@@ -195,13 +195,26 @@ def generate_mesh_decomposition(
             if len(fragment.vertices) > 0:
                 current_box_size = lod_0_box_size * 2**current_lod
                 quantization_origin = np.asarray(fragment_pos) * current_box_size
+                quantization_bits = 10
+
+                # Snap to the exact per-chunk quantization lattice before Draco
+                # encoding so adjacent chunks share boundary coordinates.
+                max_q = float((1 << quantization_bits) - 1)
+                local_vertices = fragment.vertices.astype(np.float64) - quantization_origin
+                local_vertices = np.clip(local_vertices, 0.0, float(current_box_size))
+                local_vertices = (
+                    np.round(local_vertices * (max_q / float(current_box_size)))
+                    * (float(current_box_size) / max_q)
+                )
+                quantized_vertices = quantization_origin + local_vertices
+
                 # Wrap draco output to get error about degenerate triangles
                 draco_bytes, _ = io_util.capture_draco_output(
                     2,
                     DracoPy.encode,
-                    points=fragment.vertices,
+                    points=quantized_vertices,
                     faces=fragment.faces,
-                    quantization_bits=10,
+                    quantization_bits=quantization_bits,
                     quantization_range=current_box_size,
                     quantization_origin=quantization_origin,
                 )
