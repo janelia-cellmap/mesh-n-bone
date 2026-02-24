@@ -201,12 +201,22 @@ def generate_mesh_decomposition(
                 # encoding so adjacent chunks share boundary coordinates.
                 max_q = float((1 << quantization_bits) - 1)
                 local_vertices = fragment.vertices.astype(np.float64) - quantization_origin
-                local_vertices = np.clip(local_vertices, 0.0, float(current_box_size))
+                local_vertices = np.clip(local_vertices, 0.0, current_box_size)
                 local_vertices = (
-                    np.round(local_vertices * (max_q / float(current_box_size)))
-                    * (float(current_box_size) / max_q)
+                    np.round(local_vertices * (max_q / current_box_size))
+                    * (current_box_size / max_q)
                 )
-                quantized_vertices = quantization_origin + local_vertices
+
+                # Pre-scale vertices for Draco encoding: Draco uses a single
+                # scalar quantization_range (bounding cube), but chunk_shape is
+                # per-axis. Scale shorter axes up so all axes fill the full
+                # quantization range. Neuroglancer's per-axis chunk_shape
+                # decoding undoes this scaling.
+                max_cbs = float(np.max(current_box_size))
+                scale_factors = max_cbs / current_box_size
+                scaled_local = local_vertices * scale_factors
+                scaled_origin = np.asarray(fragment_pos, dtype=float) * max_cbs
+                quantized_vertices = scaled_origin + scaled_local
 
                 # Wrap draco output to get error about degenerate triangles
                 draco_bytes, _ = io_util.capture_draco_output(
@@ -215,8 +225,8 @@ def generate_mesh_decomposition(
                     points=quantized_vertices,
                     faces=fragment.faces,
                     quantization_bits=quantization_bits,
-                    quantization_range=current_box_size,
-                    quantization_origin=quantization_origin,
+                    quantization_range=max_cbs,
+                    quantization_origin=scaled_origin,
                 )
 
                 if len(draco_bytes) > 12:
@@ -376,18 +386,16 @@ def generate_neuroglancer_multires_mesh(
                     grid_origin, np.floor(vertices.min(axis=0) - 1)
                 )  # subtract 1 in case of rounding issues
 
-            if not lod_0_box_size and current_lod == 0:
-                max_distance_between_vertices = np.ceil(
-                    np.max(vertices.max(axis=0) - vertices.min(axis=0))
-                )
+            if lod_0_box_size is None and current_lod == 0:
+                distances_per_axis = vertices.max(axis=0) - vertices.min(axis=0)
                 # arbitrarily say around 100 faces per chunk
                 heuristic_num_chunks = np.ceil(num_faces / 100)
                 if heuristic_num_chunks == 1:
-                    lod_0_box_size = np.ceil(max_distance_between_vertices) + 1
+                    lod_0_box_size = np.ceil(distances_per_axis) + 1
                 else:
                     lod_0_box_size = (
                         np.ceil(
-                            max_distance_between_vertices
+                            distances_per_axis
                             / np.ceil(heuristic_num_chunks ** (1 / 2))
                         )
                         + 1
@@ -509,7 +517,7 @@ def generate_neuroglancer_multires_mesh(
                     fragments,
                     current_lod,
                     lods[: idx + 1],
-                    np.asarray([lod_0_box_size, lod_0_box_size, lod_0_box_size]),
+                    np.asarray(lod_0_box_size, dtype=float),
                 )
 
                 del fragments
