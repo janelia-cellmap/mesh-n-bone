@@ -127,3 +127,112 @@ def zarr_segmentation(tmp_output_dir):
         )
 
     return f"{zarr_path}/seg/s0"
+
+
+def _make_zarr_cube(tmp_dir, voxel_size, offset, vol_shape, cube_slice, label=1):
+    """Helper: create a zarr volume with a single labeled cube at known position.
+
+    Args:
+        tmp_dir: parent directory for zarr
+        voxel_size: [vz, vy, vx] in ZYX order
+        offset: [oz, oy, ox] in ZYX order
+        vol_shape: (nz, ny, nx)
+        cube_slice: tuple of 3 slices defining the cube in voxel indices
+        label: label value to assign
+
+    Returns:
+        (zarr_path_str, expected_bounds_xyz, expected_center_xyz)
+        where expected values account for marching cubes half-voxel offset.
+    """
+    zarr_path = os.path.join(tmp_dir, "cube.zarr")
+    store = zarr.DirectoryStore(zarr_path)
+    root = zarr.open(store, mode="w")
+    vol = np.zeros(vol_shape, dtype=np.uint32)
+    vol[cube_slice] = label
+    root.create_dataset("seg/s0", data=vol, chunks=vol_shape)
+
+    zattrs_path = os.path.join(zarr_path, "seg", "s0", ".zattrs")
+    with open(zattrs_path, "w") as f:
+        json.dump(
+            {"voxel_size": list(voxel_size), "offset": list(offset),
+             "axis_names": ["z", "y", "x"]},
+            f,
+        )
+
+    # Compute expected mesh bounds in XYZ.
+    # zmesh marching cubes places boundary at (voxel_index - 0.5) * voxel_size
+    # The actual mesh boundary for a solid block [a:b] is at:
+    #   min_world = offset + (a - 0.5) * voxel_size
+    #   max_world = offset + (b - 0.5) * voxel_size
+    # But zmesh internally shifts by +0.5 voxel, so the surface is at:
+    #   min = offset + (a - 0.5) * voxel_size  (between voxel a-1 and a)
+    #   max = offset + (b - 1 + 0.5) * voxel_size  (between voxel b-1 and b)
+    vs = np.array(voxel_size, dtype=float)  # ZYX
+    off = np.array(offset, dtype=float)  # ZYX
+    starts = np.array([s.start for s in cube_slice], dtype=float)  # ZYX voxel indices
+    stops = np.array([s.stop for s in cube_slice], dtype=float)
+
+    # zmesh produces vertices: the isosurface for binary label at voxel boundary
+    # min vertex ≈ (start - 0.5) * voxel_size, max vertex ≈ (stop - 0.5) * voxel_size
+    expected_min_zyx = off + (starts - 0.5) * vs
+    expected_max_zyx = off + (stops - 0.5) * vs
+    expected_center_zyx = (expected_min_zyx + expected_max_zyx) / 2
+
+    # Convert to XYZ for mesh coordinates
+    expected_min_xyz = expected_min_zyx[::-1]
+    expected_max_xyz = expected_max_zyx[::-1]
+    expected_center_xyz = expected_center_zyx[::-1]
+
+    return f"{zarr_path}/seg/s0", expected_min_xyz, expected_max_xyz, expected_center_xyz
+
+
+@pytest.fixture
+def zarr_cube_with_offset(tmp_output_dir):
+    """Zarr volume with a cube at known position with non-zero offset and non-unit voxel size.
+
+    Volume: 32x32x32, voxel_size=[4,4,4], offset=[100,200,300] (ZYX).
+    Cube: label 1 at voxels [8:24, 8:24, 8:24].
+    """
+    return _make_zarr_cube(
+        tmp_output_dir,
+        voxel_size=[4, 4, 4],
+        offset=[100, 200, 300],
+        vol_shape=(32, 32, 32),
+        cube_slice=(slice(8, 24), slice(8, 24), slice(8, 24)),
+    )
+
+
+@pytest.fixture
+def zarr_sphere(tmp_output_dir):
+    """Zarr volume containing a voxelized sphere for volume verification.
+
+    Volume: 64x64x64, voxel_size=[2,2,2], offset=[0,0,0].
+    Sphere: label 1, radius 20 voxels, center at voxel [32,32,32].
+    """
+    zarr_path = os.path.join(tmp_output_dir, "sphere.zarr")
+    store = zarr.DirectoryStore(zarr_path)
+    root = zarr.open(store, mode="w")
+
+    vol = np.zeros((64, 64, 64), dtype=np.uint32)
+    center = np.array([32, 32, 32])
+    radius = 20  # voxels
+    zz, yy, xx = np.mgrid[0:64, 0:64, 0:64]
+    dist = np.sqrt((zz - center[0])**2 + (yy - center[1])**2 + (xx - center[2])**2)
+    vol[dist <= radius] = 1
+    root.create_dataset("seg/s0", data=vol, chunks=(64, 64, 64))
+
+    zattrs_path = os.path.join(zarr_path, "seg", "s0", ".zattrs")
+    with open(zattrs_path, "w") as f:
+        json.dump(
+            {"voxel_size": [2, 2, 2], "offset": [0, 0, 0], "axis_names": ["z", "y", "x"]},
+            f,
+        )
+
+    # Expected sphere center in world XYZ: [32*2, 32*2, 32*2] = [64, 64, 64]
+    # Expected radius in world units: 20 * 2 = 40
+    # Expected volume: (4/3) * pi * 40^3 ≈ 268082.6
+    expected_center_xyz = np.array([64.0, 64.0, 64.0])
+    expected_radius_world = 40.0
+    expected_volume = (4.0 / 3.0) * np.pi * expected_radius_world**3
+
+    return f"{zarr_path}/seg/s0", expected_center_xyz, expected_radius_world, expected_volume
