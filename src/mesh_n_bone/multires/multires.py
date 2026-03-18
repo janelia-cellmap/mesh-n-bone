@@ -67,6 +67,9 @@ def generate_neuroglancer_multires_mesh(
                     )
 
             previous_num_faces = num_faces
+        else:
+            # Loop completed without break — all LODs are valid
+            idx += 1
 
         lods = lods[:idx]
 

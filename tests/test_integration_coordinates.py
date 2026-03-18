@@ -78,7 +78,8 @@ class TestCubeCoordinates:
         """Meshes at different LODs should have approximately the same centroid."""
         zarr_path, _, _, expected_center = zarr_cube_with_offset
         output_dir = os.path.join(tmp_output_dir, "cube_multiscale_centroid")
-        _run_meshify(zarr_path, output_dir, do_multires=True, num_lods=3)
+        _run_meshify(zarr_path, output_dir, do_multires=True, num_lods=3,
+                     multires_strategy="downsample", delete_decimated_meshes=False)
 
         centroids = []
         for lod in range(3):
@@ -99,7 +100,8 @@ class TestCubeCoordinates:
         """Meshes at different LODs should have similar bounding box extents."""
         zarr_path, expected_min, expected_max, _ = zarr_cube_with_offset
         output_dir = os.path.join(tmp_output_dir, "cube_multiscale_extents")
-        _run_meshify(zarr_path, output_dir, do_multires=True, num_lods=3)
+        _run_meshify(zarr_path, output_dir, do_multires=True, num_lods=3,
+                     multires_strategy="downsample", delete_decimated_meshes=False)
 
         expected_extent = expected_max - expected_min  # should be ~64 per axis
         for lod in range(3):
@@ -165,7 +167,8 @@ class TestSphereGeometry:
         """Sphere volume should be approximately consistent across LOD levels."""
         zarr_path, _, _, expected_volume = zarr_sphere
         output_dir = os.path.join(tmp_output_dir, "sphere_multiscale_vol")
-        _run_meshify(zarr_path, output_dir, do_multires=True, num_lods=3)
+        _run_meshify(zarr_path, output_dir, do_multires=True, num_lods=3,
+                     multires_strategy="downsample", delete_decimated_meshes=False)
 
         volumes = []
         for lod in range(3):
@@ -190,7 +193,8 @@ class TestSphereGeometry:
         """Sphere centroids at all LODs should be at the same world position."""
         zarr_path, expected_center, _, _ = zarr_sphere
         output_dir = os.path.join(tmp_output_dir, "sphere_multiscale_ctr")
-        _run_meshify(zarr_path, output_dir, do_multires=True, num_lods=3)
+        _run_meshify(zarr_path, output_dir, do_multires=True, num_lods=3,
+                     multires_strategy="downsample", delete_decimated_meshes=False)
 
         for lod in range(3):
             ply_path = os.path.join(output_dir, "mesh_lods", f"s{lod}", "1.ply")

@@ -85,6 +85,10 @@ class Meshify:
         num_lods: int = 3,
         lod_0_box_size=None,
         downsample_method: str = "mode_suppress_zero",
+        multires_strategy: str = "decimate",
+        decimation_factor: int = 4,
+        decimation_aggressiveness: int = 7,
+        delete_decimated_meshes: bool = True,
     ):
         # Try single-arg open_ds first (newer funlib.persistence),
         # fall back to two-arg form (older versions)
@@ -171,6 +175,10 @@ class Meshify:
             self.lod_0_box_size = None
         self.downsample_method = downsample_method
         self.input_path = input_path
+        self.multires_strategy = multires_strategy
+        self.decimation_factor = decimation_factor
+        self.decimation_aggressiveness = decimation_aggressiveness
+        self.delete_decimated_meshes = delete_decimated_meshes
 
     def _get_downsample_function(self):
         """Return the appropriate downsample function based on config."""
@@ -650,41 +658,51 @@ class Meshify:
         return base * (2 ** lod)
 
     def get_multiscale_meshes(self):
-        """Generate meshes at multiple scales by downsampling the volume, then
-        create neuroglancer multiresolution output.
+        """Generate meshes and create neuroglancer multiresolution output.
 
-        For each LOD level (0, 1, ..., num_lods-1):
-        1. Downsample the segmentation volume by 2^lod
-        2. Run marching cubes to generate per-segment PLY meshes
-        3. Write to mesh_lods/s{lod}/
+        Two strategies are supported via self.multires_strategy:
 
-        Then feed all scales into the multires decomposition pipeline.
+        "decimate" (default):
+            1. Generate meshes at scale 0 from the zarr volume
+            2. Decimate each mesh with pyfqmr for LODs 1, 2, ...
+            3. Feed all LODs into the neuroglancer multires pipeline
+            Best for thin/elongated structures (e.g. mitochondria).
+
+        "downsample":
+            1. For each LOD, downsample the volume by 2^lod
+            2. Run marching cubes at each downsampled resolution
+            3. Feed all LODs into the neuroglancer multires pipeline
+            Best for thick/compact structures.
         """
         from mesh_n_bone.multires.multires import generate_all_neuroglancer_multires_meshes
+        from mesh_n_bone.multires.decimation import (
+            generate_decimated_meshes,
+            delete_decimated_mesh_files,
+        )
         from mesh_n_bone.util import neuroglancer
 
+        os.makedirs(self.output_directory, exist_ok=True)
         mesh_lods_dir = f"{self.output_directory}/mesh_lods"
         os.makedirs(mesh_lods_dir, exist_ok=True)
 
         lods = list(range(self.num_lods))
 
-        for lod in lods:
-            scale_dir = f"{mesh_lods_dir}/s{lod}"
-            logger.info(f"Generating meshes at LOD {lod} (downsample factor {self._get_downsample_factor_for_lod(lod)})")
-
-            if lod == 0:
-                # At LOD 0, use current downsample_factor (may be None)
-                self._generate_meshes_at_scale(scale_dir, self.downsample_factor)
-            else:
-                ds_factor = self._get_downsample_factor_for_lod(lod)
-                self._generate_meshes_at_scale(scale_dir, ds_factor)
+        if self.multires_strategy == "decimate":
+            self._generate_multires_decimate(mesh_lods_dir, lods)
+        elif self.multires_strategy == "downsample":
+            self._generate_multires_downsample(mesh_lods_dir, lods)
+        else:
+            raise ValueError(
+                f"Unknown multires_strategy '{self.multires_strategy}'. "
+                f"Choose from: 'decimate', 'downsample'"
+            )
 
         # Collect mesh IDs and file sizes from s0
-        s0_mesh_dir = f"{mesh_lods_dir}/s0/meshes"
+        s0_dir = f"{mesh_lods_dir}/s0"
         mesh_ids = []
         file_sizes = []
         mesh_ext = None
-        with os.scandir(s0_mesh_dir) as it:
+        with os.scandir(s0_dir) as it:
             for entry in it:
                 if not entry.is_file():
                     continue
@@ -701,17 +719,6 @@ class Meshify:
         if not mesh_ids:
             logger.warning("No meshes found at s0, skipping multires generation")
             return
-
-        # The multires pipeline expects mesh_lods/s{lod}/{id}.ply
-        # but _generate_meshes_at_scale writes to s{lod}/meshes/{id}.ply
-        # So we need to restructure: move meshes up one level
-        for lod in lods:
-            scale_mesh_dir = f"{mesh_lods_dir}/s{lod}/meshes"
-            scale_dir = f"{mesh_lods_dir}/s{lod}"
-            if os.path.isdir(scale_mesh_dir):
-                for f in os.listdir(scale_mesh_dir):
-                    shutil.move(f"{scale_mesh_dir}/{f}", f"{scale_dir}/{f}")
-                os.rmdir(scale_mesh_dir)
 
         logger.info(f"Generating neuroglancer multires for {len(mesh_ids)} meshes with {self.num_lods} LODs")
 
@@ -732,7 +739,81 @@ class Meshify:
             neuroglancer.write_segment_properties_file(multires_path)
             neuroglancer.write_info_file(multires_path)
 
-        logger.info("Multi-scale multires pipeline complete")
+        if self.delete_decimated_meshes:
+            with Timing_Messager("Cleaning up intermediate mesh files", logger):
+                shutil.rmtree(mesh_lods_dir, ignore_errors=True)
+
+        logger.info("Multires pipeline complete")
+
+    def _generate_multires_decimate(self, mesh_lods_dir, lods):
+        """Strategy: mesh at s0, then decimate for higher LODs."""
+        from mesh_n_bone.multires.decimation import generate_decimated_meshes
+
+        # Step 1: Generate s0 meshes from the zarr volume
+        s0_dir = f"{mesh_lods_dir}/s0"
+        logger.info("Generating meshes at LOD 0 from segmentation volume")
+        self._generate_meshes_at_scale(s0_dir, self.downsample_factor)
+
+        # Move meshes from s0/meshes/ up to s0/
+        s0_mesh_subdir = f"{s0_dir}/meshes"
+        if os.path.isdir(s0_mesh_subdir):
+            for f in os.listdir(s0_mesh_subdir):
+                shutil.move(f"{s0_mesh_subdir}/{f}", f"{s0_dir}/{f}")
+            os.rmdir(s0_mesh_subdir)
+
+        # Collect mesh IDs from s0
+        mesh_ids = []
+        mesh_ext = None
+        for f in os.listdir(s0_dir):
+            root, ext = os.path.splitext(f)
+            if ext in (".ply", ".obj"):
+                if mesh_ext is None:
+                    mesh_ext = ext
+                try:
+                    mesh_ids.append(int(root))
+                except ValueError:
+                    continue
+
+        if not mesh_ids:
+            logger.warning("No meshes found at s0")
+            return
+
+        # Step 2: Decimate s0 meshes for LODs 1, 2, ...
+        if len(lods) > 1:
+            logger.info(f"Decimating meshes for LODs 1-{len(lods)-1} "
+                        f"(factor={self.decimation_factor}, aggressiveness={self.decimation_aggressiveness})")
+            with dask_util.start_dask(self.num_workers, "decimation", logger):
+                with Timing_Messager("Generating decimated meshes", logger):
+                    generate_decimated_meshes(
+                        s0_dir,
+                        self.output_directory,
+                        lods,
+                        mesh_ids,
+                        mesh_ext,
+                        self.decimation_factor,
+                        self.decimation_aggressiveness,
+                        self.num_workers,
+                    )
+
+    def _generate_multires_downsample(self, mesh_lods_dir, lods):
+        """Strategy: downsample volume at each LOD, re-mesh."""
+        for lod in lods:
+            scale_dir = f"{mesh_lods_dir}/s{lod}"
+            logger.info(f"Generating meshes at LOD {lod} "
+                        f"(downsample factor {self._get_downsample_factor_for_lod(lod)})")
+
+            if lod == 0:
+                self._generate_meshes_at_scale(scale_dir, self.downsample_factor)
+            else:
+                ds_factor = self._get_downsample_factor_for_lod(lod)
+                self._generate_meshes_at_scale(scale_dir, ds_factor)
+
+            # Move meshes from s{lod}/meshes/ up to s{lod}/
+            scale_mesh_subdir = f"{scale_dir}/meshes"
+            if os.path.isdir(scale_mesh_subdir):
+                for f in os.listdir(scale_mesh_subdir):
+                    shutil.move(f"{scale_mesh_subdir}/{f}", f"{scale_dir}/{f}")
+                os.rmdir(scale_mesh_subdir)
 
     def get_meshes(self):
         """Generate meshes: chunk, assemble, and optionally analyze.
