@@ -1,10 +1,12 @@
 """Shared fixtures for mesh-n-bone tests."""
 
+import json
 import numpy as np
 import pytest
 import trimesh
 import os
 import tempfile
+import zarr
 
 
 @pytest.fixture
@@ -97,3 +99,31 @@ def labeled_volume_3d():
     # Scattered voxels of label 3 (thin structure, should vanish with suppress_zero)
     vol[0, 4, 4] = 3
     return vol
+
+
+@pytest.fixture
+def zarr_segmentation(tmp_output_dir):
+    """Create a zarr segmentation volume with two labeled objects.
+
+    Returns the path to the zarr dataset (e.g. /tmp/.../test.zarr/seg/s0).
+    Volume is 32x32x32 with voxel_size=[1,1,1], containing:
+    - Label 1: a solid 20x20x20 cube at [4:24, 4:24, 4:24]
+    - Label 2: a solid 8x8x8 cube at [24:32, 24:32, 24:32]
+    """
+    zarr_path = os.path.join(tmp_output_dir, "test.zarr")
+    store = zarr.DirectoryStore(zarr_path)
+    root = zarr.open(store, mode="w")
+    vol = np.zeros((32, 32, 32), dtype=np.uint32)
+    vol[4:24, 4:24, 4:24] = 1
+    vol[24:32, 24:32, 24:32] = 2
+    root.create_dataset("seg/s0", data=vol, chunks=(16, 16, 16))
+
+    # Write attrs for funlib.persistence
+    zattrs_path = os.path.join(zarr_path, "seg", "s0", ".zattrs")
+    with open(zattrs_path, "w") as f:
+        json.dump(
+            {"voxel_size": [1, 1, 1], "offset": [0, 0, 0], "axis_names": ["z", "y", "x"]},
+            f,
+        )
+
+    return f"{zarr_path}/seg/s0"

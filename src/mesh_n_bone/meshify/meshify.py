@@ -16,7 +16,11 @@ import pymeshlab
 
 from mesh_n_bone.util import dask_util
 from mesh_n_bone.util.logging import Timing_Messager
-from mesh_n_bone.meshify.downsample import downsample_labels_3d_suppress_zero
+from mesh_n_bone.meshify.downsample import (
+    downsample_labels_3d_suppress_zero,
+    downsample_labels_3d,
+    downsample_binary_3d,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +81,10 @@ class Meshify:
         fixed_edge_taubin_lambda: float = 0.5,
         fixed_edge_taubin_mu: float = -0.53,
         stage_1_reduction_fraction: float = 0.5,
+        do_multires: bool = False,
+        num_lods: int = 3,
+        lod_0_box_size=None,
+        downsample_method: str = "mode_suppress_zero",
     ):
         # Try single-arg open_ds first (newer funlib.persistence),
         # fall back to two-arg form (older versions)
@@ -153,6 +161,31 @@ class Meshify:
         self.stage_1_reduction_fraction = stage_1_reduction_fraction
         self.stage_2_reduction_fraction = 1 - self.stage_1_reduction_fraction
 
+        self.do_multires = do_multires
+        self.num_lods = num_lods
+        if lod_0_box_size is not None:
+            self.lod_0_box_size = np.atleast_1d(np.asarray(lod_0_box_size, dtype=float))
+            if self.lod_0_box_size.size == 1:
+                self.lod_0_box_size = np.full(3, self.lod_0_box_size.item())
+        else:
+            self.lod_0_box_size = None
+        self.downsample_method = downsample_method
+        self.input_path = input_path
+
+    def _get_downsample_function(self):
+        """Return the appropriate downsample function based on config."""
+        methods = {
+            "mode_suppress_zero": downsample_labels_3d_suppress_zero,
+            "mode": downsample_labels_3d,
+            "binary": downsample_binary_3d,
+        }
+        if self.downsample_method not in methods:
+            raise ValueError(
+                f"Unknown downsample_method '{self.downsample_method}'. "
+                f"Choose from: {list(methods.keys())}"
+            )
+        return methods[self.downsample_method]
+
     @staticmethod
     def my_cloudvolume_concatenate(*meshes):
         vertex_ct = np.zeros(len(meshes) + 1, np.uint32)
@@ -171,7 +204,8 @@ class Meshify:
             swapped_dtype = segmentation_block.dtype.newbyteorder()
             segmentation_block = segmentation_block.view(swapped_dtype).byteswap()
         if self.downsample_factor:
-            segmentation_block, _ = downsample_labels_3d_suppress_zero(
+            ds_func = self._get_downsample_function()
+            segmentation_block, _ = ds_func(
                 segmentation_block, self.downsample_factor
             )
 
@@ -564,8 +598,152 @@ class Meshify:
             write_singleres_multires_metadata(f"{self.output_directory}/meshes")
         shutil.rmtree(dirname)
 
+    def _generate_meshes_at_scale(self, output_mesh_dir, downsample_factor=None):
+        """Generate meshes at a given downsampling level, writing PLYs to output_mesh_dir.
+
+        This creates a temporary Meshify-like pipeline that:
+        1. Reads the segmentation volume (with optional extra downsampling)
+        2. Runs marching cubes per block
+        3. Assembles block meshes into per-segment PLYs
+        """
+        # Save/restore state so we can temporarily override output + downsample
+        orig_output = self.output_directory
+        orig_downsample = self.downsample_factor
+        orig_voxel_size = self.output_voxel_size_funlib
+        orig_true_voxel = self.true_voxel_size.copy()
+        orig_do_legacy = self.do_legacy_neuroglancer
+        orig_do_singleres = self.do_singleres_multires_neuroglancer
+
+        try:
+            # Override to write PLYs (not neuroglancer format) to the scale dir
+            self.output_directory = output_mesh_dir
+            self.do_legacy_neuroglancer = False
+            self.do_singleres_multires_neuroglancer = False
+
+            if downsample_factor is not None:
+                self.downsample_factor = downsample_factor
+                self.output_voxel_size_funlib = Coordinate(
+                    np.array(self.base_voxel_size_funlib) * downsample_factor
+                )
+                self.true_voxel_size = orig_true_voxel / (orig_downsample or 1) * downsample_factor
+
+            os.makedirs(self.output_directory, exist_ok=True)
+            tmp_chunked_dir = self.output_directory + "/tmp_chunked"
+            os.makedirs(tmp_chunked_dir, exist_ok=True)
+            self.get_chunked_meshes(tmp_chunked_dir)
+            self.assemble_meshes(tmp_chunked_dir)
+        finally:
+            self.output_directory = orig_output
+            self.downsample_factor = orig_downsample
+            self.output_voxel_size_funlib = orig_voxel_size
+            self.true_voxel_size = orig_true_voxel
+            self.do_legacy_neuroglancer = orig_do_legacy
+            self.do_singleres_multires_neuroglancer = orig_do_singleres
+
+    def _get_downsample_factor_for_lod(self, lod):
+        """Get the total downsample factor for a given LOD level.
+
+        If the base config already has a downsample_factor, multiply it.
+        Otherwise, use 2^lod (lod=0 means no downsampling).
+        """
+        base = self.downsample_factor or 1
+        return base * (2 ** lod)
+
+    def get_multiscale_meshes(self):
+        """Generate meshes at multiple scales by downsampling the volume, then
+        create neuroglancer multiresolution output.
+
+        For each LOD level (0, 1, ..., num_lods-1):
+        1. Downsample the segmentation volume by 2^lod
+        2. Run marching cubes to generate per-segment PLY meshes
+        3. Write to mesh_lods/s{lod}/
+
+        Then feed all scales into the multires decomposition pipeline.
+        """
+        from mesh_n_bone.multires.multires import generate_all_neuroglancer_multires_meshes
+        from mesh_n_bone.util import neuroglancer
+
+        mesh_lods_dir = f"{self.output_directory}/mesh_lods"
+        os.makedirs(mesh_lods_dir, exist_ok=True)
+
+        lods = list(range(self.num_lods))
+
+        for lod in lods:
+            scale_dir = f"{mesh_lods_dir}/s{lod}"
+            logger.info(f"Generating meshes at LOD {lod} (downsample factor {self._get_downsample_factor_for_lod(lod)})")
+
+            if lod == 0:
+                # At LOD 0, use current downsample_factor (may be None)
+                self._generate_meshes_at_scale(scale_dir, self.downsample_factor)
+            else:
+                ds_factor = self._get_downsample_factor_for_lod(lod)
+                self._generate_meshes_at_scale(scale_dir, ds_factor)
+
+        # Collect mesh IDs and file sizes from s0
+        s0_mesh_dir = f"{mesh_lods_dir}/s0/meshes"
+        mesh_ids = []
+        file_sizes = []
+        mesh_ext = None
+        with os.scandir(s0_mesh_dir) as it:
+            for entry in it:
+                if not entry.is_file():
+                    continue
+                name = entry.name
+                root, ext = os.path.splitext(name)
+                if mesh_ext is None:
+                    mesh_ext = ext
+                try:
+                    mesh_ids.append(int(root))
+                    file_sizes.append(entry.stat(follow_symlinks=False).st_size)
+                except ValueError:
+                    continue
+
+        if not mesh_ids:
+            logger.warning("No meshes found at s0, skipping multires generation")
+            return
+
+        # The multires pipeline expects mesh_lods/s{lod}/{id}.ply
+        # but _generate_meshes_at_scale writes to s{lod}/meshes/{id}.ply
+        # So we need to restructure: move meshes up one level
+        for lod in lods:
+            scale_mesh_dir = f"{mesh_lods_dir}/s{lod}/meshes"
+            scale_dir = f"{mesh_lods_dir}/s{lod}"
+            if os.path.isdir(scale_mesh_dir):
+                for f in os.listdir(scale_mesh_dir):
+                    shutil.move(f"{scale_mesh_dir}/{f}", f"{scale_dir}/{f}")
+                os.rmdir(scale_mesh_dir)
+
+        logger.info(f"Generating neuroglancer multires for {len(mesh_ids)} meshes with {self.num_lods} LODs")
+
+        with dask_util.start_dask(self.num_workers, "multires creation", logger):
+            with Timing_Messager("Generating multires meshes", logger):
+                generate_all_neuroglancer_multires_meshes(
+                    self.output_directory,
+                    self.num_workers,
+                    mesh_ids,
+                    lods,
+                    mesh_ext,
+                    np.array(file_sizes, dtype=float),
+                    self.lod_0_box_size,
+                )
+
+        with Timing_Messager("Writing info and segment properties files", logger):
+            multires_path = f"{self.output_directory}/multires"
+            neuroglancer.write_segment_properties_file(multires_path)
+            neuroglancer.write_info_file(multires_path)
+
+        logger.info("Multi-scale multires pipeline complete")
+
     def get_meshes(self):
-        """Generate meshes: chunk, assemble, and optionally analyze."""
+        """Generate meshes: chunk, assemble, and optionally analyze.
+
+        If do_multires is True, generates meshes at multiple downsampled
+        scales and creates neuroglancer multiresolution output.
+        """
+        if self.do_multires:
+            self.get_multiscale_meshes()
+            return
+
         os.makedirs(self.output_directory, exist_ok=True)
         tmp_chunked_dir = self.output_directory + "/tmp_chunked"
         os.makedirs(tmp_chunked_dir, exist_ok=True)
