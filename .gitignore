@@ -25,3 +25,9 @@ lsf-config-*
 lsf-config_*
 local-config-*
 local-config_*
+.pixi/
+pixi.lock
+tmp/
+emptymesh/
+fetchMeshes.py
+tests/test.py

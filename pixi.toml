@@ -1,0 +1,65 @@
+[project]
+name = "mesh-n-bone"
+version = "0.1.0"
+description = "Unified tool for mesh generation, multiresolution mesh creation, skeletonization, and analysis."
+channels = ["conda-forge"]
+platforms = ["linux-64"]
+
+[tasks]
+test = "python -m pytest tests/ -v"
+
+# ── Default environment: Python runtime ──────────────────────────────
+[dependencies]
+python = ">=3.10,<3.13"
+numpy = "*"
+scipy = "*"
+pandas = "*"
+numba = "*"
+pyyaml = "*"
+networkx = "*"
+pyarrow = "*"
+pymeshlab = "*"
+
+[pypi-dependencies]
+mesh-n-bone = { path = ".", editable = true }
+dracopy = ">=1.5.0"
+trimesh = ">=4.6.8"
+dask = "*"
+distributed = "*"
+dask-jobqueue = ">=0.9.0"
+bokeh = ">=3.1.0"
+pyfqmr = ">=0.3.0"
+cloud-volume = "*"
+zmesh = "*"
+funlib-geometry = "*"
+funlib-persistence = "*"
+zarr = "*"
+numcodecs = "*"
+neuroglancer = "*"
+fastremap = "*"
+pybind11-rdp = "*"
+shapely = "*"
+
+[feature.test.dependencies]
+pytest = "*"
+
+# ── Build environment: compile CGAL skeletonizer (solved independently) ──
+[feature.build-cgal.dependencies]
+cmake = "*"
+cgal-cpp = "*"
+libboost-devel = "*"
+eigen = "*"
+make = "*"
+
+[feature.build-cgal.tasks]
+build-cgal = """
+cd cgal_skeletonize_mesh && \
+mkdir -p build && cd build && \
+cmake .. && make -j$(nproc) && \
+cp skeletonize_mesh ../
+"""
+
+[environments]
+default = { solve-group = "default" }
+test = { features = ["test"], solve-group = "default" }
+build-cgal = { features = ["build-cgal"], solve-group = "build" }
