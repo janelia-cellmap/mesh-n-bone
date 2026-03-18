@@ -129,7 +129,8 @@ def zarr_segmentation(tmp_output_dir):
     return f"{zarr_path}/seg/s0"
 
 
-def _make_zarr_cube(tmp_dir, voxel_size, offset, vol_shape, cube_slice, label=1):
+def _make_zarr_cube(tmp_dir, voxel_size, offset, vol_shape, cube_slice, label=1,
+                    chunk_shape=None):
     """Helper: create a zarr volume with a single labeled cube at known position.
 
     Args:
@@ -139,17 +140,20 @@ def _make_zarr_cube(tmp_dir, voxel_size, offset, vol_shape, cube_slice, label=1)
         vol_shape: (nz, ny, nx)
         cube_slice: tuple of 3 slices defining the cube in voxel indices
         label: label value to assign
+        chunk_shape: zarr chunk shape (defaults to vol_shape)
 
     Returns:
         (zarr_path_str, expected_bounds_xyz, expected_center_xyz)
         where expected values account for marching cubes half-voxel offset.
     """
+    if chunk_shape is None:
+        chunk_shape = vol_shape
     zarr_path = os.path.join(tmp_dir, "cube.zarr")
     store = zarr.DirectoryStore(zarr_path)
     root = zarr.open(store, mode="w")
     vol = np.zeros(vol_shape, dtype=np.uint32)
     vol[cube_slice] = label
-    root.create_dataset("seg/s0", data=vol, chunks=vol_shape)
+    root.create_dataset("seg/s0", data=vol, chunks=chunk_shape)
 
     zattrs_path = os.path.join(zarr_path, "seg", "s0", ".zattrs")
     with open(zattrs_path, "w") as f:
@@ -190,15 +194,18 @@ def _make_zarr_cube(tmp_dir, voxel_size, offset, vol_shape, cube_slice, label=1)
 def zarr_cube_with_offset(tmp_output_dir):
     """Zarr volume with a cube at known position with non-zero offset and non-unit voxel size.
 
-    Volume: 32x32x32, voxel_size=[4,4,4], offset=[100,200,300] (ZYX).
-    Cube: label 1 at voxels [8:24, 8:24, 8:24].
+    Volume: 64x64x64, voxel_size=[4,4,4], offset=[100,200,300] (ZYX).
+    Cube: label 1 at voxels [8:48, 8:48, 8:48].
+    Chunks: 16x16x16 so data spans 4x4x4=64 zarr chunks and mesh blocks,
+    ensuring blockwise assembly is tested.
     """
     return _make_zarr_cube(
         tmp_output_dir,
         voxel_size=[4, 4, 4],
         offset=[100, 200, 300],
-        vol_shape=(32, 32, 32),
-        cube_slice=(slice(8, 24), slice(8, 24), slice(8, 24)),
+        vol_shape=(64, 64, 64),
+        cube_slice=(slice(8, 48), slice(8, 48), slice(8, 48)),
+        chunk_shape=(16, 16, 16),
     )
 
 
@@ -219,7 +226,7 @@ def zarr_sphere(tmp_output_dir):
     zz, yy, xx = np.mgrid[0:64, 0:64, 0:64]
     dist = np.sqrt((zz - center[0])**2 + (yy - center[1])**2 + (xx - center[2])**2)
     vol[dist <= radius] = 1
-    root.create_dataset("seg/s0", data=vol, chunks=(64, 64, 64))
+    root.create_dataset("seg/s0", data=vol, chunks=(16, 16, 16))
 
     zattrs_path = os.path.join(zarr_path, "seg", "s0", ".zattrs")
     with open(zattrs_path, "w") as f:

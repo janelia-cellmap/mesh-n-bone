@@ -77,9 +77,9 @@ class TestCubeCoordinates:
     def test_multiscale_cubes_world_bounds(self, zarr_cube_with_offset, tmp_output_dir):
         """Each LOD mesh should have bounds matching expected world coordinates.
 
-        The zarr cube at voxels [8:24]³ with voxel_size=[4,4,4] and
-        offset=[100,200,300] (ZYX) should produce meshes at all LODs
-        with bounds near [330,230,130] to [394,294,194] (XYZ).
+        The zarr cube at voxels [8:48]³ with voxel_size=[4,4,4] and
+        offset=[100,200,300] (ZYX) spans multiple zarr chunks (16³),
+        so blockwise assembly is exercised at each LOD.
         Coarser LODs shift by up to half a voxel at that resolution.
         """
         zarr_path, expected_min, expected_max, expected_center = zarr_cube_with_offset
