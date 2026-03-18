@@ -74,47 +74,47 @@ class TestCubeCoordinates:
             f"since zarr Y-offset=200 > Z-offset=100. Axes may be flipped."
         )
 
-    def test_multiscale_cubes_same_centroid(self, zarr_cube_with_offset, tmp_output_dir):
-        """Meshes at different LODs should have approximately the same centroid."""
-        zarr_path, _, _, expected_center = zarr_cube_with_offset
-        output_dir = os.path.join(tmp_output_dir, "cube_multiscale_centroid")
+    def test_multiscale_cubes_world_bounds(self, zarr_cube_with_offset, tmp_output_dir):
+        """Each LOD mesh should have bounds matching expected world coordinates.
+
+        The zarr cube at voxels [8:24]³ with voxel_size=[4,4,4] and
+        offset=[100,200,300] (ZYX) should produce meshes at all LODs
+        with bounds near [330,230,130] to [394,294,194] (XYZ).
+        Coarser LODs shift by up to half a voxel at that resolution.
+        """
+        zarr_path, expected_min, expected_max, expected_center = zarr_cube_with_offset
+        output_dir = os.path.join(tmp_output_dir, "cube_multiscale_bounds")
         _run_meshify(zarr_path, output_dir, do_multires=True, num_lods=3,
                      multires_strategy="downsample", delete_decimated_meshes=False)
 
-        centroids = []
+        expected_extent = expected_max - expected_min  # [64, 64, 64]
         for lod in range(3):
             ply_path = os.path.join(output_dir, "mesh_lods", f"s{lod}", "1.ply")
             assert os.path.exists(ply_path), f"s{lod}/1.ply should exist"
             mesh = trimesh.load(ply_path)
-            centroids.append(mesh.centroid)
 
-        # All centroids should be within a few voxels of each other
-        # At LOD 2, voxel_size = 4 * 4 = 16, so tolerance is ~16
-        for i in range(1, len(centroids)):
+            # At LOD N, effective voxel = base_voxel * 2^N.
+            # Marching cubes isosurface can shift by up to half that voxel.
+            lod_voxel = 4.0 * (2 ** lod)
+            tol = lod_voxel
+
             np.testing.assert_allclose(
-                centroids[i], centroids[0], atol=16.0,
-                err_msg=f"LOD {i} centroid differs too much from LOD 0"
+                mesh.bounds[0], expected_min, atol=tol,
+                err_msg=f"LOD {lod} mesh min bounds wrong"
+            )
+            np.testing.assert_allclose(
+                mesh.bounds[1], expected_max, atol=tol,
+                err_msg=f"LOD {lod} mesh max bounds wrong"
+            )
+            np.testing.assert_allclose(
+                mesh.centroid, expected_center, atol=tol,
+                err_msg=f"LOD {lod} mesh centroid wrong"
             )
 
-    def test_multiscale_cubes_similar_extents(self, zarr_cube_with_offset, tmp_output_dir):
-        """Meshes at different LODs should have similar bounding box extents."""
-        zarr_path, expected_min, expected_max, _ = zarr_cube_with_offset
-        output_dir = os.path.join(tmp_output_dir, "cube_multiscale_extents")
-        _run_meshify(zarr_path, output_dir, do_multires=True, num_lods=3,
-                     multires_strategy="downsample", delete_decimated_meshes=False)
-
-        expected_extent = expected_max - expected_min  # should be ~64 per axis
-        for lod in range(3):
-            ply_path = os.path.join(output_dir, "mesh_lods", f"s{lod}", "1.ply")
-            mesh = trimesh.load(ply_path)
             extent = mesh.bounds[1] - mesh.bounds[0]
-
-            # Coarser LODs lose up to 1 voxel per side, so extent shrinks slightly
-            # At LOD 2, voxel = 16, so extents can differ by up to 2*16=32
-            max_lod_voxel = 4.0 * (2 ** lod)
             np.testing.assert_allclose(
-                extent, expected_extent, atol=2 * max_lod_voxel,
-                err_msg=f"LOD {lod} extent differs too much from expected"
+                extent, expected_extent, atol=2 * lod_voxel,
+                err_msg=f"LOD {lod} extent differs from expected {expected_extent}"
             )
 
 
