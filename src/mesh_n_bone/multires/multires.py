@@ -32,7 +32,8 @@ def generate_neuroglancer_multires_mesh(
             f"rm -rf {output_path}/multires/{id} {output_path}/multires/{id}.index"
         )
 
-        grid_origin = np.ones(3) * np.inf
+        vertex_min = np.ones(3) * np.inf
+        vertex_max = np.ones(3) * -np.inf
         previous_num_faces = np.inf
         for idx, current_lod in enumerate(lods):
             if current_lod == 0:
@@ -48,9 +49,8 @@ def generate_neuroglancer_multires_mesh(
             if num_faces >= previous_num_faces:
                 break
             if vertices is not None:
-                grid_origin = np.minimum(
-                    grid_origin, np.floor(vertices.min(axis=0) - 1)
-                )
+                vertex_min = np.minimum(vertex_min, vertices.min(axis=0))
+                vertex_max = np.maximum(vertex_max, vertices.max(axis=0))
 
             if lod_0_box_size is None and current_lod == 0:
                 distances_per_axis = np.ceil(
@@ -77,6 +77,16 @@ def generate_neuroglancer_multires_mesh(
             idx += 1
 
         lods = lods[:idx]
+
+        # Shift grid_origin so the coarsest LOD bounding box is centered
+        # on the mesh bbox center.  This improves Neuroglancer's
+        # "click-to-center" behaviour, which navigates to the midpoint
+        # of clipLowerBound / clipUpperBound from the manifest.
+        coarsest_box = lod_0_box_size * 2 ** (len(lods) - 1)
+        bbox_center = (vertex_min + vertex_max) / 2
+        grid_origin = np.floor(
+            np.minimum(bbox_center - coarsest_box / 2, vertex_min - 1)
+        )
 
         results = []
         for idx, current_lod in enumerate(lods):
