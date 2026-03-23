@@ -163,11 +163,19 @@ def rewrite_index_with_empty_fragments(path, current_lod_fragments):
                     set(map(tuple, all_required_fragment_positions_np))
                 )
         else:
+            # For each new LOD fragment at position p, ALL children at
+            # LOD `lod` must exist (even if empty) so neuroglancer can
+            # properly replace the parent with its children.  Enumerate
+            # every child position from p*scale to (p+1)*scale - 1.
             for fragment in current_lod_fragments:
-                new_required_fragment_positions = fragment.lod_0_positions // 2**lod
-                all_required_fragment_positions.update(
-                    set(map(tuple, new_required_fragment_positions))
-                )
+                scale = 2 ** (current_lod - lod)
+                base = (np.asarray(fragment.position) * scale).astype(int)
+                for dx in range(scale):
+                    for dy in range(scale):
+                        for dz in range(scale):
+                            all_required_fragment_positions.add(
+                                (base[0] + dx, base[1] + dy, base[2] + dz)
+                            )
         current_missing_fragment_positions = all_required_fragment_positions - set(
             map(tuple, all_current_fragment_positions[lod])
         )
