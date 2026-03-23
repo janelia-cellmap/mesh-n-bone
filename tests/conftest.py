@@ -243,3 +243,76 @@ def zarr_sphere(tmp_output_dir):
     expected_volume = (4.0 / 3.0) * np.pi * expected_radius_world**3
 
     return f"{zarr_path}/seg/s0", expected_center_xyz, expected_radius_world, expected_volume
+
+
+def _make_zarr_cube_ome_ngff(tmp_dir, voxel_size, offset, vol_shape, cube_slice,
+                              label=1, chunk_shape=None):
+    """Like _make_zarr_cube but stores metadata in OME-NGFF multiscales format
+    (parent .zattrs) instead of per-dataset .zattrs. This mimics how most
+    cellmap/OME-Zarr datasets store their coordinate transforms."""
+    if chunk_shape is None:
+        chunk_shape = vol_shape
+    zarr_path = os.path.join(tmp_dir, "ome.zarr")
+    store = zarr.DirectoryStore(zarr_path)
+    root = zarr.open(store, mode="w")
+    vol = np.zeros(vol_shape, dtype=np.uint32)
+    vol[cube_slice] = label
+    root.create_dataset("seg/s0", data=vol, chunks=chunk_shape)
+
+    # Write OME-NGFF multiscales metadata on the PARENT group (seg/.zattrs)
+    parent_zattrs_path = os.path.join(zarr_path, "seg", ".zattrs")
+    ome_metadata = {
+        "multiscales": [{
+            "axes": [
+                {"name": "z", "type": "space", "unit": "nanometer"},
+                {"name": "y", "type": "space", "unit": "nanometer"},
+                {"name": "x", "type": "space", "unit": "nanometer"},
+            ],
+            "datasets": [{
+                "coordinateTransformations": [
+                    {"scale": list(voxel_size), "type": "scale"},
+                    {"translation": list(offset), "type": "translation"},
+                ],
+                "path": "s0",
+            }],
+            "version": "0.4",
+        }]
+    }
+    os.makedirs(os.path.dirname(parent_zattrs_path), exist_ok=True)
+    with open(parent_zattrs_path, "w") as f:
+        json.dump(ome_metadata, f)
+
+    # NO .zattrs on the dataset itself — funlib will see voxel_size=(1,1,1)
+
+    vs = np.array(voxel_size, dtype=float)
+    off = np.array(offset, dtype=float)
+    starts = np.array([s.start for s in cube_slice], dtype=float)
+    stops = np.array([s.stop for s in cube_slice], dtype=float)
+    expected_min_zyx = off + (starts - 0.5) * vs
+    expected_max_zyx = off + (stops - 0.5) * vs
+    expected_center_zyx = (expected_min_zyx + expected_max_zyx) / 2
+
+    return (
+        f"{zarr_path}/seg/s0",
+        expected_min_zyx[::-1],
+        expected_max_zyx[::-1],
+        expected_center_zyx[::-1],
+    )
+
+
+@pytest.fixture
+def zarr_cube_ome_ngff(tmp_output_dir):
+    """Zarr volume with OME-NGFF multiscales metadata (no per-dataset .zattrs).
+
+    Volume: 64x64x64, voxel_size=[8,8,8], offset=[100,100,100] (ZYX).
+    Cube: label 1 at voxels [8:48, 8:48, 8:48].
+    Chunks: 16x16x16 for multi-block testing.
+    """
+    return _make_zarr_cube_ome_ngff(
+        tmp_output_dir,
+        voxel_size=[8, 8, 8],
+        offset=[100, 100, 100],
+        vol_shape=(64, 64, 64),
+        cube_slice=(slice(8, 48), slice(8, 48), slice(8, 48)),
+        chunk_shape=(16, 16, 16),
+    )

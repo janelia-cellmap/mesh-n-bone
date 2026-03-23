@@ -66,10 +66,9 @@ class TestMultiresConfig:
         with open(os.path.join(config_dir, "run-config.yaml"), "w") as f:
             yaml.dump(config, f)
 
-        required, optional = read_multires_config(config_dir)
+        required, optional, _ = read_multires_config(config_dir)
         assert required["num_lods"] == 3
-        assert optional["box_size"].shape == (3,)
-        assert np.all(optional["box_size"] == 100.0)
+        np.testing.assert_array_equal(optional["box_size"], [100.0, 100.0, 100.0])
 
     def test_box_size_per_axis(self, tmp_output_dir):
         import yaml
@@ -81,11 +80,30 @@ class TestMultiresConfig:
                 "num_lods": 2,
             },
             "optional_decimation_settings": {
-                "box_size": [10, 20, 30],
+                "box_size": [20, 40, 60],
             },
         }
         with open(os.path.join(config_dir, "run-config.yaml"), "w") as f:
             yaml.dump(config, f)
 
-        _, optional = read_multires_config(config_dir)
-        np.testing.assert_array_equal(optional["box_size"], [10, 20, 30])
+        _, optional, _ = read_multires_config(config_dir)
+        np.testing.assert_array_equal(optional["box_size"], [20.0, 40.0, 60.0])
+
+    def test_box_size_scalar_broadcasts_to_3d(self, tmp_output_dir):
+        import yaml
+        config_dir = tmp_output_dir
+        config = {
+            "required_settings": {
+                "input_path": "/tmp/in",
+                "output_path": "/tmp/out",
+                "num_lods": 2,
+            },
+            "optional_decimation_settings": {
+                "box_size": 50,
+            },
+        }
+        with open(os.path.join(config_dir, "run-config.yaml"), "w") as f:
+            yaml.dump(config, f)
+
+        _, optional, _ = read_multires_config(config_dir)
+        np.testing.assert_array_equal(optional["box_size"], [50.0, 50.0, 50.0])

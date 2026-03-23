@@ -33,7 +33,7 @@ class TestDecompositionPipeline:
         mesh_path = os.path.join(tmp_output_dir, "test_mesh.ply")
         mesh.export(mesh_path)
 
-        lod_0_box_size = np.array([40.0, 40.0, 40.0])
+        lod_0_box_size = 40.0
         grid_origin = np.floor(mesh.vertices.min(axis=0) - 1)
 
         fragments = generate_mesh_decomposition(
@@ -56,31 +56,6 @@ class TestDecompositionPipeline:
             assert frag.offset == len(frag.draco_bytes)
             assert len(frag.position) == 3
 
-    def test_per_axis_box_size(self, tmp_output_dir):
-        """Per-axis box sizes should produce valid fragments (no degenerate triangles)."""
-        # Elongated mesh
-        mesh = trimesh.creation.box(extents=[200, 40, 40])
-        mesh.vertices += 150
-        mesh_path = os.path.join(tmp_output_dir, "elongated.ply")
-        mesh.export(mesh_path)
-
-        # Per-axis box size matching the elongation
-        lod_0_box_size = np.array([100.0, 40.0, 40.0])
-        grid_origin = np.floor(mesh.vertices.min(axis=0) - 1)
-
-        fragments = generate_mesh_decomposition(
-            mesh_path=mesh_path,
-            lod_0_box_size=lod_0_box_size,
-            grid_origin=grid_origin,
-            start_fragment=np.array([0, 0, 0]),
-            end_fragment=np.array([4, 10, 10]),
-            current_lod=0,
-            num_chunks=np.array([1, 1, 1]),
-        )
-
-        assert fragments is not None
-        assert len(fragments) > 0
-
     def test_higher_lod_decomposition(self, tmp_output_dir):
         """LOD > 0 should produce fragments with 2x larger effective box sizes."""
         mesh = trimesh.creation.icosphere(subdivisions=2, radius=50.0)
@@ -88,7 +63,7 @@ class TestDecompositionPipeline:
         mesh_path = os.path.join(tmp_output_dir, "lod1_mesh.ply")
         mesh.export(mesh_path)
 
-        lod_0_box_size = np.array([30.0, 30.0, 30.0])
+        lod_0_box_size = 30.0
         grid_origin = np.floor(mesh.vertices.min(axis=0) - 1)
 
         fragments_lod0 = generate_mesh_decomposition(
@@ -124,7 +99,7 @@ class TestDecompositionPipeline:
         mesh.export(mesh_path)
 
         grid_origin = np.array([0.0, 0.0, 0.0])
-        lod_0_box_size = np.array([5.0, 5.0, 5.0])
+        lod_0_box_size = 5.0
 
         # Request a region far from the mesh
         result = generate_mesh_decomposition(
@@ -240,8 +215,8 @@ class TestFullMultiresPipeline:
         assert num_lods >= 1
         assert all(cs > 0 for cs in chunk_shape)
 
-    def test_multires_with_explicit_box_size(self, multires_mesh_dir):
-        """Pipeline with explicit per-axis box size."""
+    def test_multires_with_explicit_scalar_box_size(self, multires_mesh_dir):
+        """Pipeline with explicit scalar box size (broadcast to per-axis)."""
         output_path = multires_mesh_dir
 
         generate_neuroglancer_multires_mesh(
@@ -256,6 +231,29 @@ class TestFullMultiresPipeline:
         multires_dir = os.path.join(output_path, "multires")
         assert os.path.exists(os.path.join(multires_dir, "1"))
         assert os.path.exists(os.path.join(multires_dir, "1.index"))
+
+    def test_multires_with_per_axis_box_size(self, multires_mesh_dir):
+        """Pipeline with per-axis box size for elongated meshes."""
+        output_path = multires_mesh_dir
+
+        generate_neuroglancer_multires_mesh(
+            id=1,
+            num_subtask_workers=1,
+            output_path=output_path,
+            lods=[0, 1],
+            original_ext=".ply",
+            lod_0_box_size=np.array([20.0, 30.0, 40.0]),
+        )
+
+        multires_dir = os.path.join(output_path, "multires")
+        assert os.path.exists(os.path.join(multires_dir, "1"))
+        assert os.path.exists(os.path.join(multires_dir, "1.index"))
+
+        # Verify index file has per-axis chunk_shape
+        with open(os.path.join(multires_dir, "1.index"), "rb") as f:
+            data = f.read()
+        chunk_shape = struct.unpack("<3f", data[0:12])
+        np.testing.assert_allclose(chunk_shape, [20.0, 30.0, 40.0])
 
     def test_neuroglancer_metadata_files(self, multires_mesh_dir):
         """Info and segment_properties files should be valid JSON."""
@@ -288,3 +286,213 @@ class TestFullMultiresPipeline:
             sp = json.load(f)
         assert sp["@type"] == "neuroglancer_segment_properties"
         assert "1" in sp["inline"]["ids"]
+
+
+class TestLodTruncation:
+    """Test that LOD truncation correctly includes all valid LODs.
+
+    The old multiresolution-mesh-creator had a bug: `lods = lods[:idx]`
+    without `else: idx += 1`, which always dropped the last valid LOD.
+    With lods=[0,1], only LOD 0 was processed. The new code fixes this.
+    """
+
+    def test_all_valid_lods_included(self, multires_mesh_dir):
+        """When all LODs have decreasing face counts, all should be included."""
+        output_path = multires_mesh_dir
+
+        generate_neuroglancer_multires_mesh(
+            id=1,
+            num_subtask_workers=1,
+            output_path=output_path,
+            lods=[0, 1],
+            original_ext=".ply",
+            lod_0_box_size=None,
+        )
+
+        # Parse the index file to check num_lods
+        index_file = os.path.join(output_path, "multires", "1.index")
+        with open(index_file, "rb") as f:
+            data = f.read()
+        num_lods = struct.unpack("<I", data[24:28])[0]
+        # Both LODs should be present (the old code would produce only 1)
+        assert num_lods == 2, (
+            f"Expected 2 LODs in index file, got {num_lods}. "
+            "The last valid LOD may be getting dropped."
+        )
+
+    def test_lod_truncation_on_non_decreasing_faces(self, tmp_output_dir):
+        """If a higher LOD has >= faces than the previous, truncate there."""
+        output_path = os.path.join(tmp_output_dir, "truncation_test")
+        mesh_lods = os.path.join(output_path, "mesh_lods")
+
+        # LOD 0: 642 faces (icosphere subdiv=3)
+        mesh = trimesh.creation.icosphere(subdivisions=3, radius=50.0)
+        mesh.vertices += 100
+        s0_dir = os.path.join(mesh_lods, "s0")
+        os.makedirs(s0_dir)
+        mesh.export(os.path.join(s0_dir, "1.ply"))
+
+        # LOD 1: SAME mesh (not decimated) — should trigger truncation
+        s1_dir = os.path.join(mesh_lods, "s1")
+        os.makedirs(s1_dir)
+        mesh.export(os.path.join(s1_dir, "1.ply"))
+
+        generate_neuroglancer_multires_mesh(
+            id=1,
+            num_subtask_workers=1,
+            output_path=output_path,
+            lods=[0, 1],
+            original_ext=".ply",
+            lod_0_box_size=None,
+        )
+
+        index_file = os.path.join(output_path, "multires", "1.index")
+        with open(index_file, "rb") as f:
+            data = f.read()
+        num_lods = struct.unpack("<I", data[24:28])[0]
+        # LOD 1 has same face count as LOD 0, so it should be truncated
+        assert num_lods == 1
+
+    def test_three_lods_all_valid(self, tmp_output_dir):
+        """Three LODs with progressively fewer faces should all be included."""
+        output_path = os.path.join(tmp_output_dir, "three_lods")
+        mesh_lods = os.path.join(output_path, "mesh_lods")
+
+        mesh = trimesh.creation.icosphere(subdivisions=4, radius=50.0)
+        mesh.vertices += 100
+
+        import pyfqmr
+
+        for lod in range(3):
+            lod_dir = os.path.join(mesh_lods, f"s{lod}")
+            os.makedirs(lod_dir)
+            if lod == 0:
+                mesh.export(os.path.join(lod_dir, "1.ply"))
+            else:
+                simplifier = pyfqmr.Simplify()
+                simplifier.setMesh(mesh.vertices, mesh.faces)
+                target = max(len(mesh.faces) // (4 ** lod), 4)
+                simplifier.simplify_mesh(
+                    target_count=target, aggressiveness=7,
+                    preserve_border=False, verbose=False,
+                )
+                v, f, _ = simplifier.getMesh()
+                trimesh.Trimesh(v, f).export(os.path.join(lod_dir, "1.ply"))
+
+        generate_neuroglancer_multires_mesh(
+            id=1,
+            num_subtask_workers=1,
+            output_path=output_path,
+            lods=[0, 1, 2],
+            original_ext=".ply",
+            lod_0_box_size=None,
+        )
+
+        index_file = os.path.join(output_path, "multires", "1.index")
+        with open(index_file, "rb") as f:
+            data = f.read()
+        num_lods = struct.unpack("<I", data[24:28])[0]
+        assert num_lods == 3, f"Expected 3 LODs, got {num_lods}"
+
+
+class TestIndexFileFormat:
+    """Test the neuroglancer multilod_draco index file format."""
+
+    def test_index_lod_scales_are_powers_of_two(self, multires_mesh_dir):
+        """lod_scales should be [1, 2, 4, ...] (powers of 2)."""
+        output_path = multires_mesh_dir
+
+        generate_neuroglancer_multires_mesh(
+            id=1,
+            num_subtask_workers=1,
+            output_path=output_path,
+            lods=[0, 1],
+            original_ext=".ply",
+        )
+
+        index_file = os.path.join(output_path, "multires", "1.index")
+        with open(index_file, "rb") as f:
+            data = f.read()
+
+        num_lods = struct.unpack("<I", data[24:28])[0]
+        lod_scales = struct.unpack(f"<{num_lods}f", data[28:28 + 4 * num_lods])
+
+        for i, scale in enumerate(lod_scales):
+            assert scale == pytest.approx(2 ** i), (
+                f"LOD {i} scale should be {2**i}, got {scale}"
+            )
+
+    def test_index_vertex_offsets_are_zero(self, multires_mesh_dir):
+        """vertex_offsets should be all zeros (no per-LOD vertex offset)."""
+        output_path = multires_mesh_dir
+
+        generate_neuroglancer_multires_mesh(
+            id=1,
+            num_subtask_workers=1,
+            output_path=output_path,
+            lods=[0, 1],
+            original_ext=".ply",
+        )
+
+        index_file = os.path.join(output_path, "multires", "1.index")
+        with open(index_file, "rb") as f:
+            data = f.read()
+
+        num_lods = struct.unpack("<I", data[24:28])[0]
+        vo_start = 28 + 4 * num_lods
+        vo_end = vo_start + 4 * num_lods * 3
+        vertex_offsets = struct.unpack(f"<{num_lods * 3}f", data[vo_start:vo_end])
+        assert all(v == 0.0 for v in vertex_offsets)
+
+    def test_index_has_fragments_at_each_lod(self, multires_mesh_dir):
+        """Each LOD should have at least one fragment in the index."""
+        output_path = multires_mesh_dir
+
+        generate_neuroglancer_multires_mesh(
+            id=1,
+            num_subtask_workers=1,
+            output_path=output_path,
+            lods=[0, 1],
+            original_ext=".ply",
+        )
+
+        index_file = os.path.join(output_path, "multires", "1.index")
+        with open(index_file, "rb") as f:
+            data = f.read()
+
+        num_lods = struct.unpack("<I", data[24:28])[0]
+        vo_end = 28 + 4 * num_lods + 4 * num_lods * 3
+        nf_end = vo_end + 4 * num_lods
+        num_frags_per_lod = struct.unpack(f"<{num_lods}I", data[vo_end:nf_end])
+
+        for lod, nf in enumerate(num_frags_per_lod):
+            assert nf >= 1, f"LOD {lod} should have at least 1 fragment, got {nf}"
+
+    def test_per_axis_heuristic_produces_3d_box_size(self, tmp_output_dir):
+        """When lod_0_box_size is None, the heuristic should produce per-axis values."""
+        output_path = os.path.join(tmp_output_dir, "heuristic_test")
+        mesh_lods = os.path.join(output_path, "mesh_lods")
+
+        # Create an elongated mesh (different extents per axis)
+        mesh = trimesh.creation.box(extents=[200, 50, 100])
+        mesh.vertices += 200
+        s0_dir = os.path.join(mesh_lods, "s0")
+        os.makedirs(s0_dir)
+        mesh.export(os.path.join(s0_dir, "1.ply"))
+
+        generate_neuroglancer_multires_mesh(
+            id=1,
+            num_subtask_workers=1,
+            output_path=output_path,
+            lods=[0],
+            original_ext=".ply",
+            lod_0_box_size=None,
+        )
+
+        index_file = os.path.join(output_path, "multires", "1.index")
+        with open(index_file, "rb") as f:
+            data = f.read()
+        chunk_shape = np.array(struct.unpack("<3f", data[0:12]))
+        # Chunk shape should be per-axis (not necessarily all equal)
+        assert chunk_shape.shape == (3,)
+        assert all(cs > 0 for cs in chunk_shape)

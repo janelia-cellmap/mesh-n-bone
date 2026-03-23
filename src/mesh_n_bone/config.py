@@ -16,12 +16,8 @@ def read_multires_config(config_path):
             box_size = optional_decimation_settings["box_size"]
             if box_size is not None:
                 box_size = np.atleast_1d(np.asarray(box_size, dtype=float))
-                if box_size.size == 1:
-                    box_size = np.full(3, box_size.item())
-                elif box_size.size != 3:
-                    raise ValueError(
-                        f"box_size must be a scalar or a 3-element list, got {box_size}"
-                    )
+                if box_size.shape == (1,):
+                    box_size = np.repeat(box_size, 3)
                 optional_decimation_settings["box_size"] = box_size
         if "skip_decimation" not in optional_decimation_settings:
             optional_decimation_settings["skip_decimation"] = False
@@ -32,7 +28,15 @@ def read_multires_config(config_path):
         if "delete_decimated_meshes" not in optional_decimation_settings:
             optional_decimation_settings["delete_decimated_meshes"] = False
 
-        return required_settings, optional_decimation_settings
+        optional_properties_settings = config.get("optional_properties_settings", {})
+        if "segment_properties_csv" not in optional_properties_settings:
+            optional_properties_settings["segment_properties_csv"] = None
+        if "segment_properties_columns" not in optional_properties_settings:
+            optional_properties_settings["segment_properties_columns"] = None
+        if "segment_properties_id_column" not in optional_properties_settings:
+            optional_properties_settings["segment_properties_id_column"] = "Object ID"
+
+        return required_settings, optional_decimation_settings, optional_properties_settings
 
 
 def read_generic_config(config_path):

@@ -159,6 +159,172 @@ class TestMultilodDracoFormat:
         assert ids == sorted(ids, key=int)
 
 
+class TestSegmentPropertiesCSV:
+    """Test CSV-based segment properties."""
+
+    def _create_index_files(self, directory, ids):
+        for mesh_id in ids:
+            with open(os.path.join(directory, f"{mesh_id}.index"), "w") as f:
+                f.write("")
+
+    def _write_csv(self, path, rows):
+        import csv
+        with open(path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=rows[0].keys())
+            writer.writeheader()
+            writer.writerows(rows)
+
+    def test_csv_string_properties(self, tmp_output_dir):
+        """String columns should appear as label/string properties."""
+        self._create_index_files(tmp_output_dir, [1, 2, 3])
+        csv_path = os.path.join(tmp_output_dir, "props.csv")
+        self._write_csv(csv_path, [
+            {"Object ID": "1", "name": "cell_a"},
+            {"Object ID": "2", "name": "cell_b"},
+            {"Object ID": "3", "name": "cell_c"},
+        ])
+
+        write_segment_properties_file(tmp_output_dir, csv_path=csv_path)
+
+        sp_path = os.path.join(tmp_output_dir, "segment_properties", "info")
+        with open(sp_path) as f:
+            sp = json.load(f)
+
+        assert sp["inline"]["ids"] == ["1", "2", "3"]
+        props = sp["inline"]["properties"]
+        assert len(props) == 1
+        assert props[0]["id"] == "name"
+        assert props[0]["type"] in ("label", "string")
+        assert props[0]["values"] == ["cell_a", "cell_b", "cell_c"]
+
+    def test_csv_numeric_properties(self, tmp_output_dir):
+        """Numeric columns should become number properties with correct data_type."""
+        self._create_index_files(tmp_output_dir, [10, 20])
+        csv_path = os.path.join(tmp_output_dir, "props.csv")
+        self._write_csv(csv_path, [
+            {"Object ID": "10", "volume": "100", "surface_area": "3.14"},
+            {"Object ID": "20", "volume": "200", "surface_area": "6.28"},
+        ])
+
+        write_segment_properties_file(tmp_output_dir, csv_path=csv_path)
+
+        sp_path = os.path.join(tmp_output_dir, "segment_properties", "info")
+        with open(sp_path) as f:
+            sp = json.load(f)
+
+        props = {p["id"]: p for p in sp["inline"]["properties"]}
+        assert props["volume"]["type"] == "number"
+        assert props["volume"]["values"] == [100, 200]
+        assert props["surface_area"]["type"] == "number"
+        assert props["surface_area"]["data_type"] == "float32"
+
+    def test_csv_tag_properties(self, tmp_output_dir):
+        """Columns with a small number of unique values should become tags."""
+        self._create_index_files(tmp_output_dir, [1, 2, 3, 4])
+        csv_path = os.path.join(tmp_output_dir, "props.csv")
+        self._write_csv(csv_path, [
+            {"Object ID": "1", "cell_type": "neuron"},
+            {"Object ID": "2", "cell_type": "glia"},
+            {"Object ID": "3", "cell_type": "neuron"},
+            {"Object ID": "4", "cell_type": "glia"},
+        ])
+
+        write_segment_properties_file(tmp_output_dir, csv_path=csv_path)
+
+        sp_path = os.path.join(tmp_output_dir, "segment_properties", "info")
+        with open(sp_path) as f:
+            sp = json.load(f)
+
+        props = {p["id"]: p for p in sp["inline"]["properties"]}
+        assert props["cell_type"]["type"] == "tags"
+        assert set(props["cell_type"]["tags"]) == {"neuron", "glia"}
+        # label property should always be present
+        assert "label" in props
+
+    def test_csv_column_filter(self, tmp_output_dir):
+        """Only selected columns should be included when csv_columns is set."""
+        self._create_index_files(tmp_output_dir, [1, 2])
+        csv_path = os.path.join(tmp_output_dir, "props.csv")
+        self._write_csv(csv_path, [
+            {"Object ID": "1", "name": "a", "volume": "100", "extra": "x"},
+            {"Object ID": "2", "name": "b", "volume": "200", "extra": "y"},
+        ])
+
+        write_segment_properties_file(
+            tmp_output_dir, csv_path=csv_path, csv_columns=["name", "volume"]
+        )
+
+        sp_path = os.path.join(tmp_output_dir, "segment_properties", "info")
+        with open(sp_path) as f:
+            sp = json.load(f)
+
+        prop_ids = [p["id"] for p in sp["inline"]["properties"]]
+        assert "name" in prop_ids
+        assert "volume" in prop_ids
+        assert "extra" not in prop_ids
+
+    def test_csv_missing_ids_get_defaults(self, tmp_output_dir):
+        """Segment IDs not in the CSV should get empty/zero default values."""
+        self._create_index_files(tmp_output_dir, [1, 2, 3])
+        csv_path = os.path.join(tmp_output_dir, "props.csv")
+        self._write_csv(csv_path, [
+            {"Object ID": "1", "name": "cell_a", "volume": "100"},
+            # id 2 and 3 are missing from CSV
+        ])
+
+        write_segment_properties_file(tmp_output_dir, csv_path=csv_path)
+
+        sp_path = os.path.join(tmp_output_dir, "segment_properties", "info")
+        with open(sp_path) as f:
+            sp = json.load(f)
+
+        props = {p["id"]: p for p in sp["inline"]["properties"]}
+        assert props["name"]["values"][0] == "cell_a"
+        assert props["name"]["values"][1] == ""
+        assert props["volume"]["values"][0] == 100
+        assert props["volume"]["values"][1] == 0
+
+    def test_csv_missing_column_raises(self, tmp_output_dir):
+        """Requesting a column not in the CSV should raise ValueError."""
+        self._create_index_files(tmp_output_dir, [1])
+        csv_path = os.path.join(tmp_output_dir, "props.csv")
+        self._write_csv(csv_path, [{"Object ID": "1", "name": "a"}])
+
+        with pytest.raises(ValueError, match="not found in CSV"):
+            write_segment_properties_file(
+                tmp_output_dir, csv_path=csv_path, csv_columns=["nonexistent"]
+            )
+
+    def test_csv_missing_id_column_raises(self, tmp_output_dir):
+        """CSV without the expected ID column should raise ValueError."""
+        self._create_index_files(tmp_output_dir, [1])
+        csv_path = os.path.join(tmp_output_dir, "props.csv")
+        self._write_csv(csv_path, [{"segment": "1", "name": "a"}])
+
+        with pytest.raises(ValueError, match="must have a 'Object ID' column"):
+            write_segment_properties_file(tmp_output_dir, csv_path=csv_path)
+
+    def test_csv_custom_id_column(self, tmp_output_dir):
+        """A custom id_column name should be used for lookup."""
+        self._create_index_files(tmp_output_dir, [1, 2])
+        csv_path = os.path.join(tmp_output_dir, "props.csv")
+        self._write_csv(csv_path, [
+            {"seg_id": "1", "name": "cell_a"},
+            {"seg_id": "2", "name": "cell_b"},
+        ])
+
+        write_segment_properties_file(
+            tmp_output_dir, csv_path=csv_path, csv_id_column="seg_id",
+        )
+
+        sp_path = os.path.join(tmp_output_dir, "segment_properties", "info")
+        with open(sp_path) as f:
+            sp = json.load(f)
+
+        props = sp["inline"]["properties"]
+        assert props[0]["values"] == ["cell_a", "cell_b"]
+
+
 class TestPrecomputedAnnotations:
     """Test neuroglancer annotation output."""
 

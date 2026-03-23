@@ -204,7 +204,9 @@ def generate_all_neuroglancer_multires_meshes(
 def run_multires(config_path, num_workers):
     """Main entry point for the multires pipeline."""
     submission_directory = os.getcwd()
-    required_settings, optional_decimation_settings = read_multires_config(config_path)
+    required_settings, optional_decimation_settings, optional_properties_settings = (
+        read_multires_config(config_path)
+    )
 
     input_path = required_settings["input_path"]
     output_path = required_settings["output_path"]
@@ -215,6 +217,10 @@ def run_multires(config_path, num_workers):
     decimation_factor = optional_decimation_settings["decimation_factor"]
     aggressiveness = optional_decimation_settings["aggressiveness"]
     delete_decimated_meshes_flag = optional_decimation_settings["delete_decimated_meshes"]
+
+    segment_properties_csv = optional_properties_settings["segment_properties_csv"]
+    segment_properties_columns = optional_properties_settings["segment_properties_columns"]
+    segment_properties_id_column = optional_properties_settings["segment_properties_id_column"]
 
     execution_directory = dask_util.setup_execution_directory(config_path, logger)
     logpath = f"{execution_directory}/output.log"
@@ -259,7 +265,12 @@ def run_multires(config_path, num_workers):
 
             with Timing_Messager("Writing info and segment properties files", logger):
                 multires_output_path = f"{output_path}/multires"
-                neuroglancer.write_segment_properties_file(multires_output_path)
+                neuroglancer.write_segment_properties_file(
+                    multires_output_path,
+                    csv_path=segment_properties_csv,
+                    csv_columns=segment_properties_columns,
+                    csv_id_column=segment_properties_id_column,
+                )
                 neuroglancer.write_info_file(multires_output_path)
 
             if not skip_decimation and delete_decimated_meshes_flag:

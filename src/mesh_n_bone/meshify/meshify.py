@@ -16,6 +16,7 @@ import pymeshlab
 
 from mesh_n_bone.util import dask_util
 from mesh_n_bone.util.logging import Timing_Messager
+import zarr
 from mesh_n_bone.meshify.downsample import (
     downsample_labels_3d_suppress_zero,
     downsample_labels_3d,
@@ -23,6 +24,58 @@ from mesh_n_bone.meshify.downsample import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _read_ome_ngff_transform(input_path):
+    """Extract voxel_size and offset from OME-NGFF multiscales metadata.
+
+    Looks at the parent group's .zattrs for coordinateTransformations
+    that apply to the dataset at input_path. Returns (voxel_size, offset)
+    in ZYX order, or (None, None) if not found.
+    """
+    # Find the zarr root and dataset path within it
+    for ext in [".zarr", ".n5"]:
+        if ext in input_path:
+            parts = input_path.split(ext + "/")
+            zarr_root_path = parts[0] + ext
+            dataset_path = parts[1] if len(parts) > 1 else ""
+            break
+    else:
+        return None, None
+
+    # The dataset name is the last component (e.g. "s0" from "cell/s0")
+    dataset_name = os.path.basename(dataset_path)
+    # The parent group path (e.g. "cell" from "cell/s0")
+    parent_path = os.path.dirname(dataset_path)
+
+    try:
+        root = zarr.open(zarr_root_path, mode="r")
+        if parent_path:
+            parent_group = root[parent_path]
+        else:
+            parent_group = root
+
+        multiscales = parent_group.attrs.get("multiscales")
+        if not multiscales:
+            return None, None
+
+        for ms in multiscales:
+            for ds_info in ms.get("datasets", []):
+                if ds_info.get("path") == dataset_name:
+                    transforms = ds_info.get("coordinateTransformations", [])
+                    voxel_size = None
+                    offset = None
+                    for t in transforms:
+                        if t.get("type") == "scale":
+                            voxel_size = np.array(t["scale"], dtype=float)
+                        elif t.get("type") == "translation":
+                            offset = np.array(t["translation"], dtype=float)
+                    return voxel_size, offset
+    except Exception as e:
+        logger.debug(f"Could not read OME-NGFF metadata: {e}")
+
+    return None, None
+
 
 try:
     from mesh_n_bone.meshify.fixed_edge import simplify_mesh
@@ -89,6 +142,9 @@ class Meshify:
         decimation_factor: int = 4,
         decimation_aggressiveness: int = 7,
         delete_decimated_meshes: bool = True,
+        segment_properties_csv: str = None,
+        segment_properties_columns: list = None,
+        segment_properties_id_column: str = "Object ID",
     ):
         # Try single-arg open_ds first (newer funlib.persistence),
         # fall back to two-arg form (older versions)
@@ -103,6 +159,7 @@ class Meshify:
                 path_split[0] + file_type, path_split[1]
             )
         self.output_directory = output_directory
+        self.input_path = input_path
 
         # Get true (possibly non-integer) voxel size from the underlying data
         try:
@@ -112,6 +169,27 @@ class Meshify:
         except ImportError:
             # Newer funlib.persistence versions don't expose _read_attrs
             self.true_voxel_size = np.array(self.segmentation_array.voxel_size)
+
+        # Check if funlib failed to pick up voxel_size (returns 1,1,1) and
+        # try OME-NGFF multiscales metadata from the parent zarr group
+        ome_voxel_size, ome_offset = _read_ome_ngff_transform(input_path)
+
+        if ome_voxel_size is not None:
+            if all(v == 1 for v in self.segmentation_array.voxel_size):
+                logger.info(
+                    f"Using OME-NGFF voxel_size {ome_voxel_size} "
+                    f"(funlib returned {self.segmentation_array.voxel_size})"
+                )
+                self.true_voxel_size = ome_voxel_size.copy()
+                ome_voxel_size_coord = Coordinate(int(v) for v in ome_voxel_size)
+                ome_offset_coord = (
+                    Coordinate(int(v) for v in ome_offset)
+                    if ome_offset is not None
+                    else Coordinate(0, 0, 0)
+                )
+                self.segmentation_array._metadata._voxel_size = ome_voxel_size_coord
+                self.segmentation_array._metadata._offset = ome_offset_coord
+
         if total_roi:
             self.total_roi = total_roi
         else:
@@ -169,8 +247,8 @@ class Meshify:
         self.num_lods = num_lods
         if lod_0_box_size is not None:
             self.lod_0_box_size = np.atleast_1d(np.asarray(lod_0_box_size, dtype=float))
-            if self.lod_0_box_size.size == 1:
-                self.lod_0_box_size = np.full(3, self.lod_0_box_size.item())
+            if self.lod_0_box_size.shape == (1,):
+                self.lod_0_box_size = np.repeat(self.lod_0_box_size, 3)
         else:
             self.lod_0_box_size = None
         self.downsample_method = downsample_method
@@ -179,6 +257,9 @@ class Meshify:
         self.decimation_factor = decimation_factor
         self.decimation_aggressiveness = decimation_aggressiveness
         self.delete_decimated_meshes = delete_decimated_meshes
+        self.segment_properties_csv = segment_properties_csv
+        self.segment_properties_columns = segment_properties_columns
+        self.segment_properties_id_column = segment_properties_id_column
 
     def _get_downsample_function(self):
         """Return the appropriate downsample function based on config."""
@@ -640,6 +721,7 @@ class Meshify:
             os.makedirs(tmp_chunked_dir, exist_ok=True)
             self.get_chunked_meshes(tmp_chunked_dir)
             self.assemble_meshes(tmp_chunked_dir)
+            shutil.rmtree(tmp_chunked_dir, ignore_errors=True)
         finally:
             self.output_directory = orig_output
             self.downsample_factor = orig_downsample
@@ -736,7 +818,12 @@ class Meshify:
 
         with Timing_Messager("Writing info and segment properties files", logger):
             multires_path = f"{self.output_directory}/multires"
-            neuroglancer.write_segment_properties_file(multires_path)
+            neuroglancer.write_segment_properties_file(
+                multires_path,
+                csv_path=self.segment_properties_csv,
+                csv_columns=self.segment_properties_columns,
+                csv_id_column=self.segment_properties_id_column,
+            )
             neuroglancer.write_info_file(multires_path)
 
         if self.delete_decimated_meshes:
@@ -830,6 +917,7 @@ class Meshify:
         os.makedirs(tmp_chunked_dir, exist_ok=True)
         self.get_chunked_meshes(tmp_chunked_dir)
         self.assemble_meshes(tmp_chunked_dir)
+        shutil.rmtree(tmp_chunked_dir, ignore_errors=True)
 
         if self.do_analysis:
             from mesh_n_bone.analyze.analyze import AnalyzeMeshes

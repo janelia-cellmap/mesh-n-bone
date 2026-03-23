@@ -118,6 +118,40 @@ class TestCubeCoordinates:
             )
 
 
+class TestOmeNgffCoordinates:
+    """Test that OME-NGFF multiscales metadata is correctly picked up."""
+
+    def test_ome_ngff_cube_bounds(self, zarr_cube_ome_ngff, tmp_output_dir):
+        """Mesh from a zarr with OME-NGFF metadata should have correct world coords."""
+        zarr_path, expected_min, expected_max, expected_center = zarr_cube_ome_ngff
+        output_dir = os.path.join(tmp_output_dir, "ome_cube")
+        _run_meshify(zarr_path, output_dir)
+
+        mesh = trimesh.load(os.path.join(output_dir, "meshes", "1.ply"))
+
+        voxel_size = 8.0
+        np.testing.assert_allclose(mesh.bounds[0], expected_min, atol=voxel_size,
+                                   err_msg="OME-NGFF cube min bounds wrong")
+        np.testing.assert_allclose(mesh.bounds[1], expected_max, atol=voxel_size,
+                                   err_msg="OME-NGFF cube max bounds wrong")
+        np.testing.assert_allclose(mesh.centroid, expected_center, atol=voxel_size,
+                                   err_msg="OME-NGFF cube centroid wrong")
+
+    def test_ome_ngff_not_in_voxel_coords(self, zarr_cube_ome_ngff, tmp_output_dir):
+        """Mesh vertices should NOT be in voxel coordinates (0-64 range)."""
+        zarr_path, _, _, _ = zarr_cube_ome_ngff
+        output_dir = os.path.join(tmp_output_dir, "ome_not_voxel")
+        _run_meshify(zarr_path, output_dir)
+
+        mesh = trimesh.load(os.path.join(output_dir, "meshes", "1.ply"))
+        # With voxel_size=8, offset=100, the mesh should be at ~160-480 range
+        # If voxel_size was missed, it would be at ~8-48 range
+        assert mesh.bounds[1].max() > 100, (
+            f"Mesh max coord ({mesh.bounds[1].max():.1f}) is too small — "
+            f"voxel_size may not have been applied"
+        )
+
+
 class TestSphereGeometry:
     """Test that a sphere mesh has approximately correct volume and shape."""
 
