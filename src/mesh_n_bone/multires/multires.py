@@ -53,10 +53,15 @@ def generate_neuroglancer_multires_mesh(
                 )
 
             if lod_0_box_size is None and current_lod == 0:
-                distances_per_axis = vertices.max(axis=0) - vertices.min(axis=0)
-                heuristic_num_chunks = np.ceil(num_faces / 100)
+                distances_per_axis = np.ceil(
+                    vertices.max(axis=0) - vertices.min(axis=0)
+                )
+                # Target ~25k faces per LOD 0 fragment (~30 KB Draco-
+                # compressed at 10-bit quantization).  This balances
+                # spatial selectivity against HTTP per-request overhead.
+                heuristic_num_chunks = np.ceil(num_faces / 25_000)
                 if heuristic_num_chunks == 1:
-                    lod_0_box_size = np.ceil(distances_per_axis) + 1
+                    lod_0_box_size = distances_per_axis + 1
                 else:
                     lod_0_box_size = (
                         np.ceil(
