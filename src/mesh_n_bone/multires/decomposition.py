@@ -122,18 +122,36 @@ def generate_mesh_decomposition(
                 current_box_size = lod_0_box_size * 2**current_lod
                 quantization_origin = np.asarray(fragment_pos) * current_box_size
                 quantization_bits = 10
+                # DracoPy requires a single scalar quantization_range, but
+                # neuroglancer decodes each axis independently using
+                # chunk_shape[j].  Pre-scale shorter axes so all axes fill
+                # the full quantization range; neuroglancer's per-axis
+                # chunk_shape decoding undoes this scaling.
+                max_cbs = float(np.max(current_box_size))
 
-                # Snap to quantization lattice
+                # Snap to the exact per-axis quantization lattice
                 max_q = float((1 << quantization_bits) - 1)
                 local_vertices = fragment.vertices.astype(np.float64) - quantization_origin
                 local_vertices = np.clip(local_vertices, 0.0, current_box_size)
+
+                # Snap vertices near chunk boundaries to the exact
+                # boundary so adjacent chunks share identical positions
+                # after quantization (eliminates visible seams).
+                half_step = current_box_size / max_q / 2.0
+                local_vertices = np.where(
+                    local_vertices < half_step, 0.0, local_vertices
+                )
+                local_vertices = np.where(
+                    local_vertices > current_box_size - half_step,
+                    current_box_size,
+                    local_vertices,
+                )
                 local_vertices = (
                     np.round(local_vertices * (max_q / current_box_size))
                     * (current_box_size / max_q)
                 )
 
-                # Pre-scale for per-axis chunk_shape
-                max_cbs = float(np.max(current_box_size))
+                # Pre-scale for Draco encoding
                 scale_factors = max_cbs / current_box_size
                 scaled_local = local_vertices * scale_factors
                 scaled_origin = np.asarray(fragment_pos, dtype=float) * max_cbs
