@@ -26,12 +26,23 @@ from mesh_n_bone.meshify.downsample import (
 logger = logging.getLogger(__name__)
 
 
+_OME_UNIT_TO_ABBREVIATION = {
+    "angstrom": "Å",
+    "nanometer": "nm",
+    "micrometer": "um",
+    "millimeter": "mm",
+    "centimeter": "cm",
+    "meter": "m",
+}
+
+
 def _read_ome_ngff_transform(input_path):
-    """Extract voxel_size and offset from OME-NGFF multiscales metadata.
+    """Extract voxel_size, offset, and coordinate unit from OME-NGFF metadata.
 
     Looks at the parent group's .zattrs for coordinateTransformations
-    that apply to the dataset at input_path. Returns (voxel_size, offset)
-    in ZYX order, or (None, None) if not found.
+    that apply to the dataset at input_path. Returns
+    (voxel_size, offset, coordinate_units) in ZYX order,
+    or (None, None, None) if not found.
     """
     # Find the zarr root and dataset path within it
     for ext in [".zarr", ".n5"]:
@@ -41,7 +52,7 @@ def _read_ome_ngff_transform(input_path):
             dataset_path = parts[1] if len(parts) > 1 else ""
             break
     else:
-        return None, None
+        return None, None, None
 
     # The dataset name is the last component (e.g. "s0" from "cell/s0")
     dataset_name = os.path.basename(dataset_path)
@@ -57,9 +68,21 @@ def _read_ome_ngff_transform(input_path):
 
         multiscales = parent_group.attrs.get("multiscales")
         if not multiscales:
-            return None, None
+            return None, None, None
 
         for ms in multiscales:
+            # Extract coordinate unit from axes metadata
+            coordinate_units = None
+            axes = ms.get("axes", [])
+            for ax in axes:
+                if ax.get("type") == "space":
+                    unit = ax.get("unit")
+                    if unit is not None:
+                        coordinate_units = _OME_UNIT_TO_ABBREVIATION.get(
+                            unit, unit
+                        )
+                    break
+
             for ds_info in ms.get("datasets", []):
                 if ds_info.get("path") == dataset_name:
                     transforms = ds_info.get("coordinateTransformations", [])
@@ -70,11 +93,11 @@ def _read_ome_ngff_transform(input_path):
                             voxel_size = np.array(t["scale"], dtype=float)
                         elif t.get("type") == "translation":
                             offset = np.array(t["translation"], dtype=float)
-                    return voxel_size, offset
+                    return voxel_size, offset, coordinate_units
     except Exception as e:
         logger.debug(f"Could not read OME-NGFF metadata: {e}")
 
-    return None, None
+    return None, None, None
 
 
 try:
@@ -111,7 +134,7 @@ class Meshify:
         self,
         input_path: str,
         output_directory: str,
-        total_roi: Roi = None,
+        roi: Roi = None,
         max_num_voxels=np.inf,
         max_num_blocks=np.inf,
         read_write_block_shape_pixels: list = None,
@@ -145,6 +168,8 @@ class Meshify:
         segment_properties_csv: str = None,
         segment_properties_columns: list = None,
         segment_properties_id_column: str = "Object ID",
+        coordinate_units: str = "nm",
+        voxel_size_nm: list = None,
     ):
         # Try single-arg open_ds first (newer funlib.persistence),
         # fall back to two-arg form (older versions)
@@ -172,9 +197,20 @@ class Meshify:
 
         # Check if funlib failed to pick up voxel_size (returns 1,1,1) and
         # try OME-NGFF multiscales metadata from the parent zarr group
-        ome_voxel_size, ome_offset = _read_ome_ngff_transform(input_path)
+        ome_voxel_size, ome_offset, ome_units = _read_ome_ngff_transform(input_path)
 
-        if ome_voxel_size is not None:
+        if ome_units is not None and coordinate_units == "nm":
+            coordinate_units = ome_units
+
+        if voxel_size_nm is not None:
+            # Explicit voxel size in nm — only affects mesh vertex scaling,
+            # not the block/ROI coordinate system (so ROI stays in dataset units)
+            voxel_size_nm = np.atleast_1d(np.asarray(voxel_size_nm, dtype=float))
+            if voxel_size_nm.shape == (1,):
+                voxel_size_nm = np.repeat(voxel_size_nm, 3)
+            logger.info(f"Using user-specified voxel_size_nm {voxel_size_nm}")
+            self.true_voxel_size = voxel_size_nm.copy()
+        elif ome_voxel_size is not None:
             if all(v == 1 for v in self.segmentation_array.voxel_size):
                 logger.info(
                     f"Using OME-NGFF voxel_size {ome_voxel_size} "
@@ -190,10 +226,33 @@ class Meshify:
                 self.segmentation_array._metadata._voxel_size = ome_voxel_size_coord
                 self.segmentation_array._metadata._offset = ome_offset_coord
 
-        if total_roi:
-            self.total_roi = total_roi
+        if roi is not None:
+            if not isinstance(roi, Roi):
+                # Accept dict with offset+shape or begin+end from YAML config
+                if isinstance(roi, dict):
+                    if "begin" in roi and "end" in roi:
+                        begin = Coordinate(roi["begin"])
+                        end = Coordinate(roi["end"])
+                        roi = Roi(begin, end - begin)
+                    elif "offset" in roi and "shape" in roi:
+                        roi = Roi(
+                            Coordinate(roi["offset"]),
+                            Coordinate(roi["shape"]),
+                        )
+                    else:
+                        raise ValueError(
+                            "roi dict must have 'offset'+'shape' or 'begin'+'end' keys"
+                        )
+                else:
+                    raise ValueError(
+                        "roi must be a Roi object or a dict with "
+                        "'offset'+'shape' or 'begin'+'end' keys"
+                    )
+            self.roi = roi
+            self.has_custom_roi = True
         else:
-            self.total_roi = self.segmentation_array.roi
+            self.roi = self.segmentation_array.roi
+            self.has_custom_roi = False
         self.num_workers = num_workers
 
         if read_write_block_shape_pixels:
@@ -260,6 +319,7 @@ class Meshify:
         self.segment_properties_csv = segment_properties_csv
         self.segment_properties_columns = segment_properties_columns
         self.segment_properties_id_column = segment_properties_id_column
+        self.coordinate_units = coordinate_units
 
     def _get_downsample_function(self):
         """Return the appropriate downsample function based on config."""
@@ -347,7 +407,7 @@ class Meshify:
 
     def get_chunked_meshes(self, dirname):
         blocks = dask_util.create_blocks(
-            self.total_roi,
+            self.roi,
             self.segmentation_array,
             self.read_write_block_shape_pixels.copy(),
             padding=self.output_voxel_size_funlib,
@@ -370,6 +430,7 @@ class Meshify:
         aggressiveness=0.3,
         do_simplification=True,
         check_mesh_validity=True,
+        preserve_open_boundaries=False,
     ):
         def get_cleaned_simplified_and_smoothed_mesh(
             mesh, target_reduction, aggressiveness, do_simplification
@@ -381,7 +442,7 @@ class Meshify:
                     target_reduction=target_reduction,
                     aggressiveness=aggressiveness,
                     verbose=False,
-                    fix_edges=False,
+                    fix_edges=preserve_open_boundaries,
                 )
             else:
                 simplified_mesh = mesh
@@ -395,14 +456,26 @@ class Meshify:
                         face_matrix=simplified_mesh.faces,
                     )
                 )
+                if preserve_open_boundaries:
+                    # Identify boundary vertices and save their positions
+                    ms.compute_selection_from_mesh_border()
+                    border_mask = ms.current_mesh().vertex_selection_array()
+                    border_positions = simplified_mesh.vertices[border_mask].copy()
+
                 ms.apply_coord_taubin_smoothing(
                     lambda_=0.5,
                     mu=-0.53,
                     stepsmoothnum=n_smoothing_iter,
                 )
                 m = ms.current_mesh()
+                verts = m.vertex_matrix()
+
+                if preserve_open_boundaries:
+                    # Restore boundary vertex positions
+                    verts[border_mask] = border_positions
+
                 simplified_mesh = trimesh.Trimesh(
-                    vertices=m.vertex_matrix(), faces=m.face_matrix()
+                    vertices=verts, faces=m.face_matrix()
                 )
 
             if not check_mesh_validity:
@@ -516,7 +589,8 @@ class Meshify:
         ms.meshing_repair_non_manifold_edges(method="Split Vertices")
         ms.meshing_repair_non_manifold_edges(method="Remove Faces")
 
-        ms.meshing_close_holes(maxholesize=max_hole_size)
+        if max_hole_size > 0:
+            ms.meshing_close_holes(maxholesize=max_hole_size)
         ms.meshing_repair_non_manifold_vertices(vertdispratio=0)
 
         if remove_smallest_components:
@@ -586,10 +660,15 @@ class Meshify:
             )
             mesh = mesh.deduplicate_chunk_boundaries(
                 chunk_size=chunk_size[::-1],
-                offset=self.total_roi.offset[::-1],
+                offset=self.roi.offset[::-1],
             )
 
-        if self.check_mesh_validity:
+        # When using a custom ROI, meshes cut at the boundary are intentionally
+        # open — skip hole-closing and watertight validity checks.
+        check_validity = self.check_mesh_validity and not self.has_custom_roi
+        hole_size = 0 if self.has_custom_roi else 30
+
+        if check_validity or self.has_custom_roi:
             try:
                 vertices = np.ascontiguousarray(mesh.vertices, dtype=np.float64)
                 faces = np.ascontiguousarray(mesh.faces, dtype=np.int32)
@@ -598,6 +677,7 @@ class Meshify:
                     vertices,
                     faces,
                     remove_smallest_components=self.remove_smallest_components,
+                    max_hole_size=hole_size,
                 )
             except Exception as e:
                 raise Exception(f"{mesh_id} failed, with error: {e}")
@@ -616,7 +696,8 @@ class Meshify:
                     self.remove_smallest_components,
                     self.default_aggressiveness,
                     self.do_simplification,
-                    self.check_mesh_validity,
+                    check_validity,
+                    preserve_open_boundaries=self.has_custom_roi,
                 )
             else:
                 mesh = Meshify.simplify_and_smooth_mesh(
@@ -626,7 +707,8 @@ class Meshify:
                     self.remove_smallest_components,
                     self.default_aggressiveness,
                     self.do_simplification,
-                    self.check_mesh_validity,
+                    check_validity,
+                    preserve_open_boundaries=self.has_custom_roi,
                 )
 
             if len(mesh.faces) == 0:
@@ -637,11 +719,13 @@ class Meshify:
 
         # Correct for difference between funlib voxel sizes (rounded) and actual
         if list(self.true_voxel_size) != list(self.output_voxel_size_funlib):
-            mesh.vertices -= self.total_roi.offset[::-1]
-            mesh.vertices *= np.array(self.true_voxel_size[::-1]) / np.array(
+            scale = np.array(self.true_voxel_size[::-1]) / np.array(
                 self.output_voxel_size_funlib[::-1]
             )
-            mesh.vertices += self.total_roi.offset[::-1]
+            offset_xyz = np.array(self.roi.offset[::-1], dtype=float)
+            mesh.vertices -= offset_xyz
+            mesh.vertices *= scale
+            mesh.vertices += offset_xyz * scale
 
         from mesh_n_bone.util.neuroglancer import (
             write_ngmesh,

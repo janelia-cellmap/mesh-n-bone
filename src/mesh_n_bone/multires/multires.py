@@ -186,6 +186,17 @@ def generate_neuroglancer_multires_mesh(
                 del fragments
 
 
+def _mesh_intersects_roi(mesh_path, roi_begin, roi_end):
+    """Check if a mesh's bounding box intersects the given ROI (in XYZ)."""
+    vertices, _ = mesh_io.mesh_loader(mesh_path)
+    if vertices is None or len(vertices) == 0:
+        return False
+    mesh_min = vertices.min(axis=0)
+    mesh_max = vertices.max(axis=0)
+    # Check for overlap in all 3 dimensions
+    return np.all(mesh_min <= roi_end) and np.all(mesh_max >= roi_begin)
+
+
 def generate_all_neuroglancer_multires_meshes(
     output_path, num_workers, ids, lods, original_ext, file_sizes, lod_0_box_size=None,
 ):
@@ -211,8 +222,16 @@ def generate_all_neuroglancer_multires_meshes(
     )
 
 
-def run_multires(config_path, num_workers):
-    """Main entry point for the multires pipeline."""
+def run_multires(config_path, num_workers, roi=None):
+    """Main entry point for the multires pipeline.
+
+    Args:
+        config_path: Path to config directory.
+        num_workers: Number of dask workers.
+        roi: Optional ROI dict with 'begin'+'end' or 'offset'+'shape' keys
+             (XYZ world coordinates). Only meshes intersecting this region
+             will be processed.
+    """
     submission_directory = os.getcwd()
     required_settings, optional_decimation_settings, optional_properties_settings = (
         read_multires_config(config_path)
@@ -231,6 +250,25 @@ def run_multires(config_path, num_workers):
     segment_properties_csv = optional_properties_settings["segment_properties_csv"]
     segment_properties_columns = optional_properties_settings["segment_properties_columns"]
     segment_properties_id_column = optional_properties_settings["segment_properties_id_column"]
+
+    # Merge ROI from config if not provided via CLI
+    if roi is None:
+        roi = optional_decimation_settings.get("roi")
+
+    # Parse ROI into begin/end arrays (XYZ world coordinates)
+    roi_begin = None
+    roi_end = None
+    if roi is not None:
+        if "begin" in roi and "end" in roi:
+            roi_begin = np.asarray(roi["begin"], dtype=float)
+            roi_end = np.asarray(roi["end"], dtype=float)
+        elif "offset" in roi and "shape" in roi:
+            roi_begin = np.asarray(roi["offset"], dtype=float)
+            roi_end = roi_begin + np.asarray(roi["shape"], dtype=float)
+        else:
+            raise ValueError(
+                "roi must have 'begin'+'end' or 'offset'+'shape' keys"
+            )
 
     execution_directory = dask_util.setup_execution_directory(config_path, logger)
     logpath = f"{execution_directory}/output.log"
@@ -257,6 +295,22 @@ def run_multires(config_path, num_workers):
                     file_sizes.append(entry.stat(follow_symlinks=False).st_size)
                     mesh_ids.append(int(root))
             t0 = time.time()
+
+            # Filter meshes by ROI if specified
+            if roi_begin is not None:
+                kept_ids = []
+                kept_sizes = []
+                for idx, mesh_id in enumerate(mesh_ids):
+                    mesh_path = os.path.join(input_path, f"{mesh_id}{mesh_ext}")
+                    if _mesh_intersects_roi(mesh_path, roi_begin, roi_end):
+                        kept_ids.append(mesh_id)
+                        kept_sizes.append(file_sizes[idx])
+                logger.info(
+                    f"ROI filter: {len(kept_ids)}/{len(mesh_ids)} meshes "
+                    f"intersect the specified region"
+                )
+                mesh_ids = kept_ids
+                file_sizes = kept_sizes
 
             if not skip_decimation:
                 with dask_util.start_dask(num_workers, "decimation", logger):

@@ -15,7 +15,7 @@ class TestCLI:
         assert result.returncode == 0
         assert "mesh-n-bone" in result.stdout
         assert "meshify" in result.stdout
-        assert "multires" in result.stdout
+        assert "to-neuroglancer" in result.stdout
         assert "skeletonize" in result.stdout
         assert "analyze" in result.stdout
 

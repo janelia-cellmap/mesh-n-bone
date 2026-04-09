@@ -9,7 +9,7 @@ Produces meshes in the [neuroglancer precomputed format](https://github.com/goog
 ## Features
 
 - **Meshify** — Generate meshes from `.zarr` / `.n5` segmentation volumes via marching cubes, with blockwise processing, chunk assembly, simplification, and optional on-the-fly downsampling
-- **Multires** — Convert single-scale meshes into neuroglancer multiresolution Draco-compressed meshes with automatic LOD decimation
+- **To-Neuroglancer** — Convert single-scale meshes into neuroglancer multiresolution Draco-compressed meshes with automatic LOD decimation
 - **Skeletonize** — Extract skeletons from meshes using CGAL mean curvature flow, with pruning, simplification, and metrics
 - **Analyze** — Compute mesh metrics: volume, surface area, curvature, thickness, principal inertia, oriented bounds
 
@@ -52,33 +52,81 @@ mesh-n-bone <command> [options]
 #### `meshify` — Generate meshes from segmentation volumes
 
 ```bash
-mesh-n-bone meshify CONFIG_PATH -n NUM_WORKERS
+mesh-n-bone meshify CONFIG_PATH -n NUM_WORKERS [--roi begin_z,begin_y,begin_x,end_z,end_y,end_x]
 ```
 
 Reads a `.zarr` or `.n5` segmentation volume, runs marching cubes per chunk, assembles across chunk boundaries (with boundary deduplication), optionally simplifies and smooths, and writes output as PLY or neuroglancer format.
 
-#### `multires` — Create multiresolution neuroglancer meshes
+Example meshify `run-config.yaml`:
 
-```bash
-mesh-n-bone multires CONFIG_PATH -n NUM_WORKERS
+```yaml
+# ── Required ──
+input_path: /path/to/segmentation.zarr/s0   # Path to zarr/n5 segmentation dataset
+output_directory: /path/to/output            # Where to write output meshes
+num_workers: 10                              # Number of dask workers
+
+# ── Mesh generation ──
+downsample_factor: 2             # Downsample volume by this factor before meshing (default: none)
+downsample_method: mode          # Downsampling method: mode, mode_suppress_zero, or binary
+
+# ── Simplification & smoothing ──
+do_simplification: true          # Simplify meshes after assembly (default: true)
+target_reduction: 0.99           # Fraction of faces to remove (default: 0.99)
+n_smoothing_iter: 10             # Taubin smoothing iterations (default: 10)
+check_mesh_validity: false       # Require watertight meshes (default: true; disable for ROI)
+use_fixed_edge_simplification: true  # Preserve chunk boundary edges during simplification
+do_analysis: false               # Compute mesh metrics CSV (default: true)
+
+# ── Multiresolution output ──
+do_multires: true                # Also generate neuroglancer multilod_draco output
+num_lods: 3                      # Number of levels of detail
+multires_strategy: decimate      # LOD strategy: decimate or downsample
+decimation_factor: 4             # Face reduction factor per LOD (default: 4)
+delete_decimated_meshes: true    # Remove intermediate LOD mesh files
+
+# ── Coordinate system ──
+voxel_size_nm: [1000, 1000, 1000]  # Voxel size in nm (ZYX); use when dataset units
+                                    # are not nm (e.g. 1 um = 1000 nm). Only affects
+                                    # mesh vertex scaling, not ROI coordinates.
+
+# ── Region of interest (optional) ──
+roi:                             # Restrict processing to this subregion
+  begin: [100, 200, 300]         # Start coordinates in dataset world units (ZYX)
+  end: [500, 600, 700]           # End coordinates in dataset world units (ZYX)
+                                 # Boundary edges are preserved during simplification.
+                                 # Can also be passed via CLI: --roi z0,y0,x0,z1,y1,x1
 ```
 
-Takes existing meshes (e.g. PLY files), decimates them at multiple LODs using pyfqmr, decomposes into spatial fragments, Draco-compresses, and writes the neuroglancer `multilod_draco` format.
+#### `to-neuroglancer` — Convert existing meshes to neuroglancer multiresolution format
+
+```bash
+mesh-n-bone to-neuroglancer CONFIG_PATH -n NUM_WORKERS [--roi begin_x,begin_y,begin_z,end_x,end_y,end_z]
+```
+
+Takes existing meshes (e.g. PLY files), decimates them at multiple LODs using pyfqmr, decomposes into spatial fragments, Draco-compresses, and writes the neuroglancer `multilod_draco` format. Use this when you already have single-scale meshes and just need the neuroglancer format.
 
 Config directory must contain `run-config.yaml` and `dask-config.yaml`. Example `run-config.yaml`:
 
 ```yaml
 required_settings:
-  input_path: /path/to/meshes        # Directory with LOD 0 meshes
-  output_path: /path/to/output       # Output directory
-  num_lods: 6                        # Number of levels of detail
+  input_path: /path/to/meshes       # Directory containing LOD 0 mesh files (e.g. PLY)
+  output_path: /path/to/output      # Where to write neuroglancer output
+  num_lods: 6                       # Number of levels of detail to generate
 
 optional_decimation_settings:
-  box_size: 4                        # LOD 0 box size (scalar or [x, y, z])
-  skip_decimation: false             # Skip if decimated meshes already exist
-  decimation_factor: 4               # Face reduction factor per LOD
-  aggressiveness: 10                 # Decimation aggressiveness
-  delete_decimated_meshes: true      # Clean up intermediate files
+  box_size: 4                       # LOD 0 fragment size in world units (scalar or [x, y, z])
+  skip_decimation: false            # Set true to reuse previously decimated meshes
+  decimation_factor: 4              # Face reduction factor per LOD (default: 2)
+  aggressiveness: 10                # pyfqmr decimation aggressiveness (default: 7)
+  delete_decimated_meshes: true     # Remove intermediate LOD mesh files when done
+  roi:                              # Only process meshes intersecting this region (XYZ)
+    begin: [0, 0, 0]
+    end: [1000, 1000, 1000]
+
+optional_properties_settings:
+  segment_properties_csv: /path/to/properties.csv  # CSV with per-segment metadata
+  segment_properties_columns: [col1, col2]         # Which columns to include (default: all)
+  segment_properties_id_column: "Object ID"        # CSV column with segment IDs
 ```
 
 `box_size` can be a scalar (applied to all axes) or a 3-element list for per-axis control, which prevents degenerate triangles on elongated meshes.

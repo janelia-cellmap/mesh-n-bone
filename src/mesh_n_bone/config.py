@@ -27,6 +27,8 @@ def read_multires_config(config_path):
             optional_decimation_settings["aggressiveness"] = 7
         if "delete_decimated_meshes" not in optional_decimation_settings:
             optional_decimation_settings["delete_decimated_meshes"] = False
+        if "roi" not in optional_decimation_settings:
+            optional_decimation_settings["roi"] = None
 
         optional_properties_settings = config.get("optional_properties_settings", {})
         if "segment_properties_csv" not in optional_properties_settings:

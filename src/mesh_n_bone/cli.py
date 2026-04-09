@@ -41,12 +41,28 @@ def _get_run_properties(args):
     return execution_directory, logpath, run_config
 
 
+def _parse_roi_arg(roi_str):
+    """Parse --roi argument into a dict with 'begin' and 'end' keys.
+
+    Accepts 6 comma-separated values: begin_0,begin_1,begin_2,end_0,end_1,end_2
+    For meshify these are in ZYX order (matching the volume); for multires in XYZ.
+    """
+    values = [float(v) for v in roi_str.split(",")]
+    if len(values) != 6:
+        raise argparse.ArgumentTypeError(
+            "ROI must be 6 comma-separated values: begin_0,begin_1,begin_2,end_0,end_1,end_2"
+        )
+    return {"begin": values[:3], "end": values[3:]}
+
+
 def cmd_meshify(args):
     """Run the meshify pipeline."""
     from mesh_n_bone.meshify.meshify import Meshify
     from mesh_n_bone.util.logging import tee_streams
 
     execution_directory, logpath, run_config = _get_run_properties(args)
+    if args.roi:
+        run_config["roi"] = _parse_roi_arg(args.roi)
     with tee_streams(logpath):
         os.chdir(execution_directory)
         meshify = Meshify(**run_config)
@@ -57,7 +73,8 @@ def cmd_multires(args):
     """Run the multiresolution mesh pipeline."""
     from mesh_n_bone.multires.multires import run_multires
 
-    run_multires(args.config_path, args.num_workers)
+    roi = _parse_roi_arg(args.roi) if args.roi else None
+    run_multires(args.config_path, args.num_workers, roi=roi)
 
 
 def cmd_skeletonize(args):
@@ -113,15 +130,27 @@ def main():
     p_meshify.add_argument(
         "-n", "--num-workers", type=int, default=10, help="Number of dask workers"
     )
+    p_meshify.add_argument(
+        "--roi",
+        type=str,
+        default=None,
+        help="ROI to process (ZYX): begin_z,begin_y,begin_x,end_z,end_y,end_x",
+    )
     p_meshify.set_defaults(func=cmd_meshify)
 
-    # multires
+    # to-neuroglancer
     p_multires = subparsers.add_parser(
-        "multires", help="Create multiresolution neuroglancer meshes"
+        "to-neuroglancer", help="Convert existing meshes to neuroglancer multiresolution format"
     )
     p_multires.add_argument("config_path", help="Path to config directory")
     p_multires.add_argument(
         "-n", "--num-workers", type=int, default=10, help="Number of dask workers"
+    )
+    p_multires.add_argument(
+        "--roi",
+        type=str,
+        default=None,
+        help="ROI to process (XYZ): begin_x,begin_y,begin_z,end_x,end_y,end_z",
     )
     p_multires.set_defaults(func=cmd_multires)
 

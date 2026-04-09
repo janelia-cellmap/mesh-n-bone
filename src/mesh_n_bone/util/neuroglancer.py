@@ -424,7 +424,7 @@ def write_singleres_multires_metadata(meshdir, csv_path=None, csv_columns=None, 
 
 def write_precomputed_annotations(
     output_directory, annotation_type, ids, coords,
-    properties_dict, relationships_dict=None,
+    properties_dict, relationships_dict=None, coordinate_units="nm",
 ):
     """Write neuroglancer precomputed annotations."""
     os.makedirs(f"{output_directory}/spatial0", exist_ok=True)
@@ -474,7 +474,7 @@ def write_precomputed_annotations(
     max_extents = [int(max_extent) for max_extent in max_extents]
     info = {
         "@type": "neuroglancer_annotations_v1",
-        "dimensions": {"x": [1, "nm"], "y": [1, "nm"], "z": [1, "nm"]},
+        "dimensions": {"x": [1, coordinate_units], "y": [1, coordinate_units], "z": [1, coordinate_units]},
         "by_id": {"key": "by_id"},
         "lower_bound": [0, 0, 0],
         "upper_bound": max_extents,

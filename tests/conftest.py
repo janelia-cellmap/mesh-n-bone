@@ -164,25 +164,15 @@ def _make_zarr_cube(tmp_dir, voxel_size, offset, vol_shape, cube_slice, label=1,
         )
 
     # Compute expected mesh bounds in XYZ.
-    # zmesh marching cubes places boundary at (voxel_index - 0.5) * voxel_size
-    # The actual mesh boundary for a solid block [a:b] is at:
-    #   min_world = offset + (a - 0.5) * voxel_size
-    #   max_world = offset + (b - 0.5) * voxel_size
-    # But zmesh internally shifts by +0.5 voxel, so the surface is at:
-    #   min = offset + (a - 0.5) * voxel_size  (between voxel a-1 and a)
-    #   max = offset + (b - 1 + 0.5) * voxel_size  (between voxel b-1 and b)
     vs = np.array(voxel_size, dtype=float)  # ZYX
     off = np.array(offset, dtype=float)  # ZYX
-    starts = np.array([s.start for s in cube_slice], dtype=float)  # ZYX voxel indices
+    starts = np.array([s.start for s in cube_slice], dtype=float)
     stops = np.array([s.stop for s in cube_slice], dtype=float)
 
-    # zmesh produces vertices: the isosurface for binary label at voxel boundary
-    # min vertex ≈ (start - 0.5) * voxel_size, max vertex ≈ (stop - 0.5) * voxel_size
     expected_min_zyx = off + (starts - 0.5) * vs
     expected_max_zyx = off + (stops - 0.5) * vs
     expected_center_zyx = (expected_min_zyx + expected_max_zyx) / 2
 
-    # Convert to XYZ for mesh coordinates
     expected_min_xyz = expected_min_zyx[::-1]
     expected_max_xyz = expected_max_zyx[::-1]
     expected_center_xyz = expected_center_zyx[::-1]
@@ -235,9 +225,6 @@ def zarr_sphere(tmp_output_dir):
             f,
         )
 
-    # Expected sphere center in world XYZ: [32*2, 32*2, 32*2] = [64, 64, 64]
-    # Expected radius in world units: 20 * 2 = 40
-    # Expected volume: (4/3) * pi * 40^3 ≈ 268082.6
     expected_center_xyz = np.array([64.0, 64.0, 64.0])
     expected_radius_world = 40.0
     expected_volume = (4.0 / 3.0) * np.pi * expected_radius_world**3
