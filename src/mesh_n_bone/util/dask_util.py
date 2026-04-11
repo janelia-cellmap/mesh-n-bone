@@ -17,7 +17,24 @@ logger = logging.getLogger(__name__)
 
 
 def set_local_directory(cluster_type):
-    """Sets local directory used for dask outputs."""
+    """Configure a writable local-directory for Dask worker spill and temp files.
+
+    Tries ``/scratch/<user>`` then ``/tmp/<user>``, creating the directory if
+    needed. Also sets ``tempfile.tempdir`` and the ``TMPDIR`` environment
+    variable. Does nothing if the Dask config already has a local-directory
+    for the given cluster type.
+
+    Parameters
+    ----------
+    cluster_type : str
+        Dask-jobqueue cluster type key (e.g. ``"lsf"``, ``"slurm"``,
+        ``"local"``).
+
+    Raises
+    ------
+    RuntimeError
+        If no writable directory can be created.
+    """
     local_dir = dask.config.get(f"jobqueue.{cluster_type}.local-directory", None)
     if local_dir:
         return
@@ -44,10 +61,31 @@ def set_local_directory(cluster_type):
 
 @contextmanager
 def start_dask(num_workers, msg, logger, config=None):
-    """Context manager used for starting/shutting down dask.
+    """Context manager that starts a Dask cluster and yields a ``Client``.
 
-    When num_workers == 1, no cluster is created and no dask-config.yaml
-    is required — work runs in the calling process via plain .compute().
+    When ``num_workers == 1`` and no *config* is provided, no cluster is
+    created -- work runs in the calling process with the synchronous
+    scheduler. Otherwise a cluster is created from ``dask-config.yaml``
+    (or the supplied *config* dict) and shut down on exit.
+
+    Parameters
+    ----------
+    num_workers : int
+        Number of workers to request.  ``1`` triggers local/synchronous
+        mode when *config* is ``None``.
+    msg : str
+        Human-readable label used in log messages and the dashboard link.
+    logger : logging.Logger
+        Logger instance for status messages.
+    config : dict or None
+        Parsed Dask configuration dictionary.  If ``None``, the file
+        ``dask-config.yaml`` in the current directory is loaded.
+
+    Yields
+    ------
+    client : dask.distributed.Client or None
+        A connected Dask client, or nothing (bare ``yield``) in
+        synchronous mode.
     """
     if not config:
         if num_workers == 1:
@@ -58,38 +96,67 @@ def start_dask(num_workers, msg, logger, config=None):
         with open("dask-config.yaml") as f:
             config = yaml.load(f, Loader=SafeLoader)
 
+    job_script_prologue = [
+        "export NUMEXPR_MAX_THREADS=1",
+        "export NUMEXPR_NUM_THREADS=1",
+        "export MKL_NUM_THREADS=1",
+        "export NUM_MKL_THREADS=1",
+        "export OPENBLAS_NUM_THREADS=1",
+        "export OPENMP_NUM_THREADS=1",
+        "export OMP_NUM_THREADS=1",
+    ]
+
     cluster_type = next(iter(config["jobqueue"]))
     dask.config.update(dask.config.config, config)
 
     set_local_directory(cluster_type)
     if cluster_type == "local":
         from dask.distributed import LocalCluster
+        import socket
 
+        hostname = socket.gethostname()
         cluster = LocalCluster(n_workers=num_workers, threads_per_worker=1)
     else:
         if cluster_type == "lsf":
             from dask_jobqueue import LSFCluster
 
-            cluster = LSFCluster()
+            cluster = LSFCluster(
+                job_script_prologue=job_script_prologue,
+                scheduler_options={
+                    "service_kwargs": {
+                        "dashboard": {
+                            "session_token_expiration": 60 * 60 * 24,
+                        }
+                    },
+                },
+            )
         elif cluster_type == "slurm":
             from dask_jobqueue import SLURMCluster
 
-            cluster = SLURMCluster()
+            cluster = SLURMCluster(
+                job_script_prologue=job_script_prologue,
+            )
         elif cluster_type == "sge":
             from dask_jobqueue import SGECluster
 
             cluster = SGECluster()
         cluster.scale(num_workers)
     try:
-        with Timing_Messager(f"Starting dask cluster for {msg}", logger):
+        with Timing_Messager(
+            f"Starting {cluster_type} dask cluster for {msg} with {num_workers} workers",
+            logger,
+        ):
             client = Client(cluster)
             try:
                 client.wait_for_workers(num_workers, timeout=300)
             except TimeoutError:
                 pass
 
+        dashboard_link = client.cluster.dashboard_link
+        if cluster_type == "local":
+            dashboard_link = dashboard_link.replace("127.0.0.1", hostname)
         print_with_datetime(
-            f"Check {client.cluster.dashboard_link} for {msg} status.", logger
+            f"Check {dashboard_link} for {msg} status.", logger
         )
         yield client
     finally:
@@ -98,8 +165,24 @@ def start_dask(num_workers, msg, logger, config=None):
 
 
 def setup_execution_directory(config_path, logger):
-    """Sets up the execution directory which is the config dir appended with
-    the date and time."""
+    """Create a timestamped copy of a configuration directory for execution.
+
+    The new directory name is ``<config_path>-<YYYYmmdd.HHMMSS>``. The
+    ``run-config.yaml`` inside is made read-only to prevent accidental
+    modification during a run.
+
+    Parameters
+    ----------
+    config_path : str
+        Path to the source configuration directory.
+    logger : logging.Logger
+        Logger instance for status messages.
+
+    Returns
+    -------
+    str
+        Absolute path to the newly created execution directory.
+    """
     config_path = config_path[:-1] if config_path[-1] == "/" else config_path
     timestamp = f"{datetime.now():%Y%m%d.%H%M%S}"
     execution_dir = f"{config_path}-{timestamp}"
@@ -112,6 +195,26 @@ def setup_execution_directory(config_path, logger):
 
 
 def guesstimate_npartitions(elements, num_workers, scaling=10):
+    """Estimate a reasonable number of Dask-bag partitions.
+
+    Aims for roughly ``num_workers * scaling`` partitions, then rounds
+    to produce evenly sized partitions.
+
+    Parameters
+    ----------
+    elements : int or Sized
+        Total number of elements (or a collection whose length is used).
+    num_workers : int
+        Number of Dask workers available.
+    scaling : int, optional
+        Multiplier applied to *num_workers* to set the target partition
+        count.  Default is ``10``.
+
+    Returns
+    -------
+    int
+        Number of partitions.
+    """
     if not isinstance(elements, int):
         elements = len(elements)
     approximate_npartitions = min(elements, num_workers * scaling)
@@ -121,9 +224,32 @@ def guesstimate_npartitions(elements, num_workers, scaling=10):
 
 
 def compute_bag(fn, memmap_file_path, variable_args_list, fixed_args_list, num_workers):
-    """Execute a function over variable args using dask bag with memory-mapped arrays.
+    """Execute a function over a list of argument tuples using a Dask bag.
 
-    When num_workers == 1 (no distributed client), falls back to plain .compute().
+    The *variable_args_list* is saved to disk as a NumPy ``.npy`` file and
+    memory-mapped by each worker so that large arrays are not serialised
+    through the scheduler. When ``num_workers == 1`` the bag is computed
+    synchronously.
+
+    Parameters
+    ----------
+    fn : callable
+        Function to call for each element. Called as
+        ``fn(*variable_args[i], *fixed_args_list)``.
+    memmap_file_path : str
+        Path where the temporary ``.npy`` file is written.  Deleted after
+        computation.
+    variable_args_list : array_like
+        Array of argument tuples, one per element.
+    fixed_args_list : list
+        Additional arguments appended to every call.
+    num_workers : int
+        Number of Dask workers.  ``1`` triggers synchronous execution.
+
+    Raises
+    ------
+    RuntimeError
+        If any partition raises an exception on a distributed cluster.
     """
     np.save(memmap_file_path, variable_args_list)
 
@@ -164,19 +290,48 @@ def compute_bag(fn, memmap_file_path, variable_args_list, fixed_args_list, num_w
 try:
     from dataclasses import dataclass
     from funlib.geometry import Roi
-    from funlib.persistence import Array
 
     @dataclass
     class DaskBlock:
+        """A spatial block for distributed processing.
+
+        Parameters
+        ----------
+        index : int
+            Sequential block index.
+        roi : funlib.geometry.Roi
+            Region of interest covered by this block.
+        """
+
         index: int
         roi: Roi
 
     def create_blocks(
-        roi: Roi,
-        ds: Array,
+        roi,
+        ds,
         read_write_block_shape_pixels=None,
         padding=None,
     ):
+        """Tile a region of interest into ``DaskBlock`` instances.
+
+        Parameters
+        ----------
+        roi : funlib.geometry.Roi
+            Region of interest to partition.
+        ds : object
+            Dataset with ``chunk_shape`` and ``voxel_size`` attributes
+            (e.g. ``CellMapArray``).
+        read_write_block_shape_pixels : numpy.ndarray or None
+            Override block size in voxel units.  When ``None``, the
+            dataset's chunk shape is used.
+        padding : funlib.geometry.Coordinate or None
+            Symmetric padding to grow each block ROI by.
+
+        Returns
+        -------
+        list[DaskBlock]
+            Blocks covering the entire *roi*.
+        """
         with Timing_Messager("Generating blocks", logger):
             block_size = read_write_block_shape_pixels
             if read_write_block_shape_pixels is None:

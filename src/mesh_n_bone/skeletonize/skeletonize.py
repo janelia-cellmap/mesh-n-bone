@@ -20,7 +20,36 @@ logger = logging.getLogger(__name__)
 
 
 class Skeletonize:
-    """Skeletonize meshes using CGAL and dask."""
+    """Skeletonize meshes using CGAL and dask.
+
+    Orchestrates the full pipeline: reading meshes, calling the CGAL
+    skeletonizer binary, pruning and simplifying the resulting skeletons,
+    computing morphometric metrics, and writing neuroglancer-compatible
+    outputs.
+
+    Parameters
+    ----------
+    input_directory : str
+        Directory containing input mesh files (PLY or neuroglancer Draco).
+    output_directory : str
+        Root directory for all outputs (CGAL skeletons, neuroglancer
+        skeletons, and metrics CSV).
+    num_workers : int, optional
+        Number of dask workers for parallel processing.  Default is ``10``.
+    min_branch_length_nm : float, optional
+        Branches shorter than this value (nanometres) are pruned.
+        Default is ``100``.
+    simplification_tolerance_nm : float, optional
+        Ramer-Douglas-Peucker tolerance (nanometres) used when
+        simplifying skeletons.  Default is ``50``.
+    base_loop_subdivision_iterations : int, optional
+        Number of Loop subdivision iterations applied to the mesh
+        before skeletonization.  Default is ``1``.
+    neuroglancer_format : bool, optional
+        If ``True``, input meshes are treated as neuroglancer
+        precomputed format (possibly Draco-compressed).  Default is
+        ``False``.
+    """
 
     def __init__(
         self,
@@ -48,6 +77,38 @@ class Skeletonize:
         neuroglancer_format: bool = False,
         timeout_seconds: int = 120,
     ) -> None:
+        """Run the CGAL skeletonizer binary on a single mesh file.
+
+        If the input is a Draco-compressed neuroglancer mesh, it is first
+        decoded and dequantized to a temporary PLY file.  The binary is
+        invoked with increasing Loop subdivision iterations (starting from
+        *base_loop_subdivision_iterations*) until it succeeds or the
+        maximum number of retries is exhausted.
+
+        Parameters
+        ----------
+        input_file : str
+            Path to the input mesh (PLY or neuroglancer Draco).
+        output_file : str
+            Path where the CGAL skeleton text file will be written.
+        base_loop_subdivision_iterations : int, optional
+            Starting number of Loop subdivision iterations.  Default is
+            ``1``.  The timeout scales by ``4**(iterations - 1)``.
+        neuroglancer_format : bool, optional
+            When ``True``, attempt to read the mesh as neuroglancer
+            precomputed / Draco format.  Default is ``False``.
+        timeout_seconds : int, optional
+            Base timeout for the subprocess call in seconds.  Default is
+            ``120``.
+
+        Raises
+        ------
+        FileNotFoundError
+            If the CGAL skeletonizer binary cannot be located.
+        Exception
+            If skeletonization times out at every retry or the subprocess
+            exits with a non-zero status.
+        """
         import tempfile
         import DracoPy
 
@@ -197,6 +258,21 @@ class Skeletonize:
 
     @staticmethod
     def read_skeleton_from_custom_file(filename):
+        """Read a skeleton from the CGAL skeletonizer's custom text format.
+
+        The file uses line prefixes: ``v`` for vertices (x y z radius),
+        ``e`` for edges, and ``p`` for polylines.
+
+        Parameters
+        ----------
+        filename : str
+            Path to the skeleton text file.
+
+        Returns
+        -------
+        CustomSkeleton
+            Parsed skeleton with vertices, edges, radii, and polylines.
+        """
         vertices = []
         edges = []
         radii = []
@@ -228,6 +304,23 @@ class Skeletonize:
         )
 
     def process_custom_skeleton_df(self, df):
+        """Process a partition of skeleton IDs and return a metrics DataFrame.
+
+        Intended to be used as a ``map_partitions`` callable with dask.
+        Each row is read, pruned, simplified, and written to disk; the
+        corresponding morphometric metrics are collected.
+
+        Parameters
+        ----------
+        df : pandas.DataFrame
+            Partition with at least an ``id`` column containing skeleton
+            file names.
+
+        Returns
+        -------
+        pandas.DataFrame
+            Concatenated metrics for every skeleton in *df*.
+        """
         results_df = []
         for row in df.itertuples():
             try:
@@ -254,6 +347,31 @@ class Skeletonize:
         min_branch_length_nm=100,
         simplification_tolerance_nm=50,
     ):
+        """Read, prune, simplify, and export a single skeleton.
+
+        Writes both the full and simplified neuroglancer skeletons under
+        ``<output_directory>/skeleton/{full,simplified}/<id>``.
+
+        Parameters
+        ----------
+        skeleton_path : str
+            Path to the CGAL skeleton text file.
+        output_directory : str
+            Root output directory.
+        min_branch_length_nm : float, optional
+            Minimum branch length for pruning (nanometres).  Default is
+            ``100``.
+        simplification_tolerance_nm : float, optional
+            RDP tolerance for simplification (nanometres).  Default is
+            ``50``.
+
+        Returns
+        -------
+        dict
+            Morphometric metrics keyed by ``"id"``,
+            ``"lsp (nm)"``, ``"radius mean (nm)"``,
+            ``"radius std (nm)"``, and ``"num branches"``.
+        """
         skeleton_id = os.path.basename(skeleton_path).split(".")[0]
         custom_skeleton = Skeletonize.read_skeleton_from_custom_file(skeleton_path)
 
@@ -280,6 +398,11 @@ class Skeletonize:
         return metrics
 
     def get_skeletons_from_meshes(self):
+        """Run CGAL skeletonization on all meshes in the input directory.
+
+        Meshes are processed in parallel using dask.  Results are written
+        to ``<output_directory>/cgal/``.
+        """
         os.makedirs(f"{self.output_directory}/cgal", exist_ok=True)
         all_files = os.listdir(self.input_directory)
 
@@ -305,6 +428,13 @@ class Skeletonize:
                 b.compute()
 
     def process_custom_skeletons(self):
+        """Prune, simplify, and export all CGAL skeletons in parallel.
+
+        Reads skeleton text files from ``<output_directory>/cgal/``,
+        computes metrics, writes neuroglancer skeleton files, and saves a
+        sorted CSV of morphometric measurements to
+        ``<output_directory>/metrics/skeleton_metrics.csv``.
+        """
         self.cgal_output_directory = f"{self.output_directory}/cgal/"
         skeleton_filenames = os.listdir(self.cgal_output_directory)
         metrics = ["lsp (nm)", "radius mean (nm)", "radius std (nm)", "num branches"]
@@ -371,6 +501,22 @@ class Skeletonize:
 
     @staticmethod
     def get_longest_shortest_path_distance(skeleton):
+        """Compute the longest shortest-path distance in a skeleton.
+
+        Builds a weighted graph from the skeleton and finds the pair of
+        nodes whose shortest-path distance is maximal (i.e., the graph
+        diameter in Euclidean-weighted terms).
+
+        Parameters
+        ----------
+        skeleton : CustomSkeleton
+            Skeleton whose vertices and edges define the graph.
+
+        Returns
+        -------
+        float
+            Maximum pairwise shortest-path distance in nanometres.
+        """
         g = nx.Graph()
         g.add_nodes_from(range(len(skeleton.vertices)))
         g.add_edges_from(skeleton.edges)
@@ -386,7 +532,12 @@ class Skeletonize:
         return max_distance
 
     def get_skeletons(self):
-        """Generate skeletons from meshes and process them."""
+        """Run the full skeletonization pipeline.
+
+        Creates the output directory, generates CGAL skeletons from all
+        input meshes, then prunes, simplifies, exports, and computes
+        metrics for each skeleton.
+        """
         os.makedirs(self.output_directory, exist_ok=True)
         self.get_skeletons_from_meshes()
         self.process_custom_skeletons()

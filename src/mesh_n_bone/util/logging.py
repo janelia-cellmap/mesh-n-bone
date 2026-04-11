@@ -16,7 +16,18 @@ logger = logging.getLogger(__name__)
 
 
 class Timing_Messager(ContextDecorator):
-    """Context manager class to time operations"""
+    """Context manager and decorator that logs elapsed wall-clock time.
+
+    Prints a "starting..." message on entry and a "completed in <seconds>!"
+    message on exit.
+
+    Parameters
+    ----------
+    base_message : str
+        Human-readable label for the operation being timed.
+    logger : logging.Logger
+        Logger instance used for output.
+    """
 
     def __init__(self, base_message, logger):
         self._base_message = base_message
@@ -36,16 +47,39 @@ class Timing_Messager(ContextDecorator):
 
 
 def print_with_datetime(output, logger):
+    """Log a message prefixed with the current date and time.
+
+    Parameters
+    ----------
+    output : str
+        Message to log.
+    logger : logging.Logger
+        Logger instance used for output (at INFO level).
+    """
     now = datetime.now().strftime("%Y/%m/%d %H:%M:%S")
     logger.info(f"{now}: {output}")
 
 
 @contextmanager
 def stdout_redirected(to=os.devnull, stdout=None):
-    """Context manager that redirects a file object or file descriptor to a new
-    file descriptor, including C/C++ output.
+    """Redirect a file descriptor (including C/C++ level output) to another target.
 
-    Lifted from https://stackoverflow.com/a/22434262/162094 (MIT License)
+    This works at the OS file-descriptor level, so it captures output from
+    native extensions that bypass Python's ``sys.stdout``.
+
+    Adapted from https://stackoverflow.com/a/22434262/162094 (MIT License).
+
+    Parameters
+    ----------
+    to : str or file-like, optional
+        Destination file path or file object.  Defaults to ``os.devnull``.
+    stdout : file-like or None, optional
+        The stream to redirect.  Defaults to ``sys.stdout``.
+
+    Yields
+    ------
+    file-like
+        The original *stdout* object (useful for nested redirections).
     """
     if stdout is None:
         stdout = sys.stdout
@@ -89,7 +123,19 @@ def fileno(file_or_fd):
 
 @contextmanager
 def tee_streams(output_path, append=False):
-    """Context manager. All stdout and stderr will be tee'd to a file on disk."""
+    """Duplicate stdout and stderr to a file on disk (like Unix ``tee``).
+
+    Both Python-level and C-level output is captured by redirecting the
+    underlying file descriptors through a ``tee`` subprocess.
+
+    Parameters
+    ----------
+    output_path : str
+        Path to the log file.
+    append : bool, optional
+        If ``True``, append to the file instead of overwriting.
+        Default is ``False``.
+    """
     if append:
         append = "-a"
     else:
@@ -122,7 +168,27 @@ def tee_streams(output_path, append=False):
 
 @contextmanager
 def email_on_exit(email_config, workflow_name, execution_dir, logpath):
-    """Context manager. Sends an email when the context exits with success/fail status."""
+    """Send a notification email when the enclosed block exits.
+
+    On success an informational email is sent; on failure the exception
+    details are included. If ``email_config["send"]`` is ``False`` or no
+    addresses are configured, the context manager is a no-op.
+
+    Parameters
+    ----------
+    email_config : dict
+        Configuration dictionary with keys ``"send"`` (bool),
+        ``"addresses"`` (list of str), and ``"include-log"`` (bool).
+        The special address ``"JANELIA_USER"`` is expanded to
+        ``<unix-user>@janelia.hhmi.org``.
+    workflow_name : str
+        Human-readable workflow name used in the email subject.
+    execution_dir : str
+        Path to the execution directory, included in the email body.
+    logpath : str
+        Path to the log file.  Appended to the email body when
+        ``email_config["include-log"]`` is ``True``.
+    """
     if not email_config["send"]:
         yield
         return
@@ -194,8 +260,35 @@ def email_on_exit(email_config, workflow_name, execution_dir, logpath):
 
 
 def capture_draco_output(fd, fn, *args, **kwargs):
-    """Capture output from a file descriptor during a function call.
-    Used to detect Draco encoding errors written to stderr."""
+    """Call a function while capturing output from a file descriptor.
+
+    Temporarily redirects *fd* (typically ``sys.stderr.fileno()``) to a
+    pipe, runs *fn*, then reads the captured bytes. If the captured text
+    contains the word ``"error"``, an exception is raised.
+
+    Parameters
+    ----------
+    fd : int
+        OS-level file descriptor to capture (e.g. ``2`` for stderr).
+    fn : callable
+        Function to invoke.
+    *args
+        Positional arguments forwarded to *fn*.
+    **kwargs
+        Keyword arguments forwarded to *fn*.
+
+    Returns
+    -------
+    result : object
+        Return value of ``fn(*args, **kwargs)``.
+    captured : str
+        Text captured from the file descriptor.
+
+    Raises
+    ------
+    Exception
+        If the captured output contains the substring ``"error"``.
+    """
     orig_fd = os.dup(fd)
     r, w = os.pipe()
     os.dup2(w, fd)

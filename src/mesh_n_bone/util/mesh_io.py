@@ -7,8 +7,21 @@ from collections import namedtuple
 
 
 class Fragment:
-    """Fragment class used to store and update fragment chunk vertices, faces
-    and corresponding lod 0 fragments."""
+    """A mesh fragment representing a chunk of a multi-LOD mesh.
+
+    Stores vertices, faces, and the corresponding LOD 0 fragment positions
+    for a single spatial chunk. Supports incremental updates as new
+    sub-fragments are merged in.
+
+    Parameters
+    ----------
+    vertices : numpy.ndarray
+        Vertex positions with shape ``(N, 3)``.
+    faces : numpy.ndarray
+        Triangle face indices with shape ``(M, 3)``.
+    lod_0_fragment_pos : list
+        List of LOD 0 fragment grid positions associated with this fragment.
+    """
 
     def __init__(self, vertices, faces, lod_0_fragment_pos):
         self.vertices = vertices
@@ -36,7 +49,25 @@ CompressedFragment = namedtuple(
 
 
 def unpack_and_remove(datatype, num_elements, file_content):
-    """Read and remove bytes from binary file object."""
+    """Unpack values from the front of a binary buffer and return the remainder.
+
+    Parameters
+    ----------
+    datatype : str
+        A single-character ``struct`` format code (e.g. ``'I'``, ``'f'``).
+    num_elements : int
+        Number of elements to unpack.
+    file_content : bytes
+        Binary buffer to read from.
+
+    Returns
+    -------
+    value : int, float, or numpy.ndarray
+        The unpacked value (scalar when ``num_elements == 1``, otherwise an
+        array).
+    file_content : bytes
+        The remaining bytes after the consumed portion.
+    """
     datatype = datatype * num_elements
     output = struct.unpack(datatype, file_content[0 : 4 * num_elements])
     file_content = file_content[4 * num_elements :]
@@ -47,7 +78,25 @@ def unpack_and_remove(datatype, num_elements, file_content):
 
 
 def mesh_loader(filepath):
-    """Wrapper for trimesh mesh loading, with addition of ngmesh loading."""
+    """Load a mesh from disk, supporting standard formats and ngmesh.
+
+    Files with no extension, ``.ngmesh``, or ``.ng`` are loaded as
+    Neuroglancer binary meshes. All other extensions are delegated to
+    ``trimesh.load``.
+
+    Parameters
+    ----------
+    filepath : str
+        Path to the mesh file.
+
+    Returns
+    -------
+    vertices : numpy.ndarray or None
+        Vertex positions with shape ``(N, 3)``, or ``None`` if the file
+        does not exist or contains no mesh geometry.
+    faces : numpy.ndarray or None
+        Triangle face indices with shape ``(M, 3)``, or ``None``.
+    """
 
     def _load_ngmesh(filepath):
         with open(filepath, mode="rb") as file:
@@ -97,7 +146,18 @@ def _cmp_zorder(lhs, rhs) -> bool:
 
 
 def zorder_fragments(fragments):
-    """Order the fragments in appropriate z curve order."""
+    """Sort fragments into Z-curve (Morton) order by their grid positions.
+
+    Parameters
+    ----------
+    fragments : list[CompressedFragment]
+        Fragments to sort; each must have a ``position`` attribute.
+
+    Returns
+    -------
+    list[CompressedFragment]
+        The same fragments in Z-curve order.
+    """
     fragments, _ = zip(
         *sorted(
             zip(fragments, [fragment.position for fragment in fragments]),
@@ -108,8 +168,22 @@ def zorder_fragments(fragments):
 
 
 def rewrite_index_with_empty_fragments(path, current_lod_fragments):
-    """Based on existing fragments and newly created fragments,
-    rewrite index file with missing empty fragments."""
+    """Rewrite an existing index file, inserting empty fragments for completeness.
+
+    Neuroglancer requires that every parent fragment at a coarser LOD has all
+    of its child fragments present (even if empty) so that LOD transitions
+    work correctly. This function reads the current ``.index`` file, computes
+    which child fragments are missing, inserts zero-length placeholders, and
+    writes the updated index back.
+
+    Parameters
+    ----------
+    path : str
+        Base path for the mesh (without ``.index`` suffix). The index file is
+        expected at ``path + ".index"``.
+    current_lod_fragments : list[CompressedFragment]
+        Newly created fragments for the next LOD level to be appended.
+    """
 
     with open(f"{path}.index", mode="rb") as file:
         file_content = file.read()
@@ -231,7 +305,27 @@ def rewrite_index_with_empty_fragments(path, current_lod_fragments):
 
 
 def write_index_file(path, grid_origin, fragments, current_lod, lods, chunk_shape):
-    """Write the index files for a mesh."""
+    """Write or update the ``.index`` file for a multi-LOD Draco mesh.
+
+    If this is the first LOD or no index file exists yet, a new file is
+    created. Otherwise the existing index is rewritten via
+    ``rewrite_index_with_empty_fragments`` to incorporate the new LOD.
+
+    Parameters
+    ----------
+    path : str
+        Base path for the mesh (without extension).
+    grid_origin : numpy.ndarray
+        Origin of the fragment grid in model coordinates, shape ``(3,)``.
+    fragments : list[CompressedFragment]
+        Compressed mesh fragments for the current LOD.
+    current_lod : int
+        The LOD level being written.
+    lods : list[int]
+        All LOD levels that have been (or will be) generated.
+    chunk_shape : numpy.ndarray
+        Size of a single LOD 0 chunk in model coordinates, shape ``(3,)``.
+    """
     lods = [lod for lod in lods if lod <= current_lod]
 
     num_lods = len(lods)
@@ -261,7 +355,23 @@ def write_index_file(path, grid_origin, fragments, current_lod, lods, chunk_shap
 
 
 def write_mesh_file(path, fragments):
-    """Write out the actual draco formatted mesh."""
+    """Append Draco-encoded fragment bytes to a mesh file on disk.
+
+    After writing, each fragment's ``draco_bytes`` is cleared (set to
+    ``None``) to free memory, while the positional metadata is preserved.
+
+    Parameters
+    ----------
+    path : str
+        File path to write (opened in append mode).
+    fragments : list[CompressedFragment]
+        Fragments whose ``draco_bytes`` will be written sequentially.
+
+    Returns
+    -------
+    list[CompressedFragment]
+        The same fragments with ``draco_bytes`` set to ``None``.
+    """
     with open(path, "ab") as f:
         for idx, fragment in enumerate(fragments):
             f.write(fragment.draco_bytes)
@@ -274,7 +384,28 @@ def write_mesh_file(path, fragments):
 def write_mesh_files(
     mesh_directory, object_id, grid_origin, fragments, current_lod, lods, chunk_shape
 ):
-    """Write out all relevant mesh files."""
+    """Write the mesh data and index files for a single segment.
+
+    Fragments are sorted into Z-curve order, their Draco bytes are appended
+    to the mesh file, and the index file is created or updated.
+
+    Parameters
+    ----------
+    mesh_directory : str
+        Directory where mesh files are stored.
+    object_id : str
+        Segment identifier used as the file name.
+    grid_origin : numpy.ndarray
+        Origin of the fragment grid in model coordinates, shape ``(3,)``.
+    fragments : list[CompressedFragment]
+        Compressed mesh fragments for the current LOD.
+    current_lod : int
+        The LOD level being written.
+    lods : list[int]
+        All LOD levels that have been (or will be) generated.
+    chunk_shape : numpy.ndarray
+        Size of a single LOD 0 chunk in model coordinates, shape ``(3,)``.
+    """
     path = mesh_directory + "/" + object_id
     if len(fragments) > 0:
         fragments = zorder_fragments(fragments)

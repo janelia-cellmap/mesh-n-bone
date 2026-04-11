@@ -7,7 +7,16 @@ import numpy as np
 
 
 def write_info_file(path):
-    """Write info file for neuroglancer multilod draco meshes."""
+    """Write the ``info`` JSON file for a Neuroglancer multi-LOD Draco mesh layer.
+
+    The generated file uses 10-bit vertex quantization, an identity
+    transform, and references a ``segment_properties`` sub-directory.
+
+    Parameters
+    ----------
+    path : str
+        Directory in which the ``info`` file is created.
+    """
     with open(f"{path}/info", "w") as f:
         info = {
             "@type": "neuroglancer_multilod_draco",
@@ -244,7 +253,28 @@ def _write_ngmesh(vertices_xyz, faces, f_out):
 
 
 def write_ngmesh(vertices_xyz, faces, f_out=None):
-    """Write mesh in ngmesh format."""
+    """Write a mesh in Neuroglancer binary (ngmesh) format.
+
+    The format consists of a ``uint32`` vertex count, followed by
+    ``float32`` vertex positions, followed by ``uint32`` triangle indices.
+
+    Parameters
+    ----------
+    vertices_xyz : numpy.ndarray
+        Vertex positions with shape ``(N, 3)``.
+    faces : numpy.ndarray
+        Triangle face indices with shape ``(M, 3)``.
+    f_out : str, file-like, or None
+        Destination. If ``None``, the encoded bytes are returned. If a
+        string, it is treated as a file path. Otherwise it must be a
+        writable binary file object.
+
+    Returns
+    -------
+    bytes or None
+        The encoded mesh bytes when ``f_out`` is ``None``; otherwise
+        ``None``.
+    """
     if f_out is None:
         with io.BytesIO() as bio:
             _write_ngmesh(vertices_xyz, faces, bio)
@@ -257,7 +287,25 @@ def write_ngmesh(vertices_xyz, faces, f_out=None):
 
 
 def write_ngmesh_metadata(meshdir, csv_path=None, csv_columns=None, csv_id_column="Object ID"):
-    """Write metadata for legacy neuroglancer mesh format."""
+    """Write ``info`` and segment-properties files for the legacy mesh format.
+
+    Discovers mesh IDs by scanning *meshdir* for files containing ``:0``
+    in their name.
+
+    Parameters
+    ----------
+    meshdir : str
+        Directory containing the legacy mesh files.
+    csv_path : str or None
+        Optional CSV file for additional segment properties.  See
+        ``_build_properties_from_csv`` for details.
+    csv_columns : list[str] or None
+        Subset of CSV columns to include.  ``None`` means all non-ID
+        columns.
+    csv_id_column : str
+        Name of the CSV column containing segment IDs.  Defaults to
+        ``"Object ID"``.
+    """
     mesh_ids = [f.split(":0")[0] for f in os.listdir(meshdir) if ":0" in f]
     mesh_ids.sort(key=int)
     info = {
@@ -316,7 +364,25 @@ def write_singleres_index_file(
     path, grid_origin, fragment_positions, fragment_offsets,
     current_lod, lods, chunk_shape,
 ):
-    """Write index file for single-resolution multires format."""
+    """Write a ``.index`` file for the single-resolution multi-LOD Draco format.
+
+    Parameters
+    ----------
+    path : str
+        Output file path (typically ending in ``.index``).
+    grid_origin : numpy.ndarray
+        Origin of the fragment grid in model coordinates, shape ``(3,)``.
+    fragment_positions : list[list[int]]
+        Grid positions for each fragment, each a 3-element list.
+    fragment_offsets : list[int]
+        Byte offsets (sizes) for each fragment in the mesh data file.
+    current_lod : int
+        The LOD level being written.
+    lods : list[int]
+        All LOD levels present.
+    chunk_shape : numpy.ndarray
+        Size of a single LOD 0 chunk in model coordinates, shape ``(3,)``.
+    """
     lods = [lod for lod in lods if lod <= current_lod]
     num_lods = len(lods)
     lod_scales = np.array([2**i for i in range(num_lods)])
@@ -340,7 +406,33 @@ def write_singleres_index_file(
 def write_singleres_multires_files(
     vertices_xyz, faces, path, vertex_quantization_bits=10, draco_compression_level=10
 ):
-    """Write single-resolution mesh in multires draco format."""
+    """Encode a single-resolution mesh as a multi-LOD Draco file with index.
+
+    The mesh is quantized into stored-model-space, Draco-encoded, and
+    written alongside a matching ``.index`` file so that Neuroglancer can
+    load it as a single-LOD multi-resolution mesh.
+
+    Parameters
+    ----------
+    vertices_xyz : numpy.ndarray
+        Vertex positions with shape ``(N, 3)``.
+    faces : numpy.ndarray
+        Triangle face indices with shape ``(M, 3)``.
+    path : str
+        Output file path for the Draco-encoded mesh data.
+    vertex_quantization_bits : int, optional
+        Number of quantization bits per vertex coordinate.  Default is
+        ``10``.
+    draco_compression_level : int, optional
+        Draco compression level (0--10).  Default is ``10``.
+
+    Returns
+    -------
+    res : bytes
+        The Draco-encoded mesh bytes.
+    vertices_xyz : numpy.ndarray
+        Quantized vertex positions in stored-model space.
+    """
     import DracoPy
 
     grid_origin = np.min(vertices_xyz, axis=0)
@@ -386,7 +478,24 @@ def write_singleres_multires_files(
 
 
 def write_singleres_multires_metadata(meshdir, csv_path=None, csv_columns=None, csv_id_column="Object ID"):
-    """Write metadata for single-resolution multires format."""
+    """Write ``info`` and segment-properties files for single-resolution multi-LOD meshes.
+
+    Discovers mesh IDs by scanning *meshdir* for ``.index`` files.
+
+    Parameters
+    ----------
+    meshdir : str
+        Directory containing the mesh and ``.index`` files.
+    csv_path : str or None
+        Optional CSV file for additional segment properties.  See
+        ``_build_properties_from_csv`` for details.
+    csv_columns : list[str] or None
+        Subset of CSV columns to include.  ``None`` means all non-ID
+        columns.
+    csv_id_column : str
+        Name of the CSV column containing segment IDs.  Defaults to
+        ``"Object ID"``.
+    """
     mesh_ids = [f.split(".index")[0] for f in os.listdir(meshdir) if ".index" in f]
     mesh_ids.sort(key=int)
     info = {
@@ -426,7 +535,32 @@ def write_precomputed_annotations(
     output_directory, annotation_type, ids, coords,
     properties_dict, relationships_dict=None, coordinate_units="nm",
 ):
-    """Write neuroglancer precomputed annotations."""
+    """Write a Neuroglancer precomputed annotation layer to disk.
+
+    Creates the ``spatial0/0_0_0`` binary file, optional relationship
+    files, and an ``info`` JSON file describing the layer.
+
+    Parameters
+    ----------
+    output_directory : str
+        Directory to write the annotation layer into.
+    annotation_type : str
+        Neuroglancer annotation type, e.g. ``"point"`` or ``"line"``.
+    ids : numpy.ndarray
+        Unique annotation IDs, shape ``(N,)``, dtype ``uint64``.
+    coords : numpy.ndarray
+        Coordinates for each annotation. Shape ``(N, 3)`` for points or
+        ``(N, 6)`` for lines (start + end).
+    properties_dict : dict[str, numpy.ndarray]
+        Mapping of property names to per-annotation ``float32`` value
+        arrays, each of length *N*.
+    relationships_dict : dict[str, numpy.ndarray] or None
+        Optional mapping of relationship IDs to index arrays selecting a
+        subset of annotations for each relationship.
+    coordinate_units : str, optional
+        Spatial unit string written into the ``info`` file.  Default is
+        ``"nm"``.
+    """
     os.makedirs(f"{output_directory}/spatial0", exist_ok=True)
     os.makedirs(f"{output_directory}/relationships", exist_ok=True)
 

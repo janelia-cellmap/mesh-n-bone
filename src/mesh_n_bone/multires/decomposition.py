@@ -10,8 +10,31 @@ logger = logging.getLogger(__name__)
 
 
 def my_slice_faces_plane(vertices, faces, plane_normal, plane_origin):
-    """Wrapper for trimesh slice_faces_plane to catch error that happens if the
-    whole mesh is to one side of the plane."""
+    """Slice a mesh along a plane, returning only the portion behind the plane.
+
+    Thin wrapper around ``trimesh.intersections.slice_faces_plane`` that
+    gracefully handles the case where the entire mesh lies on one side of
+    the cutting plane (which would otherwise raise a ``ValueError``).
+
+    Parameters
+    ----------
+    vertices : numpy.ndarray
+        Vertex positions with shape ``(N, 3)``.
+    faces : numpy.ndarray
+        Triangle face indices with shape ``(M, 3)``.
+    plane_normal : numpy.ndarray
+        Unit normal of the slicing plane (shape ``(3,)``).  Vertices on the
+        side the normal points toward are kept.
+    plane_origin : numpy.ndarray
+        A point on the slicing plane (shape ``(3,)``).
+
+    Returns
+    -------
+    vertices : numpy.ndarray
+        Vertex positions of the sliced mesh.
+    faces : numpy.ndarray
+        Face indices of the sliced mesh.
+    """
     if len(vertices) > 0 and len(faces) > 0:
         try:
             vertices, faces, _ = slice_faces_plane(
@@ -24,7 +47,26 @@ def my_slice_faces_plane(vertices, faces, plane_normal, plane_origin):
 
 
 def update_fragment_dict(dictionary, fragment_pos, vertices, faces, lod_0_fragment_pos):
-    """Update dictionary mapping fragment positions to Fragment objects."""
+    """Insert or update a fragment in the position-keyed dictionary.
+
+    If ``fragment_pos`` already exists in ``dictionary``, the fragment's
+    vertices and faces are extended via ``Fragment.update``.  Otherwise a
+    new ``mesh_io.Fragment`` is created and inserted.
+
+    Parameters
+    ----------
+    dictionary : dict
+        Mutable mapping from fragment position tuples to
+        ``mesh_io.Fragment`` objects.  Modified in place.
+    fragment_pos : tuple of int
+        ``(x, y, z)`` grid position of the fragment at the current LOD.
+    vertices : numpy.ndarray
+        Vertex positions with shape ``(N, 3)``.
+    faces : numpy.ndarray
+        Triangle face indices with shape ``(M, 3)``.
+    lod_0_fragment_pos : list of int
+        ``[x, y, z]`` grid position of the sub-fragment at LOD 0.
+    """
     if fragment_pos in dictionary:
         fragment = dictionary[fragment_pos]
         fragment.update(vertices, faces, lod_0_fragment_pos)
@@ -39,8 +81,44 @@ def generate_mesh_decomposition(
     mesh_path, lod_0_box_size, grid_origin, start_fragment, end_fragment,
     current_lod, num_chunks,
 ):
-    """Decompose a mesh into fragments of size lod_0_box_size * 2**current_lod.
-    Each fragment is also subdivided by 2x2x2."""
+    """Decompose a mesh into spatially-gridded, Draco-compressed fragments.
+
+    The mesh is loaded from ``mesh_path``, translated so that
+    ``grid_origin`` becomes the coordinate origin, and then sliced into
+    axis-aligned boxes of size ``lod_0_box_size * 2**current_lod``.  For
+    LOD >= 1 each box is further subdivided into a 2x2x2 grid of
+    sub-fragments at the LOD 0 scale.  Every resulting fragment is
+    quantized, Draco-encoded, and returned as a
+    ``mesh_io.CompressedFragment``.
+
+    Parameters
+    ----------
+    mesh_path : str
+        Path to the mesh file to decompose.
+    lod_0_box_size : numpy.ndarray
+        Per-axis size of a single fragment at LOD 0 (shape ``(3,)``).
+    grid_origin : numpy.ndarray
+        World-space origin of the fragment grid (shape ``(3,)``).  Vertices
+        are shifted by ``-grid_origin`` before slicing.
+    start_fragment : numpy.ndarray
+        Inclusive ``(x, y, z)`` start indices of the fragment range to
+        process (at the current LOD scale).
+    end_fragment : numpy.ndarray
+        Exclusive ``(x, y, z)`` end indices of the fragment range to
+        process (at the current LOD scale).
+    current_lod : int
+        Level of detail being generated.  ``0`` means full resolution;
+        higher values correspond to coarser decimation levels.
+    num_chunks : numpy.ndarray
+        Total number of Dask chunks along each axis (shape ``(3,)``).
+        Used to decide whether to pre-clip the mesh to the task's slab.
+
+    Returns
+    -------
+    list of mesh_io.CompressedFragment or None
+        Draco-compressed fragments that contain geometry, or ``None`` if
+        the mesh has no vertices within the requested region.
+    """
 
     vertices, faces = mesh_io.mesh_loader(mesh_path)
 

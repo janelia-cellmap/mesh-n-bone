@@ -4,7 +4,38 @@ import numpy as np
 
 
 def read_multires_config(config_path):
-    """Read run config for the multires pipeline."""
+    """Read and validate the run config for the multiresolution pipeline.
+
+    Loads ``run-config.yaml`` from *config_path*, extracts the
+    ``required_settings`` section, and fills in defaults for optional
+    decimation and segment-properties settings.
+
+    Parameters
+    ----------
+    config_path : str
+        Directory containing ``run-config.yaml``.
+
+    Returns
+    -------
+    tuple[dict, dict, dict]
+        ``(required_settings, optional_decimation_settings,
+        optional_properties_settings)``
+
+        *optional_decimation_settings* defaults:
+
+        - ``box_size``: ``None`` (auto-computed per-axis heuristic)
+        - ``skip_decimation``: ``False``
+        - ``decimation_factor``: ``2``
+        - ``aggressiveness``: ``7``
+        - ``delete_decimated_meshes``: ``False``
+        - ``roi``: ``None``
+
+        *optional_properties_settings* defaults:
+
+        - ``segment_properties_csv``: ``None``
+        - ``segment_properties_columns``: ``None``
+        - ``segment_properties_id_column``: ``"Object ID"``
+    """
     with open(f"{config_path}/run-config.yaml") as f:
         config = yaml.load(f, Loader=SafeLoader)
         required_settings = config["required_settings"]
@@ -42,7 +73,18 @@ def read_multires_config(config_path):
 
 
 def read_generic_config(config_path):
-    """Read a generic run config (for meshify, skeletonize, analyze)."""
+    """Read a generic YAML run config (for meshify, skeletonize, analyze).
+
+    Parameters
+    ----------
+    config_path : str
+        Directory containing ``run-config.yaml``.
+
+    Returns
+    -------
+    dict
+        Parsed YAML config as a flat dictionary.
+    """
     with open(f"{config_path}/run-config.yaml") as f:
         config = yaml.load(f, Loader=SafeLoader)
     return config

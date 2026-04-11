@@ -5,6 +5,26 @@ from numba import jit
 
 @jit(nopython=True, cache=True)
 def downsample_box(box, block_shape):
+    """Compute the bounding box in downsampled coordinates.
+
+    Converts a bounding box from full-resolution coordinates to
+    block-resolution coordinates by dividing the start by
+    ``block_shape`` (floor) and the end by ``block_shape`` (ceiling).
+
+    Parameters
+    ----------
+    box : numpy.ndarray
+        Shape ``(2, D)`` array where ``box[0]`` is the inclusive start
+        and ``box[1]`` is the exclusive end of the bounding box.
+    block_shape : numpy.ndarray
+        Shape ``(D,)`` array of block (downsampling) factors per axis.
+
+    Returns
+    -------
+    numpy.ndarray
+        Shape ``(2, D)`` downsampled bounding box with the same dtype
+        as ``box``.
+    """
     assert block_shape.shape[0] == box.shape[1]
     downsampled_box = np.zeros_like(box)
     downsampled_box[0] = box[0] // block_shape
@@ -13,7 +33,30 @@ def downsample_box(box, block_shape):
 
 
 def make_blockwise_reducer_3d(reducer_func, nopython=True):
-    """Returns a function that reduces an array block-by-block."""
+    """Create a JIT-compiled function that reduces a 3-D array block-by-block.
+
+    The returned function divides the input array into non-overlapping
+    blocks of shape ``block_shape`` and applies ``reducer_func`` to each
+    block to produce a single scalar output per block.
+
+    Parameters
+    ----------
+    reducer_func : callable
+        A Numba-compatible function that takes a 3-D array block and
+        returns a scalar value (e.g., ``flat_mode``, ``np.any``).
+    nopython : bool, optional
+        If ``True``, compile the inner loop in Numba nopython mode.
+        Default is ``True``.
+
+    Returns
+    -------
+    callable
+        A function with signature
+        ``reduce_blockwise(data, block_shape, data_box=None)`` that
+        returns a tuple ``(reduced_output, reduced_box)`` where
+        ``reduced_output`` is the downsampled 3-D array and
+        ``reduced_box`` is the bounding box in block coordinates.
+    """
 
     @jit(nopython=nopython)
     def _reduce_blockwise_compiled(data, block_shape, data_box, reduced_box):
@@ -70,7 +113,22 @@ def make_blockwise_reducer_3d(reducer_func, nopython=True):
 
 @jit(nopython=True, cache=True)
 def flat_mode_except_zero(data):
-    """Return mode of flattened data, excluding zeros if possible."""
+    """Compute the mode of a flattened array, ignoring zeros.
+
+    Flattens ``data``, removes all zero entries, then returns the most
+    frequent remaining value. If all values are zero, returns ``0``.
+
+    Parameters
+    ----------
+    data : numpy.ndarray
+        Input array of any shape (will be flattened internally).
+
+    Returns
+    -------
+    scalar
+        The mode of the non-zero elements, or ``0`` if no non-zero
+        elements exist.
+    """
     data = data.copy().reshape(-1)
     data = data[data != 0]
     if data.size == 0:
@@ -80,7 +138,21 @@ def flat_mode_except_zero(data):
 
 @jit(nopython=True, cache=True)
 def flat_mode(data):
-    """Return mode of flattened array."""
+    """Compute the mode of a flattened array.
+
+    Flattens ``data`` and returns the most frequently occurring value
+    using a sort-and-run-length approach via ``_flat_mode``.
+
+    Parameters
+    ----------
+    data : numpy.ndarray
+        Input array of any shape (will be flattened internally).
+
+    Returns
+    -------
+    scalar
+        The mode (most frequent value) of the flattened array.
+    """
     data = data.copy().reshape(-1)
     return _flat_mode(data)
 
@@ -100,6 +172,22 @@ def _flat_mode(data):
 
 @jit(nopython=True, cache=True)
 def flat_binary_mode(data):
+    """Compute a binary mode over a 3-D block.
+
+    Counts nonzero elements in ``data`` and returns ``1`` if they
+    constitute a strict majority (more than half of all elements),
+    otherwise returns ``0``.
+
+    Parameters
+    ----------
+    data : numpy.ndarray
+        3-D input array.
+
+    Returns
+    -------
+    int
+        ``1`` if nonzero elements are the majority, ``0`` otherwise.
+    """
     nonzero = 0
     for index in np.ndindex(data.shape):
         z, y, x = index

@@ -10,7 +10,12 @@ logger = logging.getLogger(__name__)
 
 
 def _setup_pymeshlab_ld_path():
-    """Ensure pymeshlab's shared libraries are on LD_LIBRARY_PATH."""
+    """Ensure pymeshlab's shared libraries are on ``LD_LIBRARY_PATH``.
+
+    If the path is missing, the environment variable is updated and the
+    current process is re-executed so the dynamic linker picks up the
+    change before any pymeshlab code is imported.
+    """
     try:
         spec = importlib.util.find_spec("pymeshlab")
         if spec and spec.origin:
@@ -30,7 +35,22 @@ def _setup_pymeshlab_ld_path():
 
 
 def _get_run_properties(args):
-    """Set up execution directory and load config."""
+    """Set up execution directory and load the YAML run config.
+
+    Parameters
+    ----------
+    args : argparse.Namespace
+        Parsed CLI arguments. Must contain ``config_path`` and
+        ``num_workers`` attributes.
+
+    Returns
+    -------
+    tuple[str, str, dict]
+        ``(execution_directory, logpath, run_config)`` where
+        *execution_directory* is the working directory for this run,
+        *logpath* is the path to the log file, and *run_config* is
+        the parsed YAML config with ``num_workers`` injected.
+    """
     from mesh_n_bone.util.dask_util import setup_execution_directory
     from mesh_n_bone.config import read_generic_config
 
@@ -42,10 +62,27 @@ def _get_run_properties(args):
 
 
 def _parse_roi_arg(roi_str):
-    """Parse --roi argument into a dict with 'begin' and 'end' keys.
+    """Parse a ``--roi`` argument into a dict with ``begin`` and ``end`` keys.
 
-    Accepts 6 comma-separated values: begin_0,begin_1,begin_2,end_0,end_1,end_2
-    For meshify these are in ZYX order (matching the volume); for multires in XYZ.
+    Accepts 6 comma-separated values:
+    ``begin_0,begin_1,begin_2,end_0,end_1,end_2``.
+    For *meshify* these are in ZYX order (matching the volume); for
+    *to-neuroglancer* they are in XYZ order.
+
+    Parameters
+    ----------
+    roi_str : str
+        Comma-separated string of 6 numeric values.
+
+    Returns
+    -------
+    dict
+        ``{"begin": [b0, b1, b2], "end": [e0, e1, e2]}``
+
+    Raises
+    ------
+    argparse.ArgumentTypeError
+        If *roi_str* does not contain exactly 6 values.
     """
     values = [float(v) for v in roi_str.split(",")]
     if len(values) != 6:
@@ -56,7 +93,17 @@ def _parse_roi_arg(roi_str):
 
 
 def cmd_meshify(args):
-    """Run the meshify pipeline."""
+    """Run the meshify pipeline.
+
+    Generates triangle meshes from a segmentation volume stored in
+    Zarr/N5 format, using marching cubes and optional simplification.
+
+    Parameters
+    ----------
+    args : argparse.Namespace
+        CLI arguments including ``config_path``, ``num_workers``, and
+        optional ``roi``.
+    """
     from mesh_n_bone.meshify.meshify import Meshify
     from mesh_n_bone.util.logging import tee_streams
 
@@ -70,7 +117,17 @@ def cmd_meshify(args):
 
 
 def cmd_multires(args):
-    """Run the multiresolution mesh pipeline."""
+    """Run the multiresolution mesh pipeline.
+
+    Converts existing meshes into the Neuroglancer precomputed
+    multiresolution format with multiple levels of detail.
+
+    Parameters
+    ----------
+    args : argparse.Namespace
+        CLI arguments including ``config_path``, ``num_workers``, and
+        optional ``roi``.
+    """
     from mesh_n_bone.multires.multires import run_multires
 
     roi = _parse_roi_arg(args.roi) if args.roi else None
@@ -78,7 +135,16 @@ def cmd_multires(args):
 
 
 def cmd_skeletonize(args):
-    """Run the skeletonization pipeline."""
+    """Run the batch skeletonization pipeline.
+
+    Extracts curve skeletons from meshes using CGAL's mean curvature
+    skeleton algorithm, with optional Dask parallelization.
+
+    Parameters
+    ----------
+    args : argparse.Namespace
+        CLI arguments including ``config_path`` and ``num_workers``.
+    """
     from mesh_n_bone.skeletonize.skeletonize import Skeletonize
     from mesh_n_bone.util.logging import tee_streams
 
@@ -90,7 +156,14 @@ def cmd_skeletonize(args):
 
 
 def cmd_skeletonize_single(args):
-    """Run CGAL skeletonization on a single mesh file."""
+    """Run CGAL skeletonization on a single mesh file.
+
+    Parameters
+    ----------
+    args : argparse.Namespace
+        CLI arguments including ``input_file``, ``output_file``,
+        ``subdivisions``, and ``neuroglancer`` flag.
+    """
     from mesh_n_bone.skeletonize.skeletonize import Skeletonize
 
     Skeletonize.cgal_skeletonize_mesh(
@@ -102,7 +175,17 @@ def cmd_skeletonize_single(args):
 
 
 def cmd_analyze(args):
-    """Run mesh analysis pipeline."""
+    """Run the mesh analysis pipeline.
+
+    Computes geometric properties (volume, surface area, curvature,
+    thickness, etc.) for a collection of meshes and writes results to
+    a Parquet file.
+
+    Parameters
+    ----------
+    args : argparse.Namespace
+        CLI arguments including ``config_path`` and ``num_workers``.
+    """
     from mesh_n_bone.analyze.analyze import AnalyzeMeshes
     from mesh_n_bone.util.logging import tee_streams
 
@@ -114,6 +197,12 @@ def cmd_analyze(args):
 
 
 def main():
+    """Entry point for the ``mesh-n-bone`` CLI.
+
+    Parses command-line arguments and dispatches to the appropriate
+    sub-command (meshify, to-neuroglancer, skeletonize,
+    skeletonize-single, or analyze).
+    """
     _setup_pymeshlab_ld_path()
 
     parser = argparse.ArgumentParser(

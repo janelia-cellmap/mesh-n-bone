@@ -15,7 +15,22 @@ logger = logging.getLogger(__name__)
 
 
 class AnalyzeMeshes:
-    """Analyze meshes using trimesh and pymeshlab."""
+    """Compute geometric properties for a collection of meshes.
+
+    Uses trimesh and PyMeshLab to compute volume, surface area, principal
+    inertia components, oriented bounding box dimensions, discrete
+    curvature (mean, Gaussian, RMS, absolute), and shape diameter
+    function (thickness) for each mesh. Results are written to a CSV.
+
+    Parameters
+    ----------
+    input_path : str
+        Directory containing mesh files (PLY, OBJ, etc.).
+    output_directory : str
+        Directory where ``mesh_metrics.csv`` will be written.
+    num_workers : int
+        Number of Dask workers for parallel processing.
+    """
 
     def __init__(
         self,
@@ -28,6 +43,18 @@ class AnalyzeMeshes:
         self.num_workers = num_workers
 
     def analyze_mesh_df(self, df):
+        """Analyze all meshes in a Dask partition.
+
+        Parameters
+        ----------
+        df : pd.DataFrame
+            Partition with an ``id`` column containing mesh filenames.
+
+        Returns
+        -------
+        pd.DataFrame
+            One row per mesh with all computed metrics.
+        """
         results_df = []
         for row in df.itertuples():
             try:
@@ -41,6 +68,21 @@ class AnalyzeMeshes:
 
     @staticmethod
     def analyze_mesh(mesh_path):
+        """Compute geometric metrics for a single mesh.
+
+        Parameters
+        ----------
+        mesh_path : str
+            Path to a mesh file readable by trimesh.
+
+        Returns
+        -------
+        dict
+            Dictionary of metric names to values, including volume,
+            surface area, principal inertia components, oriented bounding
+            box dimensions, curvature statistics, and thickness
+            statistics.
+        """
         id = os.path.basename(mesh_path).split(".")[0]
         mesh = trimesh.load_mesh(mesh_path)
 
@@ -80,6 +122,11 @@ class AnalyzeMeshes:
         return metrics
 
     def analyze(self):
+        """Run analysis on all meshes and write results to CSV.
+
+        Distributes work across Dask workers and writes
+        ``mesh_metrics.csv`` to the output directory.
+        """
         mesh_ids = os.listdir(self.meshes_dirname)
 
         metrics = ["volume (nm^3)", "surface_area (nm^2)"]

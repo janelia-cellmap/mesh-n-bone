@@ -22,7 +22,28 @@ logger = logging.getLogger(__name__)
 def generate_neuroglancer_multires_mesh(
     id, num_subtask_workers, output_path, lods, original_ext, lod_0_box_size=None,
 ):
-    """Create a complete multiresolution mesh for a single object."""
+    """Create a complete multiresolution mesh for a single segment.
+
+    Reads the mesh at each LOD, computes an octree decomposition, and
+    writes Neuroglancer precomputed fragment and manifest files.
+
+    Parameters
+    ----------
+    id : int
+        Segment ID.
+    num_subtask_workers : int
+        Number of Dask sub-workers to use for decomposition.
+    output_path : str
+        Root output directory (multires files go under
+        ``output_path/multires/``).
+    lods : list of int
+        LOD levels to process, e.g. ``[0, 1, 2]``.
+    original_ext : str
+        File extension of LOD 0 meshes (e.g. ``".ply"``).
+    lod_0_box_size : ndarray of float or None
+        Chunk box size for LOD 0. If ``None``, computed from mesh
+        bounding box targeting ~25k faces per chunk.
+    """
     with ExitStack() as stack:
         if num_subtask_workers > 1:
             client = stack.enter_context(worker_client())
@@ -32,8 +53,8 @@ def generate_neuroglancer_multires_mesh(
             f"rm -rf {output_path}/multires/{id} {output_path}/multires/{id}.index"
         )
 
-        vertex_min = np.ones(3) * np.inf
-        vertex_max = np.ones(3) * -np.inf
+        vertex_min = None
+        vertex_max = None
         previous_num_faces = np.inf
         for idx, current_lod in enumerate(lods):
             if current_lod == 0:
@@ -48,9 +69,11 @@ def generate_neuroglancer_multires_mesh(
             num_faces = len(faces)
             if num_faces >= previous_num_faces:
                 break
-            if vertices is not None:
-                vertex_min = np.minimum(vertex_min, vertices.min(axis=0))
-                vertex_max = np.maximum(vertex_max, vertices.max(axis=0))
+            # Use s0 bounds only for grid computation — decimated LODs
+            # can expand beyond s0 due to pyfqmr vertex movement.
+            if current_lod == 0 and vertices is not None:
+                vertex_min = vertices.min(axis=0)
+                vertex_max = vertices.max(axis=0)
 
             if lod_0_box_size is None and current_lod == 0:
                 distances_per_axis = np.ceil(
@@ -78,14 +101,20 @@ def generate_neuroglancer_multires_mesh(
 
         lods = lods[:idx]
 
-        # Shift grid_origin so the coarsest LOD bounding box is centered
-        # on the mesh bbox center.  This improves Neuroglancer's
-        # "click-to-center" behaviour, which navigates to the midpoint
-        # of clipLowerBound / clipUpperBound from the manifest.
-        coarsest_box = lod_0_box_size * 2 ** (len(lods) - 1)
+        # Compute the LOD 0 chunk grid from the s0 mesh extent, and
+        # set grid_origin so the mesh fits in exactly the intended
+        # number of LOD 0 chunks.
+        mesh_extent = vertex_max - vertex_min
+        num_chunks_per_axis = np.maximum(
+            np.ceil(mesh_extent / lod_0_box_size).astype(int), 1
+        )
+        lod0_grid_extent = num_chunks_per_axis * lod_0_box_size
         bbox_center = (vertex_min + vertex_max) / 2
-        grid_origin = np.floor(
-            np.minimum(bbox_center - coarsest_box / 2, vertex_min - 1)
+        grid_origin = np.floor(bbox_center - lod0_grid_extent / 2)
+        grid_origin = np.clip(
+            grid_origin,
+            np.ceil(vertex_max - lod0_grid_extent),
+            np.floor(vertex_min),
         )
 
         results = []
@@ -187,7 +216,22 @@ def generate_neuroglancer_multires_mesh(
 
 
 def _mesh_intersects_roi(mesh_path, roi_begin, roi_end):
-    """Check if a mesh's bounding box intersects the given ROI (in XYZ)."""
+    """Check if a mesh's bounding box intersects the given ROI.
+
+    Parameters
+    ----------
+    mesh_path : str
+        Path to a mesh file.
+    roi_begin : ndarray, shape (3,)
+        ROI lower bound in XYZ world coordinates.
+    roi_end : ndarray, shape (3,)
+        ROI upper bound in XYZ world coordinates.
+
+    Returns
+    -------
+    bool
+        ``True`` if the mesh's axis-aligned bounding box overlaps the ROI.
+    """
     vertices, _ = mesh_io.mesh_loader(mesh_path)
     if vertices is None or len(vertices) == 0:
         return False
@@ -200,7 +244,28 @@ def _mesh_intersects_roi(mesh_path, roi_begin, roi_end):
 def generate_all_neuroglancer_multires_meshes(
     output_path, num_workers, ids, lods, original_ext, file_sizes, lod_0_box_size=None,
 ):
-    """Generate all neuroglancer multiresolution meshes for all ids."""
+    """Generate Neuroglancer multiresolution meshes for all segments.
+
+    Distributes work across Dask workers, allocating sub-workers to each
+    segment proportional to its mesh file size.
+
+    Parameters
+    ----------
+    output_path : str
+        Root output directory.
+    num_workers : int
+        Total number of Dask workers.
+    ids : list of int
+        Segment IDs to process.
+    lods : list of int
+        LOD levels, e.g. ``[0, 1, 2]``.
+    original_ext : str
+        File extension of LOD 0 meshes.
+    file_sizes : ndarray of float
+        File sizes of LOD 0 meshes (used for work balancing).
+    lod_0_box_size : ndarray of float or None
+        Chunk box size for LOD 0. ``None`` for auto-computation.
+    """
 
     def get_number_of_subtask_workers(file_sizes, num_workers):
         total_file_size = np.sum(file_sizes)
@@ -223,14 +288,21 @@ def generate_all_neuroglancer_multires_meshes(
 
 
 def run_multires(config_path, num_workers, roi=None):
-    """Main entry point for the multires pipeline.
+    """Main entry point for the multiresolution pipeline.
 
-    Args:
-        config_path: Path to config directory.
-        num_workers: Number of dask workers.
-        roi: Optional ROI dict with 'begin'+'end' or 'offset'+'shape' keys
-             (XYZ world coordinates). Only meshes intersecting this region
-             will be processed.
+    Reads a config, generates decimated LODs, builds Neuroglancer
+    precomputed multiresolution meshes, and writes metadata files.
+
+    Parameters
+    ----------
+    config_path : str
+        Directory containing ``run-config.yaml``.
+    num_workers : int
+        Number of Dask workers.
+    roi : dict or None
+        Optional ROI with ``begin``/``end`` or ``offset``/``shape``
+        keys in XYZ world coordinates. Only meshes intersecting this
+        region will be processed.
     """
     submission_directory = os.getcwd()
     required_settings, optional_decimation_settings, optional_properties_settings = (
