@@ -1,6 +1,5 @@
 """Mesh generation from segmentation volumes using zmesh and dask."""
 
-from funlib.persistence import open_ds
 from funlib.geometry import Roi, Coordinate
 import numpy as np
 import os
@@ -13,10 +12,12 @@ import shutil
 import trimesh
 import json
 import pymeshlab
+import zarr
 
 from mesh_n_bone.util import dask_util
 from mesh_n_bone.util.logging import Timing_Messager
-import zarr
+from mesh_n_bone.util.zarr_io import open_dataset, split_dataset_path, read_raw_voxel_size
+from mesh_n_bone.util.image_data_interface import open_ds_tensorstore, to_ndarray_tensorstore
 from mesh_n_bone.meshify.downsample import (
     downsample_labels_3d_suppress_zero,
     downsample_labels_3d,
@@ -113,12 +114,27 @@ except ImportError as e:
 
 
 def staged_reductions(target_reduction_total, frac1, frac2):
-    """Compute per-stage reductions given how much of the total reduction
-    each stage should contribute.
+    """Compute per-stage reductions for a two-stage simplification pipeline.
 
-    Args:
-        target_reduction_total: overall target reduction (e.g. 0.99)
-        frac1, frac2: relative fractions of total simplification (e.g. 0.25, 0.75)
+    Splits an overall target reduction into two successive stages so that
+    applying both in sequence achieves the total.
+
+    Parameters
+    ----------
+    target_reduction_total : float
+        Overall target reduction, e.g. 0.99 removes 99% of faces.
+    frac1 : float
+        Fraction of the total simplification performed in stage 1.
+    frac2 : float
+        Fraction of the total simplification performed in stage 2.
+        Must satisfy ``frac1 + frac2 == 1``.
+
+    Returns
+    -------
+    tuple[float, float]
+        ``(reduction_stage_1, reduction_stage_2)`` — per-stage reduction
+        ratios such that applying them sequentially yields
+        *target_reduction_total*.
     """
     assert abs(frac1 + frac2 - 1.0) < 1e-6, "fractions must sum to 1"
     keep_total = 1 - target_reduction_total
@@ -127,8 +143,212 @@ def staged_reductions(target_reduction_total, frac1, frac2):
     return r1, r2
 
 
+# Thread-local tensorstore handle cache so each worker opens once
+_thread_local_ts = {}
+
+
+def _get_chunked_mesh_worker(block, tmpdirname, config):
+    """Run marching cubes on a single block and write per-segment PLYs.
+
+    This is a module-level function so only lightweight *config* dict
+    (scalars, tuples, strings) is serialised to workers — no zarr arrays.
+
+    Parameters
+    ----------
+    block : DaskBlock
+        Block specification with ROI and index.
+    tmpdirname : str
+        Temporary directory for writing per-segment block meshes.
+    config : dict
+        Worker config from ``Meshify._get_worker_config()``.
+    """
+    dataset_path = config["dataset_path"]
+    if dataset_path not in _thread_local_ts:
+        _thread_local_ts[dataset_path] = open_ds_tensorstore(dataset_path)
+    ts_dataset = _thread_local_ts[dataset_path]
+
+    voxel_size = Coordinate(config["voxel_size"])
+    roi_offset = Coordinate(config["roi_offset"])
+    output_voxel_size = Coordinate(config["output_voxel_size"])
+
+    mesher = Mesher(output_voxel_size[::-1])
+    segmentation_block = to_ndarray_tensorstore(
+        ts_dataset, block.roi, voxel_size, roi_offset,
+        swap_axes=config["swap_axes"], fill_value=0,
+    )
+    if segmentation_block.dtype.byteorder == ">":
+        swapped_dtype = segmentation_block.dtype.newbyteorder()
+        segmentation_block = segmentation_block.view(swapped_dtype).byteswap()
+
+    downsample_factor = config["downsample_factor"]
+    if downsample_factor:
+        dm = config["downsample_method"]
+        if dm == "nearest":
+            segmentation_block = segmentation_block[
+                ::downsample_factor, ::downsample_factor, ::downsample_factor
+            ].copy()
+        else:
+            methods = {
+                "mode_suppress_zero": downsample_labels_3d_suppress_zero,
+                "mode": downsample_labels_3d,
+                "binary": downsample_binary_3d,
+            }
+            if dm not in methods:
+                raise ValueError(
+                    f"Unknown downsample_method '{dm}'. "
+                    f"Choose from: {list(methods.keys()) + ['nearest']}"
+                )
+            ds_func = methods[dm]
+            segmentation_block, _ = ds_func(segmentation_block, downsample_factor)
+
+    block_offset = np.array(block.roi.get_begin())
+    # Correct for the half-kernel shift introduced by downsampling:
+    # a downsampled voxel at index 0 represents original voxels [0, ds),
+    # centered at (ds-1)/2 original voxels from the origin.
+    ds_shift = (downsample_factor - 1) / 2 * np.array(voxel_size) if downsample_factor else np.zeros(3)
+    mesher.mesh(segmentation_block, close=False)
+    for id in mesher.ids():
+        mesh = mesher.get_mesh(id)
+        os.makedirs(f"{tmpdirname}/{id}", exist_ok=True)
+
+        if config["use_fixed_edge_simplification"] and config["do_simplification"]:
+            mesh_tri = trimesh.Trimesh(vertices=mesh.vertices, faces=mesh.faces)
+            stage_1_reduction, _ = staged_reductions(
+                config["target_reduction"],
+                config["stage_1_reduction_fraction"],
+                1 - config["stage_1_reduction_fraction"],
+            )
+
+            ds = config["downsample_factor"] or 1
+            block_size_voxels = np.array(config["read_write_block_shape_pixels"]) // ds + 1
+            block_size_world = (block_size_voxels * output_voxel_size)[::-1]
+
+            mesh_tri_simplified = simplify_mesh(
+                mesh_tri,
+                voxel_size=output_voxel_size,
+                target_reduction=stage_1_reduction,
+                block_size=block_size_world,
+                aggressiveness=config["default_aggressiveness"],
+                verbose=False,
+                fix_edges=True,
+            )
+            mesh_tri_simplified.vertices += block_offset[::-1] + ds_shift[::-1]
+
+            mesh_simplified = CloudVolumeMesh(
+                mesh_tri_simplified.vertices,
+                mesh_tri_simplified.faces,
+                normals=None,
+            )
+
+            with open(f"{tmpdirname}/{id}/block_{block.index}.ply", "wb") as fp:
+                fp.write(mesh_simplified.to_ply())
+        else:
+            mesh.vertices += block_offset[::-1] + ds_shift[::-1]
+            with open(f"{tmpdirname}/{id}/block_{block.index}.ply", "wb") as fp:
+                fp.write(mesh.to_ply())
+
+
 class Meshify:
-    """Create meshes from a segmentation volume using dask and zmesh."""
+    """Generate triangle meshes from a segmentation volume.
+
+    Uses `zmesh <https://github.com/seung-lab/zmesh>`_ for marching-cubes
+    meshing and Dask for parallel processing.  The pipeline:
+
+    1. Splits the volume into blocks and runs marching cubes per block.
+    2. Assembles per-segment block meshes, deduplicates boundary vertices.
+    3. Optionally simplifies, smooths, repairs, and validates each mesh.
+    4. Writes output as PLY, legacy Neuroglancer, or multiresolution
+       Neuroglancer precomputed format.
+
+    Parameters
+    ----------
+    input_path : str
+        Path to the input segmentation dataset (Zarr or N5).
+    output_directory : str
+        Directory where output meshes and metadata are written.
+    roi : Roi or dict or None
+        Region of interest to process. Accepts a ``funlib.geometry.Roi``,
+        a dict with ``begin``/``end`` or ``offset``/``shape`` keys, or
+        ``None`` for the full volume.
+    max_num_voxels : float
+        Maximum number of voxels in a segment before it is skipped.
+    max_num_blocks : float
+        Maximum number of blocks a segment may span before skipping.
+    read_write_block_shape_pixels : list of int or None
+        Block shape in voxels for chunked processing. Defaults to the
+        dataset's chunk shape.
+    downsample_factor : int or None
+        Factor by which to downsample the volume before meshing.
+    target_reduction : float
+        Fraction of faces to remove during simplification (0–1).
+    num_workers : int
+        Number of Dask workers for parallel processing.
+    remove_smallest_components : bool
+        If ``True``, keep only the largest connected component.
+    n_smoothing_iter : int
+        Number of Taubin smoothing iterations.
+    default_aggressiveness : float
+        Aggressiveness parameter for quadric-error simplification.
+    check_mesh_validity : bool
+        If ``True``, validate that meshes are watertight with
+        consistent winding.
+    do_simplification : bool
+        If ``True``, simplify meshes to *target_reduction*.
+    do_analysis : bool
+        If ``True``, run geometric analysis after mesh generation.
+    do_legacy_neuroglancer : bool
+        Write single-resolution Neuroglancer precomputed format.
+    do_singleres_multires_neuroglancer : bool
+        Write single-resolution meshes wrapped in multires metadata.
+    use_fixed_edge_simplification : bool
+        Use boundary-preserving simplification that pins block-edge
+        vertices during the per-chunk stage.
+    fixed_edge_merge_weld_epsilon : float
+        Vertex-merge tolerance for fixed-edge simplification.
+    fixed_edge_seam_angle_deg : float
+        Dihedral angle threshold (degrees) for seam detection.
+    fixed_edge_k_ring : int
+        K-ring expansion around seam vertices for denoising.
+    fixed_edge_taubin_iters : int
+        Taubin smoothing iterations during seam denoising.
+    fixed_edge_taubin_lambda : float
+        Lambda parameter for Taubin smoothing.
+    fixed_edge_taubin_mu : float
+        Mu parameter for Taubin smoothing.
+    stage_1_reduction_fraction : float
+        Fraction of total reduction applied in stage 1 (per-block).
+    do_multires : bool
+        If ``True``, generate multiresolution meshes instead of
+        single-resolution output.
+    num_lods : int
+        Number of levels of detail for multiresolution output.
+    lod_0_box_size : array-like or None
+        Chunk box size for LOD 0. ``None`` for auto-computation.
+    downsample_method : str
+        Downsampling method: ``"mode_suppress_zero"``,
+        ``"mode"``, or ``"binary"``.
+    multires_strategy : str
+        Strategy for generating LODs: ``"decimate"`` (simplify s0
+        meshes) or ``"downsample"`` (re-mesh at lower resolutions).
+    decimation_factor : int
+        Face-count reduction factor between consecutive LODs.
+    decimation_aggressiveness : int
+        Aggressiveness for pyfqmr decimation across LODs.
+    delete_decimated_meshes : bool
+        If ``True``, remove intermediate LOD mesh files after the
+        multiresolution pipeline completes.
+    segment_properties_csv : str or None
+        Path to a CSV with per-segment properties for Neuroglancer.
+    segment_properties_columns : list of str or None
+        Columns to include from the CSV (``None`` for all).
+    segment_properties_id_column : str
+        Column name in the CSV containing segment IDs.
+    coordinate_units : str
+        Spatial unit label written to metadata (e.g. ``"nm"``).
+    voxel_size_nm : list of float or None
+        Explicit voxel size override in the same units as
+        *coordinate_units*. ``None`` to read from dataset metadata.
+    """
 
     def __init__(
         self,
@@ -171,31 +391,17 @@ class Meshify:
         coordinate_units: str = "nm",
         voxel_size_nm: list = None,
     ):
-        # Try single-arg open_ds first (newer funlib.persistence),
-        # fall back to two-arg form (older versions)
-        try:
-            self.segmentation_array = open_ds(input_path)
-        except Exception:
-            for file_type in [".n5", ".zarr"]:
-                if file_type in input_path:
-                    path_split = input_path.split(file_type + "/")
-                    break
-            self.segmentation_array = open_ds(
-                path_split[0] + file_type, path_split[1]
-            )
+        filename, dataset_name = split_dataset_path(input_path)
+        self.segmentation_array = open_dataset(filename, dataset_name)
         self.output_directory = output_directory
         self.input_path = input_path
+        self._dataset_path = os.path.join(filename, dataset_name) if dataset_name else filename
+        self._swap_axes = input_path.rfind(".n5") > input_path.rfind(".zarr")
 
         # Get true (possibly non-integer) voxel size from the underlying data
-        try:
-            from funlib.persistence.arrays.datasets import _read_attrs
-            self.true_voxel_size, _, _ = _read_attrs(self.segmentation_array.data)
-            self.true_voxel_size = np.array(self.true_voxel_size)
-        except ImportError:
-            # Newer funlib.persistence versions don't expose _read_attrs
-            self.true_voxel_size = np.array(self.segmentation_array.voxel_size)
+        self.true_voxel_size = np.array(read_raw_voxel_size(self.segmentation_array))
 
-        # Check if funlib failed to pick up voxel_size (returns 1,1,1) and
+        # Check if voxel_size is just defaults (1,1,1) and
         # try OME-NGFF multiscales metadata from the parent zarr group
         ome_voxel_size, ome_offset, ome_units = _read_ome_ngff_transform(input_path)
 
@@ -214,7 +420,7 @@ class Meshify:
             if all(v == 1 for v in self.segmentation_array.voxel_size):
                 logger.info(
                     f"Using OME-NGFF voxel_size {ome_voxel_size} "
-                    f"(funlib returned {self.segmentation_array.voxel_size})"
+                    f"(attrs returned {self.segmentation_array.voxel_size})"
                 )
                 self.true_voxel_size = ome_voxel_size.copy()
                 ome_voxel_size_coord = Coordinate(int(v) for v in ome_voxel_size)
@@ -223,8 +429,11 @@ class Meshify:
                     if ome_offset is not None
                     else Coordinate(0, 0, 0)
                 )
-                self.segmentation_array._metadata._voxel_size = ome_voxel_size_coord
-                self.segmentation_array._metadata._offset = ome_offset_coord
+                self.segmentation_array.voxel_size = ome_voxel_size_coord
+                array_shape = self.segmentation_array.data.shape[-3:]
+                self.segmentation_array.roi = Roi(
+                    ome_offset_coord, Coordinate(array_shape) * ome_voxel_size_coord
+                )
 
         if roi is not None:
             if not isinstance(roi, Roi):
@@ -258,8 +467,8 @@ class Meshify:
         if read_write_block_shape_pixels:
             self.read_write_block_shape_pixels = np.array(read_write_block_shape_pixels)
         else:
-            self.read_write_block_shape_pixels = np.array(
-                self.segmentation_array.chunk_shape
+            self.read_write_block_shape_pixels = (
+                self._default_block_shape_pixels()
             )
 
         self.max_num_blocks = max_num_blocks
@@ -321,12 +530,48 @@ class Meshify:
         self.segment_properties_id_column = segment_properties_id_column
         self.coordinate_units = coordinate_units
 
+    def _default_block_shape_pixels(self, target_mb=128):
+        """Choose a default block shape as a chunk-aligned multiple.
+
+        Picks the largest integer multiple of the dataset's chunk shape
+        whose memory footprint stays at or below ``target_mb``.  Larger
+        blocks reduce the number of block boundaries (and therefore
+        frozen boundary vertices during fixed-edge simplification).
+
+        Parameters
+        ----------
+        target_mb : int or float
+            Target memory budget per block in megabytes.
+
+        Returns
+        -------
+        numpy.ndarray
+            Block shape in voxels, as a multiple of the chunk shape.
+        """
+        chunk = np.array(self.segmentation_array.chunk_shape)
+        itemsize = self.segmentation_array.dtype.itemsize
+        chunk_bytes = int(np.prod(chunk)) * itemsize
+        target_bytes = target_mb * 1e6
+        # Find the largest multiplier whose cube fits in the budget
+        # Total bytes = chunk_bytes * multiplier^3
+        max_mult = int((target_bytes / chunk_bytes) ** (1 / 3))
+        # Don't exceed the ROI dimensions
+        if hasattr(self, "roi") and self.roi is not None:
+            roi_pixels = np.array(self.roi.shape) / np.array(
+                self.segmentation_array.voxel_size
+            )
+            max_by_roi = int(np.min(roi_pixels / chunk))
+            max_mult = min(max_mult, max_by_roi)
+        multiplier = max(1, max_mult)
+        return chunk * multiplier
+
     def _get_downsample_function(self):
         """Return the appropriate downsample function based on config."""
         methods = {
             "mode_suppress_zero": downsample_labels_3d_suppress_zero,
             "mode": downsample_labels_3d,
             "binary": downsample_binary_3d,
+            "nearest": None,
         }
         if self.downsample_method not in methods:
             raise ValueError(
@@ -337,6 +582,21 @@ class Meshify:
 
     @staticmethod
     def my_cloudvolume_concatenate(*meshes):
+        """Concatenate multiple meshes into a single CloudVolume ``Mesh``.
+
+        Face indices are offset so that they reference the correct
+        vertices in the combined vertex array.
+
+        Parameters
+        ----------
+        *meshes : cloudvolume.mesh.Mesh
+            Meshes to concatenate.
+
+        Returns
+        -------
+        cloudvolume.mesh.Mesh
+            Combined mesh with all vertices and re-indexed faces.
+        """
         vertex_ct = np.zeros(len(meshes) + 1, np.uint32)
         vertex_ct[1:] = np.cumsum([len(mesh) for mesh in meshes])
         vertices = np.concatenate([mesh.vertices for mesh in meshes])
@@ -346,66 +606,49 @@ class Meshify:
         normals = None
         return CloudVolumeMesh(vertices, faces, normals)
 
-    def _get_chunked_mesh(self, block, tmpdirname):
-        mesher = Mesher(self.output_voxel_size_funlib[::-1])
-        segmentation_block = self.segmentation_array.to_ndarray(block.roi, fill_value=0)
-        if segmentation_block.dtype.byteorder == ">":
-            swapped_dtype = segmentation_block.dtype.newbyteorder()
-            segmentation_block = segmentation_block.view(swapped_dtype).byteswap()
-        if self.downsample_factor:
-            ds_func = self._get_downsample_function()
-            segmentation_block, _ = ds_func(
-                segmentation_block, self.downsample_factor
-            )
-
-        block_offset = np.array(block.roi.get_begin())
-        mesher.mesh(segmentation_block, close=False)
-        for id in mesher.ids():
-            mesh = mesher.get_mesh(id)
-            os.makedirs(f"{tmpdirname}/{id}", exist_ok=True)
-
-            if self.use_fixed_edge_simplification and self.do_simplification:
-                mesh_tri = trimesh.Trimesh(vertices=mesh.vertices, faces=mesh.faces)
-                stage_1_reduction, _ = staged_reductions(
-                    self.target_reduction,
-                    self.stage_1_reduction_fraction,
-                    self.stage_2_reduction_fraction,
-                )
-
-                block_size_voxels = self.read_write_block_shape_pixels + 1
-                block_size_world = (block_size_voxels * self.output_voxel_size_funlib)[
-                    ::-1
-                ]
-
-                mesh_tri_simplified = simplify_mesh(
-                    mesh_tri,
-                    voxel_size=self.output_voxel_size_funlib,
-                    target_reduction=stage_1_reduction,
-                    block_size=block_size_world,
-                    aggressiveness=self.default_aggressiveness,
-                    verbose=False,
-                    fix_edges=True,
-                )
-                mesh_tri_simplified.vertices += block_offset[::-1]
-
-                mesh_simplified = CloudVolumeMesh(
-                    mesh_tri_simplified.vertices,
-                    mesh_tri_simplified.faces,
-                    normals=None,
-                )
-
-                with open(f"{tmpdirname}/{id}/block_{block.index}.ply", "wb") as fp:
-                    fp.write(mesh_simplified.to_ply())
-            else:
-                mesh.vertices += block_offset[::-1]
-                with open(f"{tmpdirname}/{id}/block_{block.index}.ply", "wb") as fp:
-                    fp.write(mesh.to_ply())
+    def _get_worker_config(self):
+        """Return a lightweight, pickle-safe dict of parameters for workers."""
+        return {
+            "dataset_path": self._dataset_path,
+            "swap_axes": self._swap_axes,
+            "voxel_size": tuple(self.segmentation_array.voxel_size),
+            "roi_offset": tuple(self.segmentation_array.roi.offset),
+            "output_voxel_size": tuple(self.output_voxel_size_funlib),
+            "downsample_factor": self.downsample_factor,
+            "downsample_method": self.downsample_method,
+            "use_fixed_edge_simplification": self.use_fixed_edge_simplification,
+            "do_simplification": self.do_simplification,
+            "target_reduction": self.target_reduction,
+            "stage_1_reduction_fraction": self.stage_1_reduction_fraction,
+            "stage_2_reduction_fraction": self.stage_2_reduction_fraction,
+            "read_write_block_shape_pixels": self.read_write_block_shape_pixels.tolist(),
+            "default_aggressiveness": self.default_aggressiveness,
+        }
 
     @staticmethod
     def is_mesh_valid(mesh):
+        """Check whether a mesh has consistent winding, is watertight, and has positive volume.
+
+        Parameters
+        ----------
+        mesh : trimesh.Trimesh
+            Mesh to validate.
+
+        Returns
+        -------
+        bool
+            ``True`` if the mesh passes all three checks.
+        """
         return mesh.is_winding_consistent and mesh.is_watertight and mesh.volume > 0
 
     def get_chunked_meshes(self, dirname):
+        """Generate per-block meshes for the entire ROI using Dask.
+
+        Parameters
+        ----------
+        dirname : str
+            Directory where per-segment block mesh PLYs are written.
+        """
         blocks = dask_util.create_blocks(
             self.roi,
             self.segmentation_array,
@@ -413,8 +656,9 @@ class Meshify:
             padding=self.output_voxel_size_funlib,
         )
 
+        worker_config = self._get_worker_config()
         b = db.from_sequence(blocks, npartitions=self.num_workers * 10).map(
-            self._get_chunked_mesh, dirname
+            _get_chunked_mesh_worker, dirname, worker_config
         )
 
         with dask_util.start_dask(self.num_workers, "generate chunked meshes", logger):
@@ -432,6 +676,40 @@ class Meshify:
         check_mesh_validity=True,
         preserve_open_boundaries=False,
     ):
+        """Simplify, smooth, and optionally repair a mesh.
+
+        Applies quadric-error simplification followed by Taubin smoothing.
+        If the result is invalid (non-watertight or inconsistent winding),
+        retries with progressively lower aggressiveness until a valid mesh
+        is obtained or simplification is skipped entirely.
+
+        Parameters
+        ----------
+        mesh : trimesh.Trimesh or mesh-like
+            Input mesh with ``.vertices`` and ``.faces`` attributes.
+        target_reduction : float
+            Fraction of faces to remove (0–1).
+        n_smoothing_iter : int
+            Number of Taubin smoothing iterations.
+        remove_smallest_components : bool
+            If ``True``, keep only the largest connected component before
+            processing.
+        aggressiveness : float
+            Starting aggressiveness for simplification.
+        do_simplification : bool
+            If ``False``, skip simplification entirely.
+        check_mesh_validity : bool
+            If ``True``, validate the mesh after each attempt and retry
+            on failure.
+        preserve_open_boundaries : bool
+            If ``True``, pin boundary vertices during simplification and
+            restore them after smoothing.
+
+        Returns
+        -------
+        trimesh.Trimesh
+            Processed mesh.
+        """
         def get_cleaned_simplified_and_smoothed_mesh(
             mesh, target_reduction, aggressiveness, do_simplification
         ):
@@ -515,7 +793,8 @@ class Meshify:
             )
 
         if do_simplification:
-            do_simplification = output_trimesh_mesh.faces.shape[0] > 100
+            target_faces = int(max(12, (1 - target_reduction) * output_trimesh_mesh.faces.shape[0]))
+            do_simplification = output_trimesh_mesh.faces.shape[0] > target_faces
         trimesh_mesh = get_cleaned_simplified_and_smoothed_mesh(
             mesh, target_reduction, aggressiveness, do_simplification
         )
@@ -578,7 +857,31 @@ class Meshify:
         max_hole_size=30,
         verbose=False,
     ):
-        """Repair mesh using PyMeshLab and return as trimesh."""
+        """Repair a mesh using PyMeshLab.
+
+        Removes duplicate faces/vertices, repairs non-manifold edges and
+        vertices, closes small holes, re-orients faces, and optionally
+        removes small connected components.
+
+        Parameters
+        ----------
+        vertices : ndarray, shape (V, 3)
+            Vertex positions.
+        faces : ndarray, shape (F, 3)
+            Triangle face indices.
+        remove_smallest_components : bool
+            If ``True``, remove all but the largest component.
+        max_hole_size : int
+            Maximum number of edges in a hole to close. Set to 0 to
+            skip hole closing.
+        verbose : bool
+            Not currently used; reserved for future logging.
+
+        Returns
+        -------
+        trimesh.Trimesh
+            Repaired mesh.
+        """
         ms = pymeshlab.MeshSet()
         ms.add_mesh(pymeshlab.Mesh(vertex_matrix=vertices, face_matrix=faces))
 
@@ -620,6 +923,16 @@ class Meshify:
         return trimesh.Trimesh(vertices=verts_out, faces=faces_out)
 
     def _assemble_mesh(self, mesh_id):
+        """Assemble block meshes for a single segment into a final mesh.
+
+        Concatenates per-block PLYs, deduplicates boundary vertices,
+        simplifies, smooths, validates, and writes the output mesh.
+
+        Parameters
+        ----------
+        mesh_id : str
+            Segment ID whose block meshes will be assembled.
+        """
         if not os.path.exists(f"{self.dirname}/{mesh_id}"):
             return
 
@@ -662,6 +975,21 @@ class Meshify:
                 chunk_size=chunk_size[::-1],
                 offset=self.roi.offset[::-1],
             )
+            if self.use_fixed_edge_simplification:
+                # Fixed-edge simplification clips block meshes at
+                # half-voxel inward from chunk boundaries, so their
+                # shared vertices sit at chunk_boundary ± 0.5*voxel_size
+                # rather than exactly on the boundary.
+                # deduplicate_chunk_boundaries only merges vertices with
+                # mod(pos, chunk_size)==0, missing these clip-plane
+                # duplicates.  Merge them here via trimesh.
+                tri_tmp = trimesh.Trimesh(
+                    vertices=mesh.vertices, faces=mesh.faces, process=False
+                )
+                tri_tmp.merge_vertices(merge_tex=False, merge_norm=False)
+                mesh = CloudVolumeMesh(
+                    tri_tmp.vertices, tri_tmp.faces, normals=None
+                )
 
         # When using a custom ROI, meshes cut at the boundary are intentionally
         # open — skip hole-closing and watertight validity checks.
@@ -750,6 +1078,13 @@ class Meshify:
         shutil.rmtree(f"{self.dirname}/{mesh_id}")
 
     def assemble_meshes(self, dirname):
+        """Assemble all per-segment block meshes and write final outputs.
+
+        Parameters
+        ----------
+        dirname : str
+            Directory containing per-segment subdirectories of block PLYs.
+        """
         from mesh_n_bone.util.neuroglancer import (
             write_ngmesh_metadata,
             write_singleres_multires_metadata,
@@ -758,13 +1093,20 @@ class Meshify:
         os.makedirs(f"{self.output_directory}/meshes/", exist_ok=True)
         self.dirname = dirname
         mesh_ids = os.listdir(dirname)
-        b = db.from_sequence(
-            mesh_ids,
-            npartitions=dask_util.guesstimate_npartitions(mesh_ids, self.num_workers),
-        ).map(self._assemble_mesh)
-        with dask_util.start_dask(self.num_workers, "assemble meshes", logger):
-            with Timing_Messager("Assembling meshes", logger):
-                b.compute()
+        # Drop the zarr-backed array before dask serialises self — assembly
+        # only reads PLY files, not the segmentation volume.
+        saved_array = self.segmentation_array
+        self.segmentation_array = None
+        try:
+            b = db.from_sequence(
+                mesh_ids,
+                npartitions=dask_util.guesstimate_npartitions(mesh_ids, self.num_workers),
+            ).map(self._assemble_mesh)
+            with dask_util.start_dask(self.num_workers, "assemble meshes", logger):
+                with Timing_Messager("Assembling meshes", logger):
+                    b.compute()
+        finally:
+            self.segmentation_array = saved_array
         if self.do_legacy_neuroglancer:
             write_ngmesh_metadata(f"{self.output_directory}/meshes")
         elif self.do_singleres_multires_neuroglancer:

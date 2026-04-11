@@ -18,6 +18,37 @@ def pymeshlab_simplify(
     verts, faces, target_faces, aggressiveness=0.3,
     preserve_border=True, preserve_topology=True, verbose=False,
 ):
+    """Simplify a mesh using PyMeshLab quadric edge-collapse decimation.
+
+    Performs decimation followed by removal of duplicate faces, duplicate
+    vertices, and unreferenced vertices.
+
+    Parameters
+    ----------
+    verts : numpy.ndarray
+        Vertex positions with shape ``(N, 3)``.
+    faces : numpy.ndarray
+        Triangle indices with shape ``(M, 3)``.
+    target_faces : int
+        Desired number of faces after simplification.
+    aggressiveness : float, optional
+        Quality threshold passed to the decimation filter. Lower values
+        produce more conservative simplification. Default is ``0.3``.
+    preserve_border : bool, optional
+        If ``True``, boundary edges are preserved during decimation.
+        Default is ``True``.
+    preserve_topology : bool, optional
+        If ``True``, the mesh topology is preserved. Default is ``True``.
+    verbose : bool, optional
+        Unused; kept for API compatibility. Default is ``False``.
+
+    Returns
+    -------
+    verts_out : numpy.ndarray
+        Simplified vertex positions with dtype ``float64``.
+    faces_out : numpy.ndarray
+        Simplified triangle indices with dtype ``int32``.
+    """
     ms = pymeshlab.MeshSet()
     ms.add_mesh(pymeshlab.Mesh(verts, faces))
     ms.meshing_decimation_quadric_edge_collapse(
@@ -39,11 +70,46 @@ def pymeshlab_simplify(
 def fqmr_simplify(
     verts, faces, target_faces, preserve_border, aggressiveness=7, verbose=False,
 ):
+    """Simplify a mesh using the pyfqmr (Fast Quadric Mesh Reduction) library.
+
+    Handles multiple pyfqmr API versions (``setMesh``/``set_mesh``) and
+    return formats (2- or 3-tuple) transparently.
+
+    Parameters
+    ----------
+    verts : numpy.ndarray
+        Vertex positions with shape ``(N, 3)``.
+    faces : numpy.ndarray
+        Triangle indices with shape ``(M, 3)``.
+    target_faces : int
+        Desired number of faces after simplification. Clamped to a minimum
+        of ``4``.
+    preserve_border : bool
+        If ``True``, boundary edges are preserved during decimation.
+    aggressiveness : float, optional
+        Controls how aggressively the algorithm simplifies. Higher values
+        allow more aggressive reduction. Default is ``7``.
+    verbose : bool, optional
+        If ``True``, pyfqmr prints progress information. Default is ``False``.
+
+    Returns
+    -------
+    verts_out : numpy.ndarray
+        Simplified vertex positions with dtype ``float64``.
+    faces_out : numpy.ndarray
+        Simplified triangle indices with dtype ``int32``.
+
+    Raises
+    ------
+    RuntimeError
+        If the installed pyfqmr version has an incompatible API or returns
+        an unexpected number of values.
+    """
     simp = Simplify()
     if hasattr(simp, "setMesh"):
         simp.setMesh(verts.astype(np.float64), faces.astype(np.int32))
         simp.simplify_mesh(
-            target_count=int(max(4, target_faces)),
+            target_count=int(max(12, target_faces)),
             preserve_border=preserve_border,
             aggressiveness=aggressiveness,
             verbose=verbose,
@@ -52,7 +118,7 @@ def fqmr_simplify(
     elif hasattr(simp, "set_mesh"):
         simp.set_mesh(verts.astype(np.float64), faces.astype(np.int32))
         simp.simplify_mesh(
-            target_count=int(max(4, target_faces)),
+            target_count=int(max(12, target_faces)),
             preserve_border=preserve_border,
             aggressiveness=aggressiveness,
             verbose=verbose,
@@ -72,6 +138,25 @@ def fqmr_simplify(
 
 
 def repair_cleanup(mesh, rezero=False):
+    """Clean up a trimesh by removing degenerate and duplicate geometry.
+
+    Sequentially removes degenerate faces, duplicate faces, and
+    unreferenced vertices. Optionally re-zeros the mesh origin and
+    fixes face normals.
+
+    Parameters
+    ----------
+    mesh : trimesh.Trimesh
+        The mesh to repair in place.
+    rezero : bool, optional
+        If ``True`` and the mesh has faces, translate the mesh so its
+        bounding box starts at the origin. Default is ``False``.
+
+    Returns
+    -------
+    trimesh.Trimesh
+        The repaired mesh (same object, modified in place).
+    """
     # Remove degenerate faces
     if hasattr(mesh, 'remove_degenerate_faces'):
         mesh.remove_degenerate_faces()
@@ -94,7 +179,36 @@ def repair_cleanup(mesh, rezero=False):
 
 
 def weld_vertices(mesh, epsilon, block_size=None, roi_offset=None, verbose=False):
-    """Weld vertices within epsilon distance using a grid-based approach."""
+    """Weld vertices that are within an epsilon distance of each other.
+
+    Uses a grid-based spatial hashing approach to efficiently find and
+    merge nearby vertices via a union-find structure. When ``block_size``
+    and ``roi_offset`` are provided, only vertices near block boundaries
+    are considered for welding.
+
+    Parameters
+    ----------
+    mesh : trimesh.Trimesh
+        Input mesh. A copy is made internally.
+    epsilon : float
+        Maximum distance between vertices to be merged.
+    block_size : numpy.ndarray or None, optional
+        Shape ``(3,)`` array giving the block dimensions. When provided
+        together with ``roi_offset``, restricts welding to vertices near
+        block boundaries. Default is ``None``.
+    roi_offset : numpy.ndarray or None, optional
+        Shape ``(3,)`` array giving the ROI origin offset in world
+        coordinates. Used with ``block_size`` to compute boundary
+        proximity. Default is ``None``.
+    verbose : bool, optional
+        Unused; kept for API compatibility. Default is ``False``.
+
+    Returns
+    -------
+    trimesh.Trimesh
+        A new mesh with nearby vertices merged and geometry cleaned up
+        via ``repair_cleanup``.
+    """
     from collections import defaultdict
 
     mesh = mesh.copy()
@@ -193,7 +307,32 @@ def weld_vertices(mesh, epsilon, block_size=None, roi_offset=None, verbose=False
 
 
 def remove_boundary_vertices(mesh, voxel_size, block_size=None, verbose=False):
-    """Clip mesh at all block boundaries and remove vertices on positive faces."""
+    """Clip a mesh at block boundaries and remove exterior vertices.
+
+    For each axis, slices the mesh at planes located half a voxel inward
+    from the block origin and half a voxel inward from the block extent.
+    Vertices that fall outside the valid interior range are then removed
+    along with any faces that reference them.
+
+    Parameters
+    ----------
+    mesh : trimesh.Trimesh
+        Input mesh to clip.
+    voxel_size : array_like
+        Shape ``(3,)`` voxel dimensions used to compute a half-voxel
+        tolerance for clipping planes.
+    block_size : array_like or None, optional
+        Shape ``(3,)`` block dimensions in world coordinates. If ``None``,
+        the mesh is returned unchanged. Default is ``None``.
+    verbose : bool, optional
+        Unused; kept for API compatibility. Default is ``False``.
+
+    Returns
+    -------
+    trimesh.Trimesh
+        The clipped and cleaned mesh. Returns an empty mesh if all
+        geometry is removed.
+    """
     if len(mesh.vertices) == 0:
         return mesh
     if block_size is None:
@@ -255,13 +394,62 @@ def simplify_mesh(
     mesh, target_reduction, voxel_size, block_size=None,
     aggressiveness=0.3, verbose=False, use_pymeshlab=True, fix_edges=False,
 ):
-    """Simplify a mesh with optional boundary preservation."""
+    """Simplify a mesh with optional boundary preservation.
+
+    First removes vertices outside block boundaries via
+    ``remove_boundary_vertices``, then decimates the mesh to the
+    requested face count using either PyMeshLab or pyfqmr.
+
+    Parameters
+    ----------
+    mesh : trimesh.Trimesh
+        Input mesh to simplify.
+    target_reduction : float
+        Fraction of faces to remove, in the range ``[0, 1)``. For
+        example, ``0.5`` removes roughly half the faces.
+    voxel_size : array_like
+        Shape ``(3,)`` voxel dimensions passed to
+        ``remove_boundary_vertices``.
+    block_size : array_like or None, optional
+        Shape ``(3,)`` block dimensions for boundary clipping. If
+        ``None``, no boundary clipping is performed. Default is ``None``.
+    aggressiveness : float, optional
+        Aggressiveness parameter forwarded to the simplification backend.
+        Default is ``0.3``.
+    verbose : bool, optional
+        If ``True``, print progress information. Default is ``False``.
+    use_pymeshlab : bool, optional
+        If ``True``, use PyMeshLab for decimation; otherwise use pyfqmr.
+        Default is ``True``.
+    fix_edges : bool, optional
+        If ``True``, boundary edges are preserved during decimation.
+        Default is ``False``.
+
+    Returns
+    -------
+    trimesh.Trimesh
+        The simplified and cleaned mesh.
+    """
     mesh = remove_boundary_vertices(mesh, voxel_size, block_size, verbose=verbose)
     F = mesh.faces
     if len(F) == 0:
         return mesh
 
-    target_faces = int(max(4, (1 - target_reduction) * F.shape[0]))
+    target_faces = int(max(12, (1 - target_reduction) * F.shape[0]))
+    if fix_edges:
+        # When preserving borders, boundary vertices cannot be collapsed.
+        # If target_faces is too low relative to the number of boundary
+        # vertices, the simplifier is forced to collapse all interior
+        # geometry into single high-valence fan vertices.  Cap the target
+        # so that at least 2 faces per boundary vertex remain, which keeps
+        # vertex valence reasonable.
+        ms_tmp = pymeshlab.MeshSet()
+        ms_tmp.add_mesh(pymeshlab.Mesh(mesh.vertices, F))
+        ms_tmp.compute_selection_from_mesh_border()
+        n_boundary = int(ms_tmp.current_mesh().vertex_selection_array().sum())
+        min_faces = 2 * n_boundary
+        if target_faces < min_faces:
+            target_faces = min_faces
     if use_pymeshlab:
         v_out, f_out = pymeshlab_simplify(
             mesh.vertices, F,
@@ -284,6 +472,28 @@ def simplify_mesh(
 
 
 def detect_seam_vertices(mesh, angle_degrees, verbose=False):
+    """Detect vertices along sharp seam edges in a mesh.
+
+    Identifies edges where the dihedral angle between adjacent faces
+    exceeds a threshold, then returns the unique vertex indices that
+    belong to those sharp edges.
+
+    Parameters
+    ----------
+    mesh : trimesh.Trimesh
+        Input mesh to analyze.
+    angle_degrees : float
+        Dihedral angle threshold in degrees. Edges with an angle at or
+        above this value are considered sharp seams.
+    verbose : bool, optional
+        Unused; kept for API compatibility. Default is ``False``.
+
+    Returns
+    -------
+    numpy.ndarray
+        Sorted unique vertex indices (dtype ``int32``) on sharp seam
+        edges. Returns an empty array if no seams are found.
+    """
     adj = mesh.face_adjacency
     ang = mesh.face_adjacency_angles
     if ang is None or len(ang) == 0:
@@ -303,6 +513,19 @@ def detect_seam_vertices(mesh, angle_degrees, verbose=False):
 
 
 def vertex_adjacency_list(mesh):
+    """Build a per-vertex adjacency list from the mesh edge graph.
+
+    Parameters
+    ----------
+    mesh : trimesh.Trimesh
+        Input mesh whose ``edges_unique`` attribute is used.
+
+    Returns
+    -------
+    list of numpy.ndarray
+        A list of length ``len(mesh.vertices)`` where each element is a
+        1-D ``int32`` array of neighboring vertex indices.
+    """
     nbrs = [[] for _ in range(len(mesh.vertices))]
     edges = mesh.edges_unique
     for u, v in edges:
@@ -312,6 +535,28 @@ def vertex_adjacency_list(mesh):
 
 
 def expand_k_ring(seed_vertices, nbrs, k):
+    """Expand a set of seed vertices by ``k`` neighborhood rings.
+
+    Performs a breadth-first expansion from ``seed_vertices`` using the
+    adjacency list ``nbrs``, adding all vertices reachable within ``k``
+    edge hops.
+
+    Parameters
+    ----------
+    seed_vertices : array_like
+        Initial vertex indices to expand from.
+    nbrs : list of array_like
+        Per-vertex adjacency list as returned by
+        ``vertex_adjacency_list``.
+    k : int
+        Number of rings (hops) to expand.
+
+    Returns
+    -------
+    numpy.ndarray
+        All vertex indices within ``k`` rings of the seeds, including
+        the seeds themselves (dtype ``int32``).
+    """
     ring = set(int(i) for i in seed_vertices)
     frontier = set(ring)
     for _ in range(k):
@@ -328,7 +573,31 @@ def expand_k_ring(seed_vertices, nbrs, k):
 
 
 def taubin_constrained(mesh, subset_idx, lamb=0.5, mu=-0.53, iterations=10, verbose=False):
-    """Non-shrinking Taubin smoothing on a vertex subset."""
+    """Apply non-shrinking Taubin smoothing to a vertex subset.
+
+    Alternates positive (``lamb``) and negative (``mu``) Laplacian
+    smoothing steps to smooth the surface without net shrinkage. Only
+    the vertices in ``subset_idx`` are updated; all other vertices
+    remain fixed.
+
+    Parameters
+    ----------
+    mesh : trimesh.Trimesh
+        Mesh whose vertices are modified in place.
+    subset_idx : array_like
+        Indices of the vertices to smooth.
+    lamb : float, optional
+        Positive smoothing factor for the shrinking step.
+        Default is ``0.5``.
+    mu : float, optional
+        Negative smoothing factor for the inflation step. Should be
+        negative with ``|mu| > lamb`` to prevent shrinkage.
+        Default is ``-0.53``.
+    iterations : int, optional
+        Number of shrink/inflate iteration pairs. Default is ``10``.
+    verbose : bool, optional
+        Unused; kept for API compatibility. Default is ``False``.
+    """
     if len(subset_idx) == 0:
         return
 
@@ -358,6 +627,30 @@ def denoise_seams_inplace(
     mesh, seam_angle_deg, k_ring, taubin_iters,
     lamb=0.5, mu=-0.53, verbose=False,
 ):
+    """Detect and smooth seam artifacts on a mesh in place.
+
+    Combines ``detect_seam_vertices``, ``expand_k_ring``, and
+    ``taubin_constrained`` to find sharp seam edges, expand the affected
+    region by ``k_ring`` hops, and apply Taubin smoothing to that band.
+
+    Parameters
+    ----------
+    mesh : trimesh.Trimesh
+        Mesh to denoise in place.
+    seam_angle_deg : float
+        Dihedral angle threshold in degrees for detecting seam edges.
+    k_ring : int
+        Number of neighborhood rings to expand around detected seam
+        vertices before smoothing.
+    taubin_iters : int
+        Number of Taubin smoothing iteration pairs.
+    lamb : float, optional
+        Positive smoothing factor. Default is ``0.5``.
+    mu : float, optional
+        Negative inflation factor. Default is ``-0.53``.
+    verbose : bool, optional
+        If ``True``, print diagnostic information. Default is ``False``.
+    """
     seam_verts = detect_seam_vertices(mesh, angle_degrees=seam_angle_deg, verbose=verbose)
     if seam_verts.size == 0:
         return
