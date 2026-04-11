@@ -111,20 +111,14 @@ def zarr_segmentation(tmp_output_dir):
     - Label 2: a solid 8x8x8 cube at [24:32, 24:32, 24:32]
     """
     zarr_path = os.path.join(tmp_output_dir, "test.zarr")
-    store = zarr.DirectoryStore(zarr_path)
-    root = zarr.open(store, mode="w")
+    root = zarr.open_group(zarr_path, mode="w")
     vol = np.zeros((32, 32, 32), dtype=np.uint32)
     vol[4:24, 4:24, 4:24] = 1
     vol[24:32, 24:32, 24:32] = 2
-    root.create_dataset("seg/s0", data=vol, chunks=(16, 16, 16))
-
-    # Write attrs for funlib.persistence
-    zattrs_path = os.path.join(zarr_path, "seg", "s0", ".zattrs")
-    with open(zattrs_path, "w") as f:
-        json.dump(
-            {"voxel_size": [1, 1, 1], "offset": [0, 0, 0], "axis_names": ["z", "y", "x"]},
-            f,
-        )
+    arr = root.create_array("seg/s0", data=vol, chunks=(16, 16, 16))
+    arr.attrs["voxel_size"] = [1, 1, 1]
+    arr.attrs["offset"] = [0, 0, 0]
+    arr.attrs["axis_names"] = ["z", "y", "x"]
 
     return f"{zarr_path}/seg/s0"
 
@@ -149,19 +143,13 @@ def _make_zarr_cube(tmp_dir, voxel_size, offset, vol_shape, cube_slice, label=1,
     if chunk_shape is None:
         chunk_shape = vol_shape
     zarr_path = os.path.join(tmp_dir, "cube.zarr")
-    store = zarr.DirectoryStore(zarr_path)
-    root = zarr.open(store, mode="w")
+    root = zarr.open_group(zarr_path, mode="w")
     vol = np.zeros(vol_shape, dtype=np.uint32)
     vol[cube_slice] = label
-    root.create_dataset("seg/s0", data=vol, chunks=chunk_shape)
-
-    zattrs_path = os.path.join(zarr_path, "seg", "s0", ".zattrs")
-    with open(zattrs_path, "w") as f:
-        json.dump(
-            {"voxel_size": list(voxel_size), "offset": list(offset),
-             "axis_names": ["z", "y", "x"]},
-            f,
-        )
+    arr = root.create_array("seg/s0", data=vol, chunks=chunk_shape)
+    arr.attrs["voxel_size"] = list(voxel_size)
+    arr.attrs["offset"] = list(offset)
+    arr.attrs["axis_names"] = ["z", "y", "x"]
 
     # Compute expected mesh bounds in XYZ.
     vs = np.array(voxel_size, dtype=float)  # ZYX
@@ -207,8 +195,7 @@ def zarr_sphere(tmp_output_dir):
     Sphere: label 1, radius 20 voxels, center at voxel [32,32,32].
     """
     zarr_path = os.path.join(tmp_output_dir, "sphere.zarr")
-    store = zarr.DirectoryStore(zarr_path)
-    root = zarr.open(store, mode="w")
+    root = zarr.open_group(zarr_path, mode="w")
 
     vol = np.zeros((64, 64, 64), dtype=np.uint32)
     center = np.array([32, 32, 32])
@@ -216,14 +203,10 @@ def zarr_sphere(tmp_output_dir):
     zz, yy, xx = np.mgrid[0:64, 0:64, 0:64]
     dist = np.sqrt((zz - center[0])**2 + (yy - center[1])**2 + (xx - center[2])**2)
     vol[dist <= radius] = 1
-    root.create_dataset("seg/s0", data=vol, chunks=(16, 16, 16))
-
-    zattrs_path = os.path.join(zarr_path, "seg", "s0", ".zattrs")
-    with open(zattrs_path, "w") as f:
-        json.dump(
-            {"voxel_size": [2, 2, 2], "offset": [0, 0, 0], "axis_names": ["z", "y", "x"]},
-            f,
-        )
+    arr = root.create_array("seg/s0", data=vol, chunks=(16, 16, 16))
+    arr.attrs["voxel_size"] = [2, 2, 2]
+    arr.attrs["offset"] = [0, 0, 0]
+    arr.attrs["axis_names"] = ["z", "y", "x"]
 
     expected_center_xyz = np.array([64.0, 64.0, 64.0])
     expected_radius_world = 40.0
@@ -240,36 +223,30 @@ def _make_zarr_cube_ome_ngff(tmp_dir, voxel_size, offset, vol_shape, cube_slice,
     if chunk_shape is None:
         chunk_shape = vol_shape
     zarr_path = os.path.join(tmp_dir, "ome.zarr")
-    store = zarr.DirectoryStore(zarr_path)
-    root = zarr.open(store, mode="w")
+    root = zarr.open_group(zarr_path, mode="w")
     vol = np.zeros(vol_shape, dtype=np.uint32)
     vol[cube_slice] = label
-    root.create_dataset("seg/s0", data=vol, chunks=chunk_shape)
+    root.create_array("seg/s0", data=vol, chunks=chunk_shape)
 
-    # Write OME-NGFF multiscales metadata on the PARENT group (seg/.zattrs)
-    parent_zattrs_path = os.path.join(zarr_path, "seg", ".zattrs")
-    ome_metadata = {
-        "multiscales": [{
-            "axes": [
-                {"name": "z", "type": "space", "unit": "nanometer"},
-                {"name": "y", "type": "space", "unit": "nanometer"},
-                {"name": "x", "type": "space", "unit": "nanometer"},
+    # Write OME-NGFF multiscales metadata on the PARENT group
+    seg_group = root["seg"]
+    seg_group.attrs["multiscales"] = [{
+        "axes": [
+            {"name": "z", "type": "space", "unit": "nanometer"},
+            {"name": "y", "type": "space", "unit": "nanometer"},
+            {"name": "x", "type": "space", "unit": "nanometer"},
+        ],
+        "datasets": [{
+            "coordinateTransformations": [
+                {"scale": list(voxel_size), "type": "scale"},
+                {"translation": list(offset), "type": "translation"},
             ],
-            "datasets": [{
-                "coordinateTransformations": [
-                    {"scale": list(voxel_size), "type": "scale"},
-                    {"translation": list(offset), "type": "translation"},
-                ],
-                "path": "s0",
-            }],
-            "version": "0.4",
-        }]
-    }
-    os.makedirs(os.path.dirname(parent_zattrs_path), exist_ok=True)
-    with open(parent_zattrs_path, "w") as f:
-        json.dump(ome_metadata, f)
+            "path": "s0",
+        }],
+        "version": "0.4",
+    }]
 
-    # NO .zattrs on the dataset itself — funlib will see voxel_size=(1,1,1)
+    # NO attrs on the dataset itself — open_dataset will see voxel_size=(1,1,1)
 
     vs = np.array(voxel_size, dtype=float)
     off = np.array(offset, dtype=float)

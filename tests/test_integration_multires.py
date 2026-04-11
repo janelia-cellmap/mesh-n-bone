@@ -148,8 +148,8 @@ class TestDecimation:
         assert len(dec_mesh.faces) > 0
 
     def test_decimation_multiple_lods(self, tmp_output_dir):
-        """Higher LODs should have progressively fewer faces."""
-        mesh = trimesh.creation.icosphere(subdivisions=4, radius=50.0)
+        """Higher LODs should have progressively fewer faces until the minimum."""
+        mesh = trimesh.creation.icosphere(subdivisions=5, radius=50.0)
         mesh.vertices += 100
 
         input_dir = os.path.join(tmp_output_dir, "input")
@@ -172,9 +172,11 @@ class TestDecimation:
             dec_mesh = trimesh.load(os.path.join(output_dir, f"s{lod}", "1.ply"))
             face_counts.append(len(dec_mesh.faces))
 
-        # Each LOD should have fewer faces than the previous
+        # Each LOD should have <= faces than the previous
         for i in range(1, len(face_counts)):
-            assert face_counts[i] < face_counts[i - 1]
+            assert face_counts[i] <= face_counts[i - 1]
+        # At least the first decimation should reduce faces
+        assert face_counts[1] < face_counts[0]
 
 
 class TestFullMultiresPipeline:
@@ -254,6 +256,46 @@ class TestFullMultiresPipeline:
             data = f.read()
         chunk_shape = struct.unpack("<3f", data[0:12])
         np.testing.assert_allclose(chunk_shape, [20.0, 30.0, 40.0])
+
+    def test_small_mesh_single_lod0_fragment(self, multires_mesh_dir):
+        """A small mesh that fits in 1 chunk should have exactly 1 non-empty LOD 0 fragment.
+
+        Regression test: grid_origin centering on the coarsest LOD used to
+        shift the LOD 0 grid so small meshes straddled multiple chunks.
+        """
+        output_path = multires_mesh_dir
+
+        generate_neuroglancer_multires_mesh(
+            id=1,
+            num_subtask_workers=1,
+            output_path=output_path,
+            lods=[0, 1],
+            original_ext=".ply",
+            lod_0_box_size=None,  # auto-compute from mesh
+        )
+
+        index_file = os.path.join(output_path, "multires", "1.index")
+        with open(index_file, "rb") as f:
+            data = f.read()
+
+        off = 0
+        off += 12  # chunk_shape
+        off += 12  # grid_origin
+        num_lods = struct.unpack_from("<I", data, off)[0]; off += 4
+        off += 4 * num_lods  # lod_scales
+        off += 12 * num_lods  # vertex_offsets
+        num_frags_per_lod = np.frombuffer(data, "<I", num_lods, off); off += 4 * num_lods
+
+        # Parse LOD 0 fragments
+        nf = num_frags_per_lod[0]
+        off += 4 * nf * 3  # skip positions (transposed)
+        frag_offsets = np.frombuffer(data, "<I", nf, off)
+
+        non_empty = np.count_nonzero(frag_offsets)
+        assert non_empty == 1, (
+            f"Small mesh should have 1 non-empty LOD 0 fragment, got {non_empty} "
+            f"(total fragments: {nf})"
+        )
 
     def test_neuroglancer_metadata_files(self, multires_mesh_dir):
         """Info and segment_properties files should be valid JSON."""

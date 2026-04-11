@@ -4,9 +4,20 @@ import numpy as np
 import os
 import pytest
 import trimesh
+import zarr
 
 from mesh_n_bone.cli import _parse_roi_arg
 from mesh_n_bone.multires.multires import _mesh_intersects_roi
+
+
+def _create_zarr_volume(tmpdir, vol, voxel_size=(1, 1, 1), chunk_shape=(16, 16, 16)):
+    """Helper: write a labeled volume to zarr with metadata."""
+    zarr_path = os.path.join(tmpdir, "test.zarr")
+    root = zarr.open_group(zarr_path, mode="w")
+    arr = root.create_array("labels/s0", data=vol, chunks=chunk_shape)
+    arr.attrs["voxel_size"] = list(voxel_size)
+    arr.attrs["offset"] = [0, 0, 0]
+    return f"{zarr_path}/labels/s0"
 
 
 class TestParseRoiArg:
@@ -159,25 +170,11 @@ class TestMeshifyRoiIntegration:
 
     def test_roi_restricts_to_one_object(self, tmp_output_dir):
         """When ROI covers only one of two objects, only that object should be meshed."""
-        from funlib.persistence import prepare_ds
-        from funlib.geometry import Coordinate
-
         vol = np.zeros((32, 32, 32), dtype=np.uint64)
         vol[2:14, 2:14, 2:14] = 1  # object 1 in [2:14]
         vol[18:30, 18:30, 18:30] = 2  # object 2 in [18:30]
 
-        zarr_path = os.path.join(tmp_output_dir, "test.zarr")
-        vs = Coordinate(1, 1, 1)
-        ds = prepare_ds(
-            f"{zarr_path}/labels/s0",
-            shape=Coordinate(vol.shape),
-            offset=Coordinate(0, 0, 0),
-            voxel_size=vs,
-            dtype=vol.dtype,
-            chunk_shape=Coordinate(16, 16, 16),
-        )
-        ds[ds.roi] = vol
-        input_path = f"{zarr_path}/labels/s0"
+        input_path = _create_zarr_volume(tmp_output_dir, vol)
 
         output_dir = os.path.join(tmp_output_dir, "output")
         from mesh_n_bone.meshify.meshify import Meshify
@@ -203,25 +200,11 @@ class TestMeshifyRoiIntegration:
 
     def test_roi_covering_full_volume_gets_both_objects(self, tmp_output_dir):
         """ROI covering the full volume should produce all objects."""
-        from funlib.persistence import prepare_ds
-        from funlib.geometry import Coordinate
-
         vol = np.zeros((32, 32, 32), dtype=np.uint64)
         vol[2:14, 2:14, 2:14] = 1
         vol[18:30, 18:30, 18:30] = 2
 
-        zarr_path = os.path.join(tmp_output_dir, "test.zarr")
-        vs = Coordinate(1, 1, 1)
-        ds = prepare_ds(
-            f"{zarr_path}/labels/s0",
-            shape=Coordinate(vol.shape),
-            offset=Coordinate(0, 0, 0),
-            voxel_size=vs,
-            dtype=vol.dtype,
-            chunk_shape=Coordinate(16, 16, 16),
-        )
-        ds[ds.roi] = vol
-        input_path = f"{zarr_path}/labels/s0"
+        input_path = _create_zarr_volume(tmp_output_dir, vol)
 
         output_dir = os.path.join(tmp_output_dir, "output")
         from mesh_n_bone.meshify.meshify import Meshify
@@ -381,28 +364,16 @@ class TestMeshifyRoiBoundaryProtection:
 
     def test_roi_with_simplification_produces_mesh(self, tmp_output_dir):
         """Meshify with ROI + simplification should produce valid output."""
-        from funlib.persistence import prepare_ds
-        from funlib.geometry import Coordinate
         from mesh_n_bone.meshify.meshify import Meshify
 
         vol = np.zeros((32, 32, 32), dtype=np.uint64)
         vol[2:30, 2:30, 2:30] = 1  # object spans full volume
 
-        zarr_path = os.path.join(tmp_output_dir, "test.zarr")
-        vs = Coordinate(1, 1, 1)
-        ds = prepare_ds(
-            f"{zarr_path}/labels/s0",
-            shape=Coordinate(vol.shape),
-            offset=Coordinate(0, 0, 0),
-            voxel_size=vs,
-            dtype=vol.dtype,
-            chunk_shape=Coordinate(16, 16, 16),
-        )
-        ds[ds.roi] = vol
+        input_path = _create_zarr_volume(tmp_output_dir, vol)
 
         output_dir = os.path.join(tmp_output_dir, "output")
         m = Meshify(
-            input_path=f"{zarr_path}/labels/s0",
+            input_path=input_path,
             output_directory=output_dir,
             roi={"begin": [0, 0, 0], "end": [16, 16, 16]},
             num_workers=1,

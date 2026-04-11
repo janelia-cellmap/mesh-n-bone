@@ -10,27 +10,20 @@ import os
 import pytest
 import tempfile
 import trimesh
+import zarr
 
-from funlib.persistence import prepare_ds
 from funlib.geometry import Coordinate
 
 from mesh_n_bone.meshify.meshify import Meshify
 
 
 def _create_zarr_volume(tmpdir, vol, voxel_size=(8, 8, 8), chunk_shape=(16, 16, 16)):
-    """Helper: write a labeled volume to zarr with funlib metadata."""
+    """Helper: write a labeled volume to zarr with metadata."""
     zarr_path = os.path.join(tmpdir, "test.zarr")
-    vs = Coordinate(*voxel_size)
-    cs = Coordinate(*chunk_shape)
-    ds = prepare_ds(
-        f"{zarr_path}/labels/s0",
-        shape=Coordinate(vol.shape),
-        offset=Coordinate(0, 0, 0),
-        voxel_size=vs,
-        dtype=vol.dtype,
-        chunk_shape=cs,
-    )
-    ds[ds.roi] = vol
+    root = zarr.open_group(zarr_path, mode="w")
+    arr = root.create_array("labels/s0", data=vol, chunks=chunk_shape)
+    arr.attrs["voxel_size"] = list(voxel_size)
+    arr.attrs["offset"] = [0, 0, 0]
     return f"{zarr_path}/labels/s0"
 
 

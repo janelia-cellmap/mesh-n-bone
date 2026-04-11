@@ -166,6 +166,97 @@ class TestSeamDetectionAndDenoising:
         assert len(mesh.faces) > 0
 
 
+class TestBoundaryAwareReduction:
+    """Test that fix_edges caps reduction to avoid high-valence artifacts."""
+
+    @staticmethod
+    def _make_partial_block_mesh(block_size, voxel_size=1):
+        """Create a mesh that only partially fills a block.
+
+        The mesh is an open hemisphere occupying one corner of the block,
+        resulting in a large open boundary after clipping — the scenario
+        that triggers high-valence artifacts without the cap.
+        """
+        import pymeshlab
+        # Create a sphere that extends beyond the block on three sides
+        sphere = trimesh.creation.icosphere(subdivisions=4, radius=block_size * 0.8)
+        # Shift so most of it is inside [0, block_size]
+        sphere.vertices += block_size * 0.4
+        return sphere
+
+    def test_fix_edges_caps_target_faces(self):
+        """With fix_edges=True, target_faces should be capped based on boundary count."""
+        block_size = np.array([30.0, 30.0, 30.0])
+        mesh = self._make_partial_block_mesh(30.0)
+
+        result = simplify_mesh(
+            mesh,
+            target_reduction=0.95,
+            voxel_size=(1, 1, 1),
+            block_size=block_size,
+            fix_edges=True,
+        )
+
+        # With the cap, max valence should stay reasonable (< 30)
+        if len(result.vertices) > 0:
+            valences = np.array(
+                [len(result.vertex_neighbors[i]) for i in range(len(result.vertices))]
+            )
+            assert valences.max() < 30, (
+                f"Max valence {valences.max()} exceeds limit; "
+                "boundary-aware cap may not be working"
+            )
+
+    def test_fix_edges_aggressive_reduction_no_spikes(self):
+        """Aggressive reduction with fix_edges should not create spike vertices."""
+        block_size = np.array([30.0, 30.0, 30.0])
+        mesh = self._make_partial_block_mesh(30.0)
+
+        result = simplify_mesh(
+            mesh,
+            target_reduction=0.9,
+            voxel_size=(1, 1, 1),
+            block_size=block_size,
+            fix_edges=True,
+        )
+
+        if len(result.vertices) > 3 and len(result.faces) > 1:
+            # Check for spike vertices (face normals pointing opposite directions)
+            vertex_faces = result.vertex_faces
+            spike_count = 0
+            for vi in range(len(result.vertices)):
+                faces = vertex_faces[vi]
+                faces = faces[faces >= 0]
+                if len(faces) < 3:
+                    continue
+                fnormals = result.face_normals[faces]
+                mean_n = fnormals.mean(axis=0)
+                norm = np.linalg.norm(mean_n)
+                if norm < 1e-10:
+                    continue
+                mean_n /= norm
+                dots = np.dot(fnormals, mean_n)
+                if dots.min() < -0.5:
+                    spike_count += 1
+            assert spike_count == 0, f"Found {spike_count} spike vertices"
+
+    def test_no_cap_without_fix_edges(self):
+        """Without fix_edges, reduction should not be capped."""
+        mesh = trimesh.creation.icosphere(subdivisions=4, radius=10.0)
+        original_faces = len(mesh.faces)
+
+        result = simplify_mesh(
+            mesh,
+            target_reduction=0.95,
+            voxel_size=(1, 1, 1),
+            block_size=None,
+            fix_edges=False,
+        )
+
+        # Should achieve close to the requested reduction
+        assert len(result.faces) < 0.15 * original_faces
+
+
 class TestSimplificationBackends:
     """Test both pymeshlab and fqmr simplification backends."""
 
