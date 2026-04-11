@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 
 def generate_neuroglancer_multires_mesh(
     id, num_subtask_workers, output_path, lods, original_ext, lod_0_box_size=None,
+    vertex_quantization_bits=16,
 ):
     """Create a complete multiresolution mesh for a single segment.
 
@@ -101,19 +102,33 @@ def generate_neuroglancer_multires_mesh(
 
         lods = lods[:idx]
 
-        # Compute the LOD 0 chunk grid from the s0 mesh extent, and
-        # set grid_origin so the mesh fits in exactly the intended
-        # number of LOD 0 chunks.
+        # Compute the LOD 0 chunk grid from the s0 mesh extent.
         mesh_extent = vertex_max - vertex_min
         num_chunks_per_axis = np.maximum(
             np.ceil(mesh_extent / lod_0_box_size).astype(int), 1
         )
-        lod0_grid_extent = num_chunks_per_axis * lod_0_box_size
+
+        # For meshes that fit in a single chunk, drop to 1 LOD.
+        # With 1 LOD the octree is just 1 cell, so grid_origin
+        # centers the mesh exactly and there are no internal chunk
+        # boundaries that would create LOD-transition seam artifacts.
+        if np.all(num_chunks_per_axis == 1) and len(lods) > 1:
+            lods = lods[:1]
+
+        # Center the mesh within the full octree grid so that
+        # Neuroglancer's bounding-box center matches the actual mesh
+        # center.
+        octree_unit = 2 ** (len(lods) - 1)
+        total_chunks_per_axis = (
+            np.ceil(num_chunks_per_axis / octree_unit).astype(int)
+            * octree_unit
+        )
+        full_grid_extent = total_chunks_per_axis * lod_0_box_size
         bbox_center = (vertex_min + vertex_max) / 2
-        grid_origin = np.floor(bbox_center - lod0_grid_extent / 2)
+        grid_origin = np.floor(bbox_center - full_grid_extent / 2)
         grid_origin = np.clip(
             grid_origin,
-            np.ceil(vertex_max - lod0_grid_extent),
+            np.ceil(vertex_max - full_grid_extent),
             np.floor(vertex_min),
         )
 
@@ -169,6 +184,7 @@ def generate_neuroglancer_multires_mesh(
                                         current_end_fragment,
                                         current_lod,
                                         num_chunks,
+                                        vertex_quantization_bits,
                                     )
                                 )
                             else:
@@ -181,6 +197,7 @@ def generate_neuroglancer_multires_mesh(
                                         current_end_fragment,
                                         current_lod,
                                         num_chunks,
+                                        vertex_quantization_bits,
                                     )
                                 )
 
@@ -242,7 +259,8 @@ def _mesh_intersects_roi(mesh_path, roi_begin, roi_end):
 
 
 def generate_all_neuroglancer_multires_meshes(
-    output_path, num_workers, ids, lods, original_ext, file_sizes, lod_0_box_size=None,
+    output_path, num_workers, ids, lods, original_ext, file_sizes,
+    lod_0_box_size=None, vertex_quantization_bits=16,
 ):
     """Generate Neuroglancer multiresolution meshes for all segments.
 
@@ -275,7 +293,7 @@ def generate_all_neuroglancer_multires_meshes(
 
     num_subtask_workers = get_number_of_subtask_workers(file_sizes, num_workers)
     variable_args_list = []
-    fixed_args_list = [output_path, lods, original_ext, lod_0_box_size]
+    fixed_args_list = [output_path, lods, original_ext, lod_0_box_size, vertex_quantization_bits]
     for idx, id in enumerate(ids):
         variable_args_list.append((id, num_subtask_workers[idx]))
     dask_util.compute_bag(
@@ -397,6 +415,7 @@ def run_multires(config_path, num_workers, roi=None):
                     generate_all_neuroglancer_multires_meshes(
                         output_path, num_workers, mesh_ids, lods, mesh_ext,
                         np.array(file_sizes), lod_0_box_size,
+                        vertex_quantization_bits=16,
                     )
 
             with Timing_Messager("Writing info and segment properties files", logger):
@@ -407,7 +426,9 @@ def run_multires(config_path, num_workers, roi=None):
                     csv_columns=segment_properties_columns,
                     csv_id_column=segment_properties_id_column,
                 )
-                neuroglancer.write_info_file(multires_output_path)
+                neuroglancer.write_info_file(
+                    multires_output_path, vertex_quantization_bits=16,
+                )
 
             if not skip_decimation and delete_decimated_meshes_flag:
                 with dask_util.start_dask(

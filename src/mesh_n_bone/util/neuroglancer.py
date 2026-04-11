@@ -6,21 +6,24 @@ import struct
 import numpy as np
 
 
-def write_info_file(path):
+def write_info_file(path, vertex_quantization_bits=16):
     """Write the ``info`` JSON file for a Neuroglancer multi-LOD Draco mesh layer.
 
-    The generated file uses 10-bit vertex quantization, an identity
+    The generated file uses the specified vertex quantization, an identity
     transform, and references a ``segment_properties`` sub-directory.
 
     Parameters
     ----------
     path : str
         Directory in which the ``info`` file is created.
+    vertex_quantization_bits : int, optional
+        Number of quantization bits per vertex coordinate.  Default is
+        ``16``.
     """
     with open(f"{path}/info", "w") as f:
         info = {
             "@type": "neuroglancer_multilod_draco",
-            "vertex_quantization_bits": 10,
+            "vertex_quantization_bits": vertex_quantization_bits,
             "transform": [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0],
             "lod_scale_multiplier": 1,
             "segment_properties": "segment_properties",
@@ -500,7 +503,7 @@ def write_singleres_multires_metadata(meshdir, csv_path=None, csv_columns=None, 
     mesh_ids.sort(key=int)
     info = {
         "@type": "neuroglancer_multilod_draco",
-        "vertex_quantization_bits": 10,
+        "vertex_quantization_bits": 16,
         "transform": [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0],
         "lod_scale_multiplier": 1,
         "segment_properties": "segment_properties",

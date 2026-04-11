@@ -79,7 +79,7 @@ def update_fragment_dict(dictionary, fragment_pos, vertices, faces, lod_0_fragme
 
 def generate_mesh_decomposition(
     mesh_path, lod_0_box_size, grid_origin, start_fragment, end_fragment,
-    current_lod, num_chunks,
+    current_lod, num_chunks, vertex_quantization_bits=16,
 ):
     """Decompose a mesh into spatially-gridded, Draco-compressed fragments.
 
@@ -199,50 +199,32 @@ def generate_mesh_decomposition(
             if len(fragment.vertices) > 0:
                 current_box_size = lod_0_box_size * 2**current_lod
                 quantization_origin = np.asarray(fragment_pos) * current_box_size
-                quantization_bits = 10
-                # DracoPy requires a single scalar quantization_range, but
-                # neuroglancer decodes each axis independently using
-                # chunk_shape[j].  Pre-scale shorter axes so all axes fill
-                # the full quantization range; neuroglancer's per-axis
-                # chunk_shape decoding undoes this scaling.
-                max_cbs = float(np.max(current_box_size))
-
-                # Snap to the exact per-axis quantization lattice
+                quantization_bits = vertex_quantization_bits
+                # The spec requires Draco-encoded INTEGER positions in
+                # [0, 2^bits).  Compute per-axis integer positions:
+                #   q[j] = round(local[j] / current_box_size[j] * max_q)
+                # then encode with range=max_q so DracoPy stores them
+                # as-is.  Neuroglancer decodes via:
+                #   world[j] = grid_origin[j] + chunk_shape[j] * 2^lod
+                #              * (frag_pos[j] + q[j] / max_q)
                 max_q = float((1 << quantization_bits) - 1)
                 local_vertices = fragment.vertices.astype(np.float64) - quantization_origin
                 local_vertices = np.clip(local_vertices, 0.0, current_box_size)
 
-                # Snap vertices near chunk boundaries to the exact
-                # boundary so adjacent chunks share identical positions
-                # after quantization (eliminates visible seams).
-                half_step = current_box_size / max_q / 2.0
-                local_vertices = np.where(
-                    local_vertices < half_step, 0.0, local_vertices
-                )
-                local_vertices = np.where(
-                    local_vertices > current_box_size - half_step,
-                    current_box_size,
-                    local_vertices,
-                )
-                local_vertices = (
-                    np.round(local_vertices * (max_q / current_box_size))
-                    * (current_box_size / max_q)
-                )
-
-                # Pre-scale for Draco encoding
-                scale_factors = max_cbs / current_box_size
-                scaled_local = local_vertices * scale_factors
-                scaled_origin = np.asarray(fragment_pos, dtype=float) * max_cbs
-                quantized_vertices = scaled_origin + scaled_local
+                # Compute integer quantized positions per axis
+                int_positions = np.round(
+                    local_vertices * (max_q / current_box_size)
+                ).astype(np.float64)
+                int_positions = np.clip(int_positions, 0.0, max_q)
 
                 draco_bytes, _ = capture_draco_output(
                     2,
                     DracoPy.encode,
-                    points=quantized_vertices,
+                    points=int_positions,
                     faces=fragment.faces,
                     quantization_bits=quantization_bits,
-                    quantization_range=max_cbs,
-                    quantization_origin=scaled_origin,
+                    quantization_range=max_q,
+                    quantization_origin=[0.0, 0.0, 0.0],
                 )
 
                 if len(draco_bytes) > 12:

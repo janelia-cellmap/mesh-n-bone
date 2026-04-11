@@ -120,7 +120,7 @@ class TestSingleresMultiresFormat:
         with open(os.path.join(mesh_dir, "info")) as f:
             info = json.load(f)
         assert info["@type"] == "neuroglancer_multilod_draco"
-        assert info["vertex_quantization_bits"] == 10
+        assert info["vertex_quantization_bits"] == 16
 
 
 class TestMultilodDracoFormat:
@@ -133,7 +133,7 @@ class TestMultilodDracoFormat:
             info = json.load(f)
 
         assert info["@type"] == "neuroglancer_multilod_draco"
-        assert info["vertex_quantization_bits"] == 10
+        assert info["vertex_quantization_bits"] == 16
         assert info["lod_scale_multiplier"] == 1
         assert len(info["transform"]) == 12
 

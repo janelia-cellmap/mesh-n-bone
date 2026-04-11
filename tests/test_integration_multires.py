@@ -257,11 +257,11 @@ class TestFullMultiresPipeline:
         chunk_shape = struct.unpack("<3f", data[0:12])
         np.testing.assert_allclose(chunk_shape, [20.0, 30.0, 40.0])
 
-    def test_small_mesh_single_lod0_fragment(self, multires_mesh_dir):
-        """A small mesh that fits in 1 chunk should have exactly 1 non-empty LOD 0 fragment.
+    def test_small_mesh_grid_center_matches_mesh_center(self, multires_mesh_dir):
+        """Grid bounding-box center should approximately match the mesh center.
 
-        Regression test: grid_origin centering on the coarsest LOD used to
-        shift the LOD 0 grid so small meshes straddled multiple chunks.
+        The grid_origin is set so that Neuroglancer's navigation (which
+        uses the grid bounding box) lands near the actual mesh.
         """
         output_path = multires_mesh_dir
 
@@ -274,27 +274,35 @@ class TestFullMultiresPipeline:
             lod_0_box_size=None,  # auto-compute from mesh
         )
 
+        # Read the mesh to get the actual center
+        from mesh_n_bone.util.mesh_io import mesh_loader
+        vertices, _ = mesh_loader(
+            os.path.join(output_path, "mesh_lods", "s0", "1.ply")
+        )
+        actual_center = (vertices.min(axis=0) + vertices.max(axis=0)) / 2
+
+        # Read the index file to get the grid center
         index_file = os.path.join(output_path, "multires", "1.index")
         with open(index_file, "rb") as f:
             data = f.read()
 
-        off = 0
-        off += 12  # chunk_shape
-        off += 12  # grid_origin
-        num_lods = struct.unpack_from("<I", data, off)[0]; off += 4
-        off += 4 * num_lods  # lod_scales
-        off += 12 * num_lods  # vertex_offsets
-        num_frags_per_lod = np.frombuffer(data, "<I", num_lods, off); off += 4 * num_lods
-
-        # Parse LOD 0 fragments
+        chunk_shape = np.frombuffer(data, "<f", 3, 0).copy()
+        grid_origin = np.frombuffer(data, "<f", 3, 12).copy()
+        num_lods = struct.unpack_from("<I", data, 24)[0]
+        off = 28 + 4 * num_lods + 12 * num_lods
+        num_frags_per_lod = np.frombuffer(data, "<I", num_lods, off).copy()
+        off += 4 * num_lods
         nf = num_frags_per_lod[0]
-        off += 4 * nf * 3  # skip positions (transposed)
-        frag_offsets = np.frombuffer(data, "<I", nf, off)
+        positions = np.frombuffer(data, "<I", nf * 3, off).reshape(3, nf).T.copy()
 
-        non_empty = np.count_nonzero(frag_offsets)
-        assert non_empty == 1, (
-            f"Small mesh should have 1 non-empty LOD 0 fragment, got {non_empty} "
-            f"(total fragments: {nf})"
+        grid_min = grid_origin + positions.min(axis=0) * chunk_shape
+        grid_max = grid_origin + (positions.max(axis=0) + 1) * chunk_shape
+        grid_center = (grid_min + grid_max) / 2
+
+        offset = np.abs(grid_center - actual_center)
+        assert np.all(offset < chunk_shape * 0.6), (
+            f"Grid center {grid_center} too far from mesh center "
+            f"{actual_center} (offset {offset}, chunk_shape {chunk_shape})"
         )
 
     def test_neuroglancer_metadata_files(self, multires_mesh_dir):
@@ -319,7 +327,7 @@ class TestFullMultiresPipeline:
         with open(os.path.join(multires_dir, "info")) as f:
             info = json.load(f)
         assert info["@type"] == "neuroglancer_multilod_draco"
-        assert info["vertex_quantization_bits"] == 10
+        assert info["vertex_quantization_bits"] == 16
 
         # Verify segment properties
         sp_path = os.path.join(multires_dir, "segment_properties", "info")
@@ -342,13 +350,15 @@ class TestLodTruncation:
         """When all LODs have decreasing face counts, all should be included."""
         output_path = multires_mesh_dir
 
+        # Use a small box_size to force multi-chunk so the single-LOD
+        # truncation for single-chunk meshes does not apply.
         generate_neuroglancer_multires_mesh(
             id=1,
             num_subtask_workers=1,
             output_path=output_path,
             lods=[0, 1],
             original_ext=".ply",
-            lod_0_box_size=None,
+            lod_0_box_size=np.array([20.0, 30.0, 40.0]),
         )
 
         # Parse the index file to check num_lods
@@ -421,13 +431,15 @@ class TestLodTruncation:
                 v, f, _ = simplifier.getMesh()
                 trimesh.Trimesh(v, f).export(os.path.join(lod_dir, "1.ply"))
 
+        # Use a small box_size to force multi-chunk so the single-LOD
+        # truncation for single-chunk meshes does not apply.
         generate_neuroglancer_multires_mesh(
             id=1,
             num_subtask_workers=1,
             output_path=output_path,
             lods=[0, 1, 2],
             original_ext=".ply",
-            lod_0_box_size=None,
+            lod_0_box_size=np.array([20.0, 20.0, 20.0]),
         )
 
         index_file = os.path.join(output_path, "multires", "1.index")
