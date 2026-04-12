@@ -14,7 +14,17 @@ _CGAL_BINARY = os.path.join(
     os.path.dirname(__file__), os.pardir,
     "cgal_skeletonize_mesh", "skeletonize_mesh",
 )
-_HAS_CGAL = os.path.isfile(_CGAL_BINARY) and os.access(_CGAL_BINARY, os.X_OK)
+def _check_cgal_binary():
+    if not os.path.isfile(_CGAL_BINARY) or not os.access(_CGAL_BINARY, os.X_OK):
+        return False
+    import subprocess
+    try:
+        subprocess.run([_CGAL_BINARY, "--help"], capture_output=True, timeout=5)
+        return True
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+_HAS_CGAL = _check_cgal_binary()
 
 
 class TestCGALSkeletonization:

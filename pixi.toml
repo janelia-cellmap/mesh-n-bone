@@ -54,7 +54,7 @@ make = "*"
 build-cgal = """
 cd cgal_skeletonize_mesh && \
 mkdir -p build && cd build && \
-cmake .. && make -j$(nproc) && \
+cmake .. && make -j$(nproc 2>/dev/null || sysctl -n hw.ncpu) && \
 cp skeletonize_mesh ../
 """
 

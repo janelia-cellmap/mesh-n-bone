@@ -18,7 +18,9 @@ jobs:
 
       - uses: prefix-dev/setup-pixi@v0.8.1
         with:
-          environments: test
+          environments: test build-cgal
           cache: true
+
+      - run: pixi run -e build-cgal build-cgal
 
       - run: pixi run -e test test
