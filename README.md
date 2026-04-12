@@ -233,3 +233,7 @@ src/mesh_n_bone/
 cgal_skeletonize_mesh/      # C++ CGAL skeletonizer source + binary
 tests/                      # Unit and integration tests
 ```
+
+## Acknowledgments
+
+Thanks to [Luca Marconato](https://github.com/LucaMarconato) for the pixi configuration that informed macOS support and the neuroglancer serving approach ([#6](https://github.com/janelia-cellmap/mesh-n-bone/pull/6)).
