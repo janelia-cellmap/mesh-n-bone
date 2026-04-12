@@ -1,0 +1,60 @@
+site_name: mesh-n-bone
+site_description: Unified tool for mesh generation, multiresolution mesh creation, skeletonization, and analysis.
+site_url: https://janelia-cellmap.github.io/mesh-n-bone/
+repo_url: https://github.com/janelia-cellmap/mesh-n-bone
+repo_name: janelia-cellmap/mesh-n-bone
+
+theme:
+  name: material
+  palette:
+    - scheme: default
+      primary: teal
+      accent: teal
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - scheme: slate
+      primary: teal
+      accent: teal
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.sections
+    - navigation.expand
+    - content.code.copy
+    - toc.follow
+
+plugins:
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          options:
+            docstring_style: numpy
+            show_root_heading: true
+            show_source: false
+            members_order: source
+            heading_level: 3
+            show_symbol_type_heading: true
+            show_symbol_type_toc: true
+
+nav:
+  - Home: index.md
+  - CLI Usage: cli.md
+  - API Reference:
+      - Meshify: api/meshify.md
+      - Multiresolution: api/multires.md
+      - Skeletonize: api/skeletonize.md
+      - Analyze: api/analyze.md
+      - Utilities: api/util.md
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - toc:
+      permalink: true

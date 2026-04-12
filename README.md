@@ -1,108 +1,208 @@
-# Multiresolution Mesh Creator
+# mesh-n-bone
+
+Unified tool for mesh generation, multiresolution mesh creation, skeletonization, and analysis — all parallelized with [Dask](https://dask.org/).
+
+Produces meshes in the [neuroglancer precomputed format](https://github.com/google/neuroglancer/blob/master/src/neuroglancer/datasource/precomputed/meshes.md) for viewing in [neuroglancer](https://github.com/google/neuroglancer).
+
 ![Demo](recording/recording.gif)
 
-This repository is meant to be used to create multiresolution meshes in the [neuroglancer precomputed format](https://github.com/google/neuroglancer/blob/master/src/neuroglancer/datasource/precomputed/meshes.md), inspired by [this comment](https://github.com/google/neuroglancer/issues/272#issuecomment-752212014) in order to be used with [neuroglancer](https://github.com/google/neuroglancer). It uses [Dask](https://dask.org/) to parallelize the mesh generation, allowing for progress to be monitored via eg. http://localhost:8787/status.
+## Features
+
+- **Meshify** — Generate meshes from `.zarr` / `.n5` segmentation volumes via marching cubes, with blockwise processing, chunk assembly, simplification, and optional on-the-fly downsampling
+- **To-Neuroglancer** — Convert single-scale meshes into neuroglancer multiresolution Draco-compressed meshes with automatic LOD decimation
+- **Skeletonize** — Extract skeletons from meshes using CGAL mean curvature flow, with pruning, simplification, and metrics
+- **Analyze** — Compute mesh metrics: volume, surface area, curvature, thickness, principal inertia, oriented bounds
 
 ## Installation
 
-Install directly from the GitHub repository using pip:
+### With pixi (recommended)
 
 ```bash
-pip install git+https://github.com/janelia-cellmap/multiresolution-mesh-creator.git
+git clone https://github.com/janelia-cellmap/mesh-n-bone.git
+cd mesh-n-bone
+pixi install
 ```
 
-You will now be able to run the code via the command line using `create-multiresolution-meshes`.
+### With pip
 
-## Execution
-This code assumes that you have either:
-1. A set of high resolution (lod 0) meshes in a single directory, from which you want to create downsampled, lower resolution (higher lod) meshes.
-2. Or that you already have meshes generated at all desired lod scales. If so, each set of meshes for a given lod should be in the same directory, named eg. s0, s1, s2 corresponding to lod 0, lod 1, lod 2 etc.
-
-To create the multiresolution mesh format required by neuroglancer, you can run `create-multiresolution-meshes`:
-```
-$: create-multiresolution-meshes --help
-usage: create-multiresolution-meshes [-h] [--num-workers NUM_WORKERS]
-                                     config_path
-
-Code to convert single-scale (or a set of multi-scale) meshes to the
-neuroglancer multi-resolution mesh format
-
-positional arguments:
-  config_path           Path to directory containing run-config.yaml and dask-
-                        config.yaml
-
-optional arguments:
-  -h, --help            show this help message and exit
-  --num-workers NUM_WORKERS, -n NUM_WORKERS
-                        Number of workers to launch (i.e. each worker is
-                        launched with a single bsub command)
+```bash
+pip install git+https://github.com/janelia-cellmap/mesh-n-bone.git
 ```
 
-`create-multiresolution-meshes` takes in two arguments: a path to a config directory, and the number of desired dask workers.
+### Building the CGAL skeletonizer (optional)
 
-Example config directories for multiresolution mesh creation of the `test_meshes` can be found in `local-config` and `lsf-config`; these show how you could set run locally or on eg. an LSF cluster. The config directory must contain a `run-config.yaml` file - used to configure the decimation and multiresolution creation, and a `dask-config.yaml` file - used to configure dask itself.
+The skeletonization module requires a compiled C++ binary. Build it with:
 
-An example `run-config.yaml` file is shown below:
+```bash
+pixi run -e build-cgal build-cgal
+```
+
+This uses a separate pixi environment with CGAL, Boost, and Eigen dependencies.
+
+## Usage
+
+All commands are available through the `mesh-n-bone` CLI:
+
+```
+mesh-n-bone <command> [options]
+```
+
+### Commands
+
+#### `meshify` — Generate meshes from segmentation volumes
+
+```bash
+mesh-n-bone meshify CONFIG_PATH -n NUM_WORKERS [--roi begin_z,begin_y,begin_x,end_z,end_y,end_x]
+```
+
+Reads a `.zarr` or `.n5` segmentation volume, runs marching cubes per chunk, assembles across chunk boundaries (with boundary deduplication), optionally simplifies and smooths, and writes output as PLY or neuroglancer format.
+
+Example meshify `run-config.yaml`:
+
+```yaml
+# ── Required ──
+input_path: /path/to/segmentation.zarr/s0   # Path to zarr/n5 segmentation dataset
+output_directory: /path/to/output            # Where to write output meshes
+num_workers: 10                              # Number of dask workers
+
+# ── Mesh generation ──
+downsample_factor: 2             # Downsample volume by this factor before meshing (default: none)
+downsample_method: mode          # Downsampling method: mode, mode_suppress_zero, or binary
+
+# ── Simplification & smoothing ──
+do_simplification: true          # Simplify meshes after assembly (default: true)
+target_reduction: 0.99           # Fraction of faces to remove (default: 0.99)
+n_smoothing_iter: 10             # Taubin smoothing iterations (default: 10)
+check_mesh_validity: false       # Require watertight meshes (default: true; disable for ROI)
+use_fixed_edge_simplification: true  # Preserve chunk boundary edges during simplification
+do_analysis: false               # Compute mesh metrics CSV (default: true)
+
+# ── Multiresolution output ──
+do_multires: true                # Also generate neuroglancer multilod_draco output
+num_lods: 3                      # Number of levels of detail
+multires_strategy: decimate      # LOD strategy: decimate or downsample
+decimation_factor: 4             # Face reduction factor per LOD (default: 4)
+delete_decimated_meshes: true    # Remove intermediate LOD mesh files
+
+# ── Coordinate system ──
+voxel_size_nm: [1000, 1000, 1000]  # Voxel size in nm (ZYX); use when dataset units
+                                    # are not nm (e.g. 1 um = 1000 nm). Only affects
+                                    # mesh vertex scaling, not ROI coordinates.
+
+# ── Region of interest (optional) ──
+roi:                             # Restrict processing to this subregion
+  begin: [100, 200, 300]         # Start coordinates in dataset world units (ZYX)
+  end: [500, 600, 700]           # End coordinates in dataset world units (ZYX)
+                                 # Boundary edges are preserved during simplification.
+                                 # Can also be passed via CLI: --roi z0,y0,x0,z1,y1,x1
+```
+
+#### `to-neuroglancer` — Convert existing meshes to neuroglancer multiresolution format
+
+```bash
+mesh-n-bone to-neuroglancer CONFIG_PATH -n NUM_WORKERS [--roi begin_x,begin_y,begin_z,end_x,end_y,end_z]
+```
+
+Takes existing meshes (e.g. PLY files), decimates them at multiple LODs using pyfqmr, decomposes into spatial fragments, Draco-compresses, and writes the neuroglancer `multilod_draco` format. Use this when you already have single-scale meshes and just need the neuroglancer format.
+
+Config directory must contain `run-config.yaml` and `dask-config.yaml`. Example `run-config.yaml`:
+
 ```yaml
 required_settings:
-        input_path: ../test_meshes           # Path to lod 0 meshes or multiscale meshes
-        output_path: ../test_meshes_output   # Path to write out multires meshes
-        num_lods: 6                          # Number of levels of detail
-
+  input_path: /path/to/meshes       # Directory containing LOD 0 mesh files (e.g. PLY)
+  output_path: /path/to/output      # Where to write neuroglancer output
+  num_lods: 6                       # Number of levels of detail to generate
 
 optional_decimation_settings:
-        box_size: 4                    # lod 0 box size in nm; default is determined based on a guesstimate of a good number of faces per lod 0 chunk
-        skip_decimation: False         # Skip mesh decimation if meshes exist; default is false
-        decimation_factor: 4           # Factor by which to decimate faces at each lod, ie factor**lod; default is 2
-        aggressiveness: 10             # Aggressiveness to be used for decimation; default is 7
-        delete_decimated_meshes: True  # Delete decimated meshes, only applied if skip_decimation=False
-```
-To see all possible setups for `dask-config.yaml`, see [here](https://github.com/dask/dask-jobqueue/blob/main/dask_jobqueue/jobqueue.yaml), where you would comment out all but the type of cluster you plan to run on.
+  box_size: 4                       # LOD 0 fragment size in world units (scalar or [x, y, z])
+  skip_decimation: false            # Set true to reuse previously decimated meshes
+  decimation_factor: 4              # Face reduction factor per LOD (default: 2)
+  aggressiveness: 10                # pyfqmr decimation aggressiveness (default: 7)
+  delete_decimated_meshes: true     # Remove intermediate LOD mesh files when done
+  roi:                              # Only process meshes intersecting this region (XYZ)
+    begin: [0, 0, 0]
+    end: [1000, 1000, 1000]
 
-If you already have meshes at all the desired scales in the corresponding `s0`, `s1`,... directories in `input_path` - either because you already ran `create-multiresolution-meshes` or because you already created the meshes elsewhere, then you can set `skip_decimation: True`.
-
-If you only have meshes for lod 0, then you must run mesh decimation. Mesh decimation is performed using the lod 0 meshes, reducing the number of faces by a factor of `decimation_factor**lod`. In the example configs, the decimation factor is 4, so the decimation at each lod is `4**lod`.
-
-NOTE: The actual decimation amount is not guaranteed by the decimation factor, but is instead dependent on other mesh decimation settings as well, such as `aggressiveness`. A lower aggressiveness is more conservative, but means that decimation might not hit its target number of faces. Empirically, `aggressiveness: 10` tends to reach the desired decimation levels, but the default is set to the more conservative value of 7.
-
-## Example
-Two meshes are provided in `test_meshes` as an example (a bunny (`1.ply`) and a teapot (`2.ply`)). These are provided at a single, lod 0 scale. To turn these single resolution meshes into neuroglancer formatted multiresolution meshes using 10 local dask workers, you would run the following
-
-```
-create-multiresolution-meshes /path/to/local-config -n 10
+optional_properties_settings:
+  segment_properties_csv: /path/to/properties.csv  # CSV with per-segment metadata
+  segment_properties_columns: [col1, col2]         # Which columns to include (default: all)
+  segment_properties_id_column: "Object ID"        # CSV column with segment IDs
 ```
 
-A directory called `/path/to/local-config-{date-time}` will be created which contains dask output as well as an `output.log` file which updates as the run progresses and provides information as to where dask can be monitored. Thus every time you submit a run, a new directory will be created with the date and time appended, within which you can monitor progress. Here are the contents of `output.log`:
-```
-INFO:2021/11/08 12:16:31: Setup working directory as /path/to/local-config-20211108.121631.
-INFO:2021/11/08 12:16:35: Starting dask cluster for decimation...
-INFO:2021/11/08 12:16:35: Starting dask cluster for decimation completed in 0.10236787796020508!
-INFO:2021/11/08 12:16:35: Check http://127.0.0.1:8787/status for decimation status.
-INFO:2021/11/08 12:16:35: Generating decimated meshes...
-INFO:2021/11/08 12:16:36: Generating decimated meshes completed in 0.7968666553497314!
-INFO:2021/11/08 12:16:40: Starting dask cluster for multires creation...
-INFO:2021/11/08 12:16:40: Starting dask cluster for multires creation completed in 0.014244318008422852!
-INFO:2021/11/08 12:16:40: Check http://127.0.0.1:8787/status for multires creation status.
-INFO:2021/11/08 12:16:40: Generating multires meshes...
-INFO:2021/11/08 12:16:43: Completed creation of multiresolution neuroglancer mesh for mesh 2!
-INFO:2021/11/08 12:16:45: Completed creation of multiresolution neuroglancer mesh for mesh 1!
-INFO:2021/11/08 12:16:45: Generating multires meshes completed in 4.497605323791504!
-INFO:2021/11/08 12:16:45: Writing info and segment properties files...
-INFO:2021/11/08 12:16:45: Writing info and segment properties files completed in 0.010875463485717773!
-INFO:2021/11/08 12:16:45: Deleting decimated meshes...
-INFO:2021/11/08 12:16:45: Deleting decimated meshes completed in 0.12245559692382812!
-INFO:2021/11/08 12:16:45: Complete! Elapsed time: 13.888124704360962
+`box_size` can be a scalar (applied to all axes) or a 3-element list for per-axis control, which prevents degenerate triangles on elongated meshes.
+
+#### `skeletonize` — Skeletonize meshes using CGAL
+
+```bash
+mesh-n-bone skeletonize CONFIG_PATH -n NUM_WORKERS
 ```
 
-The multiresolution meshes will be in `test_mehes_output/multires/`. You can use something like [http-server](https://www.npmjs.com/package/http-server) to serve up that directory for viewing in neuroglancer. See the gif at the start of this page to see the results of running the above command.
+Runs CGAL mean curvature flow skeletonization on all meshes in a directory. Produces skeleton files, metrics (longest shortest path, radius statistics, branch counts), and neuroglancer skeleton format output.
 
-To run this on eg. an LSF cluster with 40 workers, you would do something like this:
+#### `skeletonize-single` — Skeletonize a single mesh
+
+```bash
+mesh-n-bone skeletonize-single INPUT_FILE OUTPUT_FILE [--subdivisions N] [--neuroglancer]
 ```
-bsub -n 2 -P your_project_name create-multiresolution-meshes lsf-config -n 40
+
+#### `analyze` — Analyze mesh geometry
+
+```bash
+mesh-n-bone analyze CONFIG_PATH -n NUM_WORKERS
 ```
 
-Where the bsub command is used to set up your job to run on the cluster, with eg. 2 cores for the dask driver. `create-multiresolution-meshes` then sets up the dask cluster on the LSF cluster using those drivers.
+Computes per-mesh metrics using trimesh and pymeshlab: volume, surface area, curvature (mean, Gaussian, RMS, absolute), thickness (shape diameter function), principal inertia components, and oriented bounding box dimensions. Outputs a CSV.
 
-To run on new meshes, just change the `run-config.yaml` file as desired, and to change dask settings, change `dask-config.yaml` as desired.
+### Dask configuration
 
+All pipeline commands use Dask for parallelism. The config directory must contain a `dask-config.yaml` specifying the cluster type. Supported: `local`, `lsf`, `slurm`, `sge`.
 
+When running with `-n 1`, no cluster is created and no config file is needed — work runs synchronously in the calling process.
+
+See [dask-jobqueue configuration](https://github.com/dask/dask-jobqueue/blob/main/dask_jobqueue/jobqueue.yaml) for all cluster options.
+
+## Testing
+
+```bash
+pixi run -e test test
+```
+
+The test suite includes unit tests and integration tests covering:
+
+- Full meshify pipeline from zarr volumes (cross-chunk assembly, watertightness, volume accuracy)
+- Multiresolution decomposition and Draco compression
+- Mesh decimation across multiple LODs
+- Downsampling methods (mode, mode-suppress-zero, binary mode)
+- Mesh analysis metrics (volume, area, curvature, thickness)
+- Skeleton processing (pruning, simplification, longest shortest path)
+- Watertightness preservation after simplification and repair
+- Fixed-edge boundary-preserving simplification
+- Neuroglancer format output (ngmesh, multilod_draco, annotations)
+
+## Project structure
+
+```
+src/mesh_n_bone/
+  cli.py                    # Unified CLI
+  config.py                 # YAML config parsing
+  meshify/                  # Volume → mesh generation
+    meshify.py              # Main pipeline (zmesh, chunk assembly)
+    downsample.py           # Numba JIT blockwise downsampling
+    fixed_edge.py           # Boundary-preserving simplification
+  multires/                 # Multiresolution mesh creation
+    multires.py             # Pipeline orchestrator
+    decomposition.py        # Spatial fragment decomposition + Draco
+    decimation.py           # pyfqmr LOD decimation
+  skeletonize/              # Mesh skeletonization
+    skeletonize.py          # CGAL skeletonization pipeline
+    skeleton.py             # Skeleton data structure + operations
+  analyze/                  # Mesh analysis
+    analyze.py              # Volume, curvature, thickness metrics
+  util/                     # Shared utilities
+    dask_util.py            # Dask cluster management
+    mesh_io.py              # Mesh I/O, fragments, z-order
+    neuroglancer.py         # Neuroglancer format writers
+    logging.py              # Timing, logging, stream capture
+cgal_skeletonize_mesh/      # C++ CGAL skeletonizer source + binary
+tests/                      # Unit and integration tests
+```

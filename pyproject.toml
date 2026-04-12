@@ -1,34 +1,70 @@
 [project]
-name = "multiresolution-mesh-creator"
+name = "mesh-n-bone"
 version = "0.1.0"
-description = "Create neuroglancer-compatible multiresolution meshes from high-resolution 3D meshes."
+description = "Unified tool for mesh generation, multiresolution mesh creation, skeletonization, and analysis."
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [
   { name = "David Ackerman", email = "ackermand@janelia.hhmi.org" },
 ]
 license-files = ["LICENSE"]
+
 dependencies = [
-  "dracopy>=1.5.0,<2",
-  "trimesh>=4.6.8,<5",
-  "dask>=2025.4.1,<2026",
-  "distributed>=2025.4.1,<2026",
-  "dask-jobqueue>=0.9.0",
-  "pyfqmr>=0.3.0,<0.4",
-  "bokeh>=3.1.0"
+  # Core
+  "numpy",
+  "trimesh>=4.6.8",
+  "dask[distributed]==2025.5.1",
+  "dask-jobqueue==0.9.0",
+  "bokeh>=3.1.0",
+  "pyyaml",
+  "pandas",
+
+  # Mesh processing
+  "dracopy>=1.5.0",
+  "pyfqmr>=0.3.0",
+  "pymeshlab",
+
+  # Mesh generation (zmesh, cloud-volume)
+  "cloud-volume",
+  "zmesh",
+
+  # Volumetric data
+  "funlib.geometry",
+  "tensorstore",
+  "zarr>=3.0.8",
+  "numba",
+
+  # Skeletonization
+  "neuroglancer",
+  "fastremap",
+  "pybind11-rdp",
+  "networkx",
+
+  # Analysis
+  "scipy",
+  "pyarrow",
+
+  # Geometry
+  "shapely",
+]
+
+[project.optional-dependencies]
+docs = [
+  "mkdocs-material",
+  "mkdocstrings[python]",
 ]
 
 [project.urls]
-Homepage = "https://example.com"
-Repository = "https://github.com/yourusername/yourrepo"
+Repository = "https://github.com/janelia-cellmap/mesh-n-bone"
+Documentation = "https://janelia-cellmap.github.io/mesh-n-bone/"
 
 [build-system]
 requires = ["setuptools>=42", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project.scripts]
-create-multiresolution-meshes = "multiresolution_mesh_creator.src.create_multiresolution_meshes:main"
+mesh-n-bone = "mesh_n_bone.cli:main"
 
 [tool.setuptools.packages.find]
-where   = ["."]
-include = ["multiresolution_mesh_creator*"]
+where = ["src"]
+include = ["mesh_n_bone*"]
