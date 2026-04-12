@@ -20,7 +20,7 @@ pixi run python examples/create_example_volume.py
 pixi run mesh-n-bone meshify examples/meshify-config -n 1
 
 # View volume and meshes in neuroglancer
-pixi run mesh-n-bone serve examples --zarr data/example.zarr/seg/s0 --meshes output/multires
+pixi run mesh-n-bone serve examples --zarr data/example.zarr/seg --meshes output/multires
 ```
 
 See [examples/](examples/) for the full walkthrough.
