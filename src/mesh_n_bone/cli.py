@@ -174,6 +174,19 @@ def cmd_skeletonize_single(args):
     )
 
 
+def cmd_serve(args):
+    """Start a local HTTP server with CORS for viewing data in neuroglancer.
+
+    Parameters
+    ----------
+    args : argparse.Namespace
+        CLI arguments including ``path``, ``port``, ``zarr``, and ``meshes``.
+    """
+    from mesh_n_bone.serve import serve
+
+    serve(args.path, port=args.port, zarr_path=args.zarr, meshes_path=args.meshes)
+
+
 def cmd_analyze(args):
     """Run the mesh analysis pipeline.
 
@@ -281,6 +294,28 @@ def main():
         "-n", "--num-workers", type=int, default=10, help="Number of dask workers"
     )
     p_analyze.set_defaults(func=cmd_analyze)
+
+    # serve
+    p_serve = subparsers.add_parser(
+        "serve", help="Serve data locally for neuroglancer viewing"
+    )
+    p_serve.add_argument("path", help="Root directory to serve")
+    p_serve.add_argument(
+        "--port", type=int, default=9015, help="HTTP server port (default: 9015)"
+    )
+    p_serve.add_argument(
+        "--zarr",
+        type=str,
+        default=None,
+        help="Relative path to zarr/n5 dataset within the served directory",
+    )
+    p_serve.add_argument(
+        "--meshes",
+        type=str,
+        default=None,
+        help="Relative path to precomputed meshes within the served directory",
+    )
+    p_serve.set_defaults(func=cmd_serve)
 
     args = parser.parse_args()
     if not args.command:

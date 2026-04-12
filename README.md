@@ -6,6 +6,25 @@ Produces meshes in the [neuroglancer precomputed format](https://github.com/goog
 
 ![Demo](recording/recording.gif)
 
+## Quick start
+
+```bash
+git clone https://github.com/janelia-cellmap/mesh-n-bone.git
+cd mesh-n-bone
+pixi install
+
+# Create a small example zarr volume
+pixi run python examples/create_example_volume.py
+
+# Generate meshes and multiresolution output
+pixi run mesh-n-bone meshify examples/meshify-config -n 1
+
+# View volume and meshes in neuroglancer
+pixi run mesh-n-bone serve examples --zarr data/example.zarr/seg/s0 --meshes output/multires
+```
+
+See [examples/](examples/) for the full walkthrough.
+
 ## Features
 
 - **Meshify** — Generate meshes from `.zarr` / `.n5` segmentation volumes via marching cubes, with blockwise processing, chunk assembly, simplification, and optional on-the-fly downsampling
@@ -152,6 +171,14 @@ mesh-n-bone analyze CONFIG_PATH -n NUM_WORKERS
 ```
 
 Computes per-mesh metrics using trimesh and pymeshlab: volume, surface area, curvature (mean, Gaussian, RMS, absolute), thickness (shape diameter function), principal inertia components, and oriented bounding box dimensions. Outputs a CSV.
+
+#### `serve` — Serve data for neuroglancer viewing
+
+```bash
+mesh-n-bone serve PATH [--zarr ZARR_PATH] [--meshes MESHES_PATH] [--port PORT]
+```
+
+Starts a local HTTP server with CORS headers and prints a neuroglancer URL. Use `--zarr` and `--meshes` to specify relative paths within `PATH` to a zarr/n5 volume and precomputed meshes, respectively. Default port is 9015.
 
 ### Dask configuration
 

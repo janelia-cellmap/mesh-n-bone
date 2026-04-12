@@ -31,3 +31,5 @@ tmp/
 emptymesh/
 fetchMeshes.py
 tests/test.py
+examples/data/
+examples/output/

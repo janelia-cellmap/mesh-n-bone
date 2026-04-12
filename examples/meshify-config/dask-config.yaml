@@ -1,0 +1,24 @@
+jobqueue:
+  local:
+    ncpus: 1
+    processes: 1
+    cores: 1
+    log-directory: job-logs
+    name: dask-worker
+
+distributed:
+  scheduler:
+    work-stealing: true
+
+  worker:
+    memory:
+      target: 0.0
+      spill: 0.0
+      pause: 0.0
+      terminate: 0.0
+
+  admin:
+    log-format: '[%(asctime)s] %(levelname)s %(message)s'
+    tick:
+      interval: 20ms
+      limit: 3h
