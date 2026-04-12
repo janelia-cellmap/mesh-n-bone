@@ -3,9 +3,85 @@
 import numpy as np
 import os
 import pytest
+import trimesh
 
 from mesh_n_bone.skeletonize.skeleton import CustomSkeleton
 from mesh_n_bone.skeletonize.skeletonize import Skeletonize
+
+
+# Path to the compiled CGAL skeletonizer binary
+_CGAL_BINARY = os.path.join(
+    os.path.dirname(__file__), os.pardir,
+    "cgal_skeletonize_mesh", "skeletonize_mesh",
+)
+_HAS_CGAL = os.path.isfile(_CGAL_BINARY) and os.access(_CGAL_BINARY, os.X_OK)
+
+
+class TestCGALSkeletonization:
+    """End-to-end tests that run the compiled CGAL skeletonizer binary."""
+
+    @pytest.mark.skipif(not _HAS_CGAL, reason="CGAL binary not built")
+    def test_sphere_produces_skeleton(self, tmp_output_dir):
+        """Skeletonizing a sphere should produce a skeleton with vertices."""
+        mesh = trimesh.creation.icosphere(subdivisions=3, radius=50.0)
+        mesh.vertices += 100
+        ply_path = os.path.join(tmp_output_dir, "sphere.ply")
+        skel_path = os.path.join(tmp_output_dir, "sphere_skel.txt")
+        mesh.export(ply_path)
+
+        Skeletonize.cgal_skeletonize_mesh(
+            ply_path, skel_path, base_loop_subdivision_iterations=0,
+        )
+
+        assert os.path.exists(skel_path)
+        skel = Skeletonize.read_skeleton_from_custom_file(skel_path)
+        assert len(skel.vertices) > 0
+        assert len(skel.edges) > 0
+
+    @pytest.mark.skipif(not _HAS_CGAL, reason="CGAL binary not built")
+    def test_tube_skeleton_is_linear(self, tmp_output_dir):
+        """Skeletonizing a tube should produce a roughly linear skeleton."""
+        mesh = trimesh.creation.cylinder(radius=5.0, height=100.0, sections=16)
+        mesh.vertices += [50, 50, 50]
+        ply_path = os.path.join(tmp_output_dir, "tube.ply")
+        skel_path = os.path.join(tmp_output_dir, "tube_skel.txt")
+        mesh.export(ply_path)
+
+        Skeletonize.cgal_skeletonize_mesh(
+            ply_path, skel_path, base_loop_subdivision_iterations=0,
+        )
+
+        skel = Skeletonize.read_skeleton_from_custom_file(skel_path)
+        assert len(skel.vertices) >= 2
+        # The skeleton should span roughly the tube's height
+        verts = np.array(skel.vertices)
+        extent = verts.max(axis=0) - verts.min(axis=0)
+        assert extent.max() > 50  # at least half the tube height
+
+    @pytest.mark.skipif(not _HAS_CGAL, reason="CGAL binary not built")
+    def test_full_pipeline_with_cgal(self, tmp_output_dir):
+        """Full pipeline: CGAL skeletonize → prune → simplify → metrics."""
+        mesh = trimesh.creation.cylinder(radius=5.0, height=80.0, sections=16)
+        mesh.vertices += 100
+        ply_path = os.path.join(tmp_output_dir, "pipe.ply")
+        skel_path = os.path.join(tmp_output_dir, "pipe_skel.txt")
+        mesh.export(ply_path)
+
+        Skeletonize.cgal_skeletonize_mesh(
+            ply_path, skel_path, base_loop_subdivision_iterations=0,
+        )
+
+        output_dir = os.path.join(tmp_output_dir, "pipe_output")
+        metrics = Skeletonize.process_custom_skeleton(
+            skeleton_path=skel_path,
+            output_directory=output_dir,
+            min_branch_length_nm=5.0,
+            simplification_tolerance_nm=1.0,
+        )
+
+        assert metrics["lsp (nm)"] > 30
+        assert metrics["radius mean (nm)"] > 0
+        assert metrics["num branches"] >= 1
 
 
 class TestSkeletonProcessingPipeline:

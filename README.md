@@ -18,15 +18,15 @@ Produces meshes in the [neuroglancer precomputed format](https://github.com/goog
 ### With pixi (recommended)
 
 ```bash
-git clone https://github.com/janelia-cellmap/multiresolution-mesh-creator.git
-cd multiresolution-mesh-creator
+git clone https://github.com/janelia-cellmap/mesh-n-bone.git
+cd mesh-n-bone
 pixi install
 ```
 
 ### With pip
 
 ```bash
-pip install git+https://github.com/janelia-cellmap/multiresolution-mesh-creator.git
+pip install git+https://github.com/janelia-cellmap/mesh-n-bone.git
 ```
 
 ### Building the CGAL skeletonizer (optional)

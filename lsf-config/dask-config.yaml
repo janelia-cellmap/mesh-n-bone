@@ -17,7 +17,7 @@ jobqueue:
     mem: 720000000000
     use-stdin: true
     log-directory: job-logs
-    name: multiresolution-mesh-creator
+    name: mesh-n-bone
 
     project: your_project_name
 
