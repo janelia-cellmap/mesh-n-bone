@@ -52,7 +52,7 @@ def open_ds_tensorstore(dataset_path, mode="r"):
         "driver": filetype,
         "kvstore": {
             "driver": "file",
-            "path": dataset_path,
+            "path": os.path.abspath(dataset_path),
         },
     }
     if mode == "r":

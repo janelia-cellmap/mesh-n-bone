@@ -26,8 +26,10 @@ lsf-config_*
 local-config-*
 local-config_*
 .pixi/
-pixi.lock
+# pixi.lock — tracked for reproducible CI
 tmp/
 emptymesh/
 fetchMeshes.py
 tests/test.py
+examples/data/
+examples/output/
