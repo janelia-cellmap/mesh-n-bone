@@ -1,4 +1,4 @@
-"""Lightweight wrapper around a zarr.Array with physical coordinate metadata.
+"""Lightweight wrapper around array metadata with physical coordinate support.
 
 Replaces funlib.persistence.Array for read-only use cases.
 """
@@ -8,24 +8,27 @@ from funlib.geometry import Coordinate, Roi
 
 
 class CellMapArray:
-    """Wrapper around a zarr.Array providing ROI-based indexing.
+    """Wrapper providing ROI-based indexing over array metadata.
 
     Converts between physical coordinates and voxel indices,
     replacing funlib.persistence.Array for read-only workflows.
     """
 
-    def __init__(self, data, voxel_size, offset):
+    def __init__(self, data, voxel_size, offset, dataset_path=None):
         """
         Parameters
         ----------
-        data : zarr.Array
-            Underlying zarr array.
+        data : ArrayMetadata
+            Metadata container with shape, dtype, chunks, and attrs.
         voxel_size : Coordinate or tuple
             Voxel dimensions in physical units.
         offset : Coordinate or tuple
             Array origin in physical units.
+        dataset_path : str or None
+            Filesystem path to the dataset (used for parent attr lookup).
         """
         self.data = data
+        self._dataset_path = dataset_path
         self.voxel_size = (
             voxel_size if isinstance(voxel_size, Coordinate) else Coordinate(voxel_size)
         )
@@ -45,23 +48,3 @@ class CellMapArray:
     @property
     def shape(self):
         return self.data.shape
-
-    def _to_slices(self, roi):
-        """Convert a physical ROI to voxel slices."""
-        voxel_roi = (roi - self.roi.offset) / self.voxel_size
-        return voxel_roi.to_slices()
-
-    def to_ndarray(self, roi, fill_value=0):
-        """Read data for a physical ROI, padding with fill_value if needed."""
-        shape = roi.shape / self.voxel_size
-        data = np.zeros(shape, dtype=self.dtype)
-        if fill_value != 0:
-            data[:] = fill_value
-
-        shared_roi = self.roi.intersect(roi)
-        if not shared_roi.empty:
-            target_slices = ((shared_roi - roi.offset) / self.voxel_size).to_slices()
-            source_slices = self._to_slices(shared_roi)
-            data[target_slices] = self.data[source_slices]
-
-        return data

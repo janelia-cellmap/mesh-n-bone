@@ -1,14 +1,79 @@
-"""Zarr dataset opening utilities, replacing funlib.persistence.open_ds."""
+"""Dataset opening utilities using direct JSON metadata reading and TensorStore."""
 
+import json
 import logging
 import os
 
-import zarr
 from funlib.geometry import Coordinate
 
 from mesh_n_bone.util.cellmap_array import CellMapArray
 
 logger = logging.getLogger(__name__)
+
+
+class ArrayMetadata:
+    """Metadata container replacing zarr.Array for CellMapArray.
+
+    Provides the same interface as zarr.Array for the properties
+    that CellMapArray accesses: ``shape``, ``dtype``, ``chunks``,
+    and ``attrs``.
+    """
+
+    def __init__(self, shape, dtype, chunks, attrs):
+        self.shape = shape
+        self.dtype = dtype
+        self.chunks = chunks
+        self.attrs = attrs
+
+
+def _read_json_file(path):
+    """Read a JSON file from a local path.
+
+    Parameters
+    ----------
+    path : str
+        Path to the JSON file.
+
+    Returns
+    -------
+    dict or None
+        Parsed JSON, or ``None`` if the file does not exist or is
+        not valid JSON.
+    """
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return None
+
+
+def _is_n5(path):
+    """Return True if *path* refers to an N5 container."""
+    return path.rfind(".n5") > path.rfind(".zarr")
+
+
+def _read_attrs(dataset_path):
+    """Read custom attributes from the metadata file at *dataset_path*.
+
+    Supports N5 (``attributes.json``), zarr v3 (``zarr.json``),
+    and zarr v2 (``.zattrs``).
+
+    Parameters
+    ----------
+    dataset_path : str
+        Path to the dataset directory.
+
+    Returns
+    -------
+    dict
+        Parsed attributes (may be empty).
+    """
+    if _is_n5(dataset_path):
+        return _read_json_file(os.path.join(dataset_path, "attributes.json")) or {}
+    zarr_json = _read_json_file(os.path.join(dataset_path, "zarr.json"))
+    if zarr_json is not None:
+        return zarr_json.get("attributes", {})
+    return _read_json_file(os.path.join(dataset_path, ".zattrs")) or {}
 
 
 def split_dataset_path(dataset_path):
@@ -37,7 +102,8 @@ def split_dataset_path(dataset_path):
 def open_dataset(filename, ds_name, mode="r"):
     """Open a zarr/n5 dataset and return a CellMapArray.
 
-    Supports zarr v2, v3, and N5 formats.
+    Uses direct JSON file reading for metadata and TensorStore
+    for array shape, dtype, and chunk layout.
 
     Parameters
     ----------
@@ -53,34 +119,44 @@ def open_dataset(filename, ds_name, mode="r"):
     CellMapArray
         Array wrapper with physical coordinate metadata.
     """
+    from mesh_n_bone.util.image_data_interface import open_ds_tensorstore
+
     logger.debug("opening dataset %s in %s", ds_name, filename)
     full_path = os.path.join(filename, ds_name) if ds_name else filename
+
+    attrs = _read_attrs(full_path)
+
     try:
-        ds = zarr.open_array(full_path, mode=mode)
+        ts_ds = open_ds_tensorstore(full_path, mode=mode)
     except Exception as e:
         logger.error("failed to open %s/%s: %s", filename, ds_name, e)
         raise
 
-    voxel_size, offset = _read_voxel_size_offset(ds)
-    return CellMapArray(ds, voxel_size, offset)
+    shape = tuple(ts_ds.shape)
+    dtype = ts_ds.dtype.numpy_dtype
+    chunks = tuple(ts_ds.chunk_layout.read_chunk.shape)
+
+    data = ArrayMetadata(shape, dtype, chunks, attrs)
+    voxel_size, offset = _read_voxel_size_offset(data)
+    return CellMapArray(data, voxel_size, offset, dataset_path=full_path)
 
 
-def _read_voxel_size_offset(ds):
-    """Read voxel_size and offset from a zarr array's attributes.
+def _read_voxel_size_offset(data):
+    """Read voxel_size and offset from array attributes.
 
     Checks funlib-style, N5, and OME-Zarr metadata formats.
 
     Parameters
     ----------
-    ds : zarr.Array
-        Opened zarr array.
+    data : ArrayMetadata
+        Metadata container with ``.attrs`` dict.
 
     Returns
     -------
     tuple[Coordinate, Coordinate]
         ``(voxel_size, offset)``
     """
-    attrs = dict(ds.attrs)
+    attrs = data.attrs
 
     if "resolution" in attrs:
         voxel_size = Coordinate(int(v) for v in attrs["resolution"])
@@ -91,7 +167,7 @@ def _read_voxel_size_offset(ds):
             int(v) for v in attrs["pixelResolution"]["dimensions"]
         )
     else:
-        voxel_size = Coordinate(1 for _ in ds.shape)
+        voxel_size = Coordinate(1 for _ in data.shape)
 
     if "offset" in attrs:
         offset = Coordinate(int(v) for v in attrs["offset"])
@@ -102,14 +178,14 @@ def _read_voxel_size_offset(ds):
 
 
 def read_raw_voxel_size(ds):
-    """Read the original float voxel_size from zarr attributes.
+    """Read the original float voxel_size from dataset attributes.
 
-    Unlike `_read_voxel_size_offset`, preserves float precision
+    Unlike ``_read_voxel_size_offset``, preserves float precision
     (funlib.geometry.Coordinate truncates to int).
 
     Parameters
     ----------
-    ds : CellMapArray or object with ``.data.attrs``
+    ds : CellMapArray
         Dataset wrapper.
 
     Returns
@@ -117,7 +193,7 @@ def read_raw_voxel_size(ds):
     tuple[float, ...]
         True voxel size as floats.
     """
-    attrs = dict(ds.data.attrs)
+    attrs = ds.data.attrs
 
     if "voxel_size" in attrs:
         return tuple(float(v) for v in attrs["voxel_size"])
@@ -146,28 +222,27 @@ def _extract_ome_scale(attrs):
 
 
 def _read_parent_attrs(ds):
-    """Try to read attributes from the parent zarr group."""
-    try:
-        store = ds.data.store
-        store_root = getattr(store, "root", None)
-        if store_root:
-            store_root = str(store_root)
-            if store_root.startswith("file://"):
-                store_root = store_root[len("file://"):]
+    """Read attributes from the parent directory of a dataset.
 
-        array_name = getattr(ds.data, "name", None) or getattr(ds.data, "path", "")
-        array_name = array_name.strip("/")
+    Parameters
+    ----------
+    ds : CellMapArray
+        Dataset wrapper. Uses the stored ``_dataset_path`` if
+        available, otherwise falls back to filesystem path
+        navigation.
 
-        if array_name and store_root:
-            parent_path = "/".join(array_name.split("/")[:-1])
-            if parent_path:
-                parent = zarr.open_group(store, mode="r", path=parent_path)
-                return dict(parent.attrs)
-        elif store_root:
-            parent_dir = os.path.dirname(store_root)
-            if os.path.isdir(parent_dir):
-                parent = zarr.open_group(parent_dir, mode="r")
-                return dict(parent.attrs)
-    except Exception:
-        pass
+    Returns
+    -------
+    dict or None
+        Parent directory attributes, or ``None`` if unavailable.
+    """
+    dataset_path = getattr(ds, "_dataset_path", None)
+    if dataset_path is None:
+        return None
+
+    parent = os.path.dirname(dataset_path)
+    if parent and parent != dataset_path:
+        attrs = _read_attrs(parent)
+        if attrs:
+            return attrs
     return None
