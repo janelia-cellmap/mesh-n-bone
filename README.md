@@ -188,6 +188,64 @@ When running with `-n 1`, no cluster is created and no config file is needed —
 
 See [dask-jobqueue configuration](https://github.com/dask/dask-jobqueue/blob/main/dask_jobqueue/jobqueue.yaml) for all cluster options.
 
+### Running on an HPC cluster
+
+#### LSF (bsub)
+
+To run on an LSF cluster, submit the driver process via `bsub`. The driver launches Dask workers as separate LSF jobs:
+
+```bash
+bsub -n 2 -P your_project_name mesh-n-bone meshify lsf-config -n 40
+```
+
+This submits a 2-slot driver job that creates a 40-worker Dask cluster. Each worker is launched as its own LSF job using the settings in `lsf-config/dask-config.yaml`.
+
+With pixi:
+
+```bash
+bsub -n 2 -P your_project_name pixi run mesh-n-bone meshify lsf-config -n 40
+```
+
+An example LSF dask config is provided in [`lsf-config/dask-config.yaml`](lsf-config/dask-config.yaml):
+
+```yaml
+jobqueue:
+  lsf:
+    ncpus: 48
+    processes: 40
+    cores: 40
+    memory: 720GB
+    walltime: 01:00
+    mem: 720000000000
+    use-stdin: true
+    log-directory: job-logs
+    name: mesh-n-bone
+    project: your_project_name
+```
+
+Update `project` to your LSF project/queue allocation and adjust `ncpus`, `memory`, and `walltime` for your cluster.
+
+#### SLURM / SGE
+
+The same pattern applies — submit the driver via your scheduler and set the cluster type in `dask-config.yaml`:
+
+```yaml
+# SLURM
+jobqueue:
+  slurm:
+    cores: 40
+    memory: 720GB
+    walltime: "01:00:00"
+    # ... other SLURM-specific options
+
+# SGE
+jobqueue:
+  sge:
+    cores: 40
+    memory: 720GB
+    # ... other SGE-specific options
+```
+
 ## Testing
 
 ```bash
