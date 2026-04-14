@@ -44,7 +44,6 @@ dependencies = [
   # Volumetric data
   "funlib.geometry",
   "tensorstore",
-  "zarr>=3.0.8",
   "numba",
 
   # Skeletonization
@@ -68,6 +67,7 @@ docs = [
 ]
 test = [
   "pytest",
+  "zarr>=3.0.8",
 ]
 
 [project.urls]

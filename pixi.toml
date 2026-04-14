@@ -33,11 +33,13 @@ zmesh = "*"
 funlib-geometry = "*"
 tensorstore = "*"
 Pillow = "*"
-zarr = ">=3.0.8"
 neuroglancer = "*"
 fastremap = "*"
 pybind11-rdp = "*"
 shapely = "*"
+
+[feature.test.pypi-dependencies]
+zarr = ">=3.0.8"
 
 [feature.test.dependencies]
 pytest = "*"

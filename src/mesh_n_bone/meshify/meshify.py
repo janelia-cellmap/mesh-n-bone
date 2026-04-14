@@ -12,11 +12,9 @@ import shutil
 import trimesh
 import json
 import pymeshlab
-import zarr
-
 from mesh_n_bone.util import dask_util
 from mesh_n_bone.util.logging import Timing_Messager
-from mesh_n_bone.util.zarr_io import open_dataset, split_dataset_path, read_raw_voxel_size
+from mesh_n_bone.util.zarr_io import open_dataset, split_dataset_path, read_raw_voxel_size, _read_attrs
 from mesh_n_bone.util.image_data_interface import open_ds_tensorstore, to_ndarray_tensorstore
 from mesh_n_bone.meshify.downsample import (
     downsample_labels_3d_suppress_zero,
@@ -45,7 +43,7 @@ def _read_ome_ngff_transform(input_path):
     (voxel_size, offset, coordinate_units) in ZYX order,
     or (None, None, None) if not found.
     """
-    # Find the zarr root and dataset path within it
+    # Find the zarr/n5 root and dataset path within it
     for ext in [".zarr", ".n5"]:
         if ext in input_path:
             parts = input_path.split(ext + "/")
@@ -61,13 +59,14 @@ def _read_ome_ngff_transform(input_path):
     parent_path = os.path.dirname(dataset_path)
 
     try:
-        root = zarr.open(zarr_root_path, mode="r")
+        # Read parent group attributes directly from JSON metadata files
         if parent_path:
-            parent_group = root[parent_path]
+            parent_dir = os.path.join(zarr_root_path, parent_path)
         else:
-            parent_group = root
+            parent_dir = zarr_root_path
 
-        multiscales = parent_group.attrs.get("multiscales")
+        parent_attrs = _read_attrs(parent_dir)
+        multiscales = parent_attrs.get("multiscales")
         if not multiscales:
             return None, None, None
 
