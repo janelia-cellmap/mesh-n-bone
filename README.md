@@ -110,6 +110,11 @@ delete_decimated_meshes: true    # Remove intermediate LOD mesh files (default: 
 # missing or incorrect. It affects mesh vertex scaling, not ROI coordinates.
 voxel_size_nm: [1000, 1000, 1000]  # Override voxel size (ZYX)
 
+# ── Segment properties ──
+segment_properties_csv: /path/to/properties.csv  # CSV with per-segment metadata
+segment_properties_columns: [col1, col2]         # Which columns to include (default: all)
+segment_properties_id_column: "Object ID"        # CSV column with segment IDs (default: "Object ID")
+
 # ── Region of interest ──
 roi:                             # Restrict processing to this subregion
   begin: [100, 200, 300]         # Start coordinates in dataset world units (ZYX)
