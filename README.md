@@ -82,33 +82,35 @@ Example meshify `run-config.yaml`:
 # ── Required ──
 input_path: /path/to/segmentation.zarr/s0   # Path to zarr/n5 segmentation dataset
 output_directory: /path/to/output            # Where to write output meshes
-num_workers: 10                              # Number of dask workers
+
+# ── All remaining fields are optional ──
 
 # ── Mesh generation ──
 downsample_factor: 2             # Downsample volume by this factor before meshing (default: none)
-downsample_method: mode          # Downsampling method: mode, mode_suppress_zero, or binary
+downsample_method: mode          # Downsampling method: mode, mode_suppress_zero, or binary (default: mode_suppress_zero)
 
 # ── Simplification & smoothing ──
 do_simplification: true          # Simplify meshes after assembly (default: true)
 target_reduction: 0.99           # Fraction of faces to remove (default: 0.99)
 n_smoothing_iter: 10             # Taubin smoothing iterations (default: 10)
 check_mesh_validity: false       # Require watertight meshes (default: true; disable for ROI)
-use_fixed_edge_simplification: true  # Preserve chunk boundary edges during simplification
+use_fixed_edge_simplification: true  # Preserve chunk boundary edges during simplification (default: false)
 do_analysis: false               # Compute mesh metrics CSV (default: true)
 
 # ── Multiresolution output ──
-do_multires: true                # Also generate neuroglancer multilod_draco output
-num_lods: 3                      # Number of levels of detail
-multires_strategy: decimate      # LOD strategy: decimate or downsample
+do_multires: true                # Also generate neuroglancer multilod_draco output (default: false)
+num_lods: 3                      # Number of levels of detail (default: 3)
+multires_strategy: decimate      # LOD strategy: decimate or downsample (default: decimate)
 decimation_factor: 4             # Face reduction factor per LOD (default: 4)
-delete_decimated_meshes: true    # Remove intermediate LOD mesh files
+delete_decimated_meshes: true    # Remove intermediate LOD mesh files (default: true)
 
 # ── Coordinate system ──
-voxel_size_nm: [1000, 1000, 1000]  # Voxel size in nm (ZYX); use when dataset units
-                                    # are not nm (e.g. 1 um = 1000 nm). Only affects
-                                    # mesh vertex scaling, not ROI coordinates.
+# Voxel size is read automatically from the dataset metadata (OME-NGFF or
+# zarr attributes). Use voxel_size_nm only to override when the metadata is
+# missing or incorrect. It affects mesh vertex scaling, not ROI coordinates.
+voxel_size_nm: [1000, 1000, 1000]  # Override voxel size (ZYX)
 
-# ── Region of interest (optional) ──
+# ── Region of interest ──
 roi:                             # Restrict processing to this subregion
   begin: [100, 200, 300]         # Start coordinates in dataset world units (ZYX)
   end: [500, 600, 700]           # End coordinates in dataset world units (ZYX)
@@ -187,6 +189,64 @@ All pipeline commands use Dask for parallelism. The config directory must contai
 When running with `-n 1`, no cluster is created and no config file is needed — work runs synchronously in the calling process.
 
 See [dask-jobqueue configuration](https://github.com/dask/dask-jobqueue/blob/main/dask_jobqueue/jobqueue.yaml) for all cluster options.
+
+### Running on an HPC cluster
+
+#### LSF (bsub)
+
+To run on an LSF cluster, submit the driver process via `bsub`. The driver launches Dask workers as separate LSF jobs:
+
+```bash
+bsub -n 2 -P your_project_name mesh-n-bone meshify lsf-config -n 40
+```
+
+This submits a 2-slot driver job that creates a 40-worker Dask cluster. Each worker is launched as its own LSF job using the settings in `lsf-config/dask-config.yaml`.
+
+With pixi:
+
+```bash
+bsub -n 2 -P your_project_name pixi run mesh-n-bone meshify lsf-config -n 40
+```
+
+An example LSF dask config is provided in [`lsf-config/dask-config.yaml`](lsf-config/dask-config.yaml):
+
+```yaml
+jobqueue:
+  lsf:
+    ncpus: 48
+    processes: 40
+    cores: 40
+    memory: 720GB
+    walltime: 01:00
+    mem: 720000000000
+    use-stdin: true
+    log-directory: job-logs
+    name: mesh-n-bone
+    project: your_project_name
+```
+
+Update `project` to your LSF project/queue allocation and adjust `ncpus`, `memory`, and `walltime` for your cluster.
+
+#### SLURM / SGE
+
+The same pattern applies — submit the driver via your scheduler and set the cluster type in `dask-config.yaml`:
+
+```yaml
+# SLURM
+jobqueue:
+  slurm:
+    cores: 40
+    memory: 720GB
+    walltime: "01:00:00"
+    # ... other SLURM-specific options
+
+# SGE
+jobqueue:
+  sge:
+    cores: 40
+    memory: 720GB
+    # ... other SGE-specific options
+```
 
 ## Testing
 
