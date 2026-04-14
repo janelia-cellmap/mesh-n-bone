@@ -45,7 +45,7 @@ pixi install
 ### With pip
 
 ```bash
-pip install git+https://github.com/janelia-cellmap/mesh-n-bone.git
+pip install mesh-n-bone
 ```
 
 ### Building the CGAL skeletonizer (optional)
