@@ -219,7 +219,7 @@ def _get_chunked_mesh_worker(block, tmpdirname, config):
             )
 
             ds = config["downsample_factor"] or 1
-            block_size_voxels = np.array(config["read_write_block_shape_pixels"]) // ds + 1
+            block_size_voxels = np.array(config["read_write_block_shape_pixels"]) // ds
             block_size_world = (block_size_voxels * output_voxel_size)[::-1]
 
             mesh_tri_simplified = simplify_mesh(
@@ -975,13 +975,11 @@ class Meshify:
                 offset=self.roi.offset[::-1],
             )
             if self.use_fixed_edge_simplification:
-                # Fixed-edge simplification clips block meshes at
-                # half-voxel inward from chunk boundaries, so their
-                # shared vertices sit at chunk_boundary ± 0.5*voxel_size
-                # rather than exactly on the boundary.
-                # deduplicate_chunk_boundaries only merges vertices with
-                # mod(pos, chunk_size)==0, missing these clip-plane
-                # duplicates.  Merge them here via trimesh.
+                # Fixed-edge simplification clips block meshes at exact
+                # chunk boundaries.  deduplicate_chunk_boundaries merges
+                # vertices at mod(pos, chunk_size)==0; merge_vertices
+                # catches any remaining near-duplicates from slice
+                # interpolation.
                 tri_tmp = trimesh.Trimesh(
                     vertices=mesh.vertices, faces=mesh.faces, process=False
                 )

@@ -352,3 +352,77 @@ class TestMeshifyAnisotropicVoxels:
         z_ratio = extents[0] / extents[2]  # vertices are xyz reversed from zyx
         # Should be roughly 0.5 (z is 2x larger voxels, so same voxel count = 2x physical)
         assert 0.3 < z_ratio < 0.7 or 1.5 < z_ratio < 2.5
+
+
+class TestMeshifyFixedEdgeSimplification:
+    """Test fixed-edge simplification across chunk boundaries.
+
+    Verifies that per-block boundary clipping produces matching vertices
+    at chunk boundaries so assembly yields watertight meshes.
+    """
+
+    def test_cross_chunk_fixed_edge_is_watertight(self, tmp_output_dir):
+        """Fixed-edge simplification on a cross-chunk object should be watertight."""
+        # Use small chunks (8 voxels) so a 28-voxel object crosses many boundaries
+        vol = np.zeros((32, 32, 32), dtype=np.uint64)
+        vol[2:30, 2:30, 2:30] = 1
+
+        input_path = _create_zarr_volume(
+            tmp_output_dir, vol, voxel_size=(4, 4, 4), chunk_shape=(8, 8, 8)
+        )
+        output_dir = os.path.join(tmp_output_dir, "output")
+
+        m = Meshify(
+            input_path=input_path,
+            output_directory=output_dir,
+            num_workers=1,
+            do_analysis=False,
+            check_mesh_validity=False,
+            use_fixed_edge_simplification=True,
+            do_simplification=True,
+            target_reduction=0.9,
+            n_smoothing_iter=5,
+            remove_smallest_components=False,
+        )
+        m.get_meshes()
+
+        mesh = trimesh.load(os.path.join(output_dir, "meshes", "1.ply"))
+        assert mesh.is_watertight, (
+            "Fixed-edge simplified mesh should be watertight after assembly"
+        )
+        assert mesh.volume > 0
+
+    def test_cross_chunk_fixed_edge_no_spikes(self, tmp_output_dir):
+        """Fixed-edge simplification should not produce spike edges."""
+        vol = np.zeros((32, 32, 32), dtype=np.uint64)
+        vol[2:30, 2:30, 2:30] = 1
+
+        input_path = _create_zarr_volume(
+            tmp_output_dir, vol, voxel_size=(4, 4, 4), chunk_shape=(8, 8, 8)
+        )
+        output_dir = os.path.join(tmp_output_dir, "output")
+
+        m = Meshify(
+            input_path=input_path,
+            output_directory=output_dir,
+            num_workers=1,
+            do_analysis=False,
+            check_mesh_validity=False,
+            use_fixed_edge_simplification=True,
+            do_simplification=True,
+            target_reduction=0.9,
+            n_smoothing_iter=5,
+            remove_smallest_components=False,
+        )
+        m.get_meshes()
+
+        mesh = trimesh.load(os.path.join(output_dir, "meshes", "1.ply"))
+        edges = mesh.edges_unique
+        edge_lengths = np.linalg.norm(
+            mesh.vertices[edges[:, 0]] - mesh.vertices[edges[:, 1]], axis=1
+        )
+        spike_ratio = edge_lengths.max() / np.median(edge_lengths)
+        assert spike_ratio < 10, (
+            f"Spike ratio {spike_ratio:.1f}x exceeds limit; "
+            "boundary clipping may not align between blocks"
+        )

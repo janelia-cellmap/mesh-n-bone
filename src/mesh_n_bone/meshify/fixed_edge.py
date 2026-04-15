@@ -309,10 +309,11 @@ def weld_vertices(mesh, epsilon, block_size=None, roi_offset=None, verbose=False
 def remove_boundary_vertices(mesh, voxel_size, block_size=None, verbose=False):
     """Clip a mesh at block boundaries and remove exterior vertices.
 
-    For each axis, slices the mesh at planes located half a voxel inward
-    from the block origin and half a voxel inward from the block extent.
-    Vertices that fall outside the valid interior range are then removed
-    along with any faces that reference them.
+    For each axis, slices the mesh at planes at the block origin and
+    block extent.  Vertices that fall outside the block are then removed
+    along with any faces that reference them.  Slicing at the exact
+    boundary ensures adjacent blocks produce identical interpolated
+    vertices at the cut plane, allowing proper merging during assembly.
 
     Parameters
     ----------
@@ -338,13 +339,10 @@ def remove_boundary_vertices(mesh, voxel_size, block_size=None, verbose=False):
     if block_size is None:
         return mesh
 
-    tolerance = 0.5 * np.array(voxel_size)
-
     for axis in range(3):
         plane_normal = np.zeros(3)
         plane_normal[axis] = 1.0
         plane_origin = np.zeros(3)
-        plane_origin[axis] = tolerance[axis]
         mesh = trimesh.intersections.slice_mesh_plane(
             mesh, plane_normal=plane_normal, plane_origin=plane_origin, cap=False,
         )
@@ -356,7 +354,7 @@ def remove_boundary_vertices(mesh, voxel_size, block_size=None, verbose=False):
         plane_normal = np.zeros(3)
         plane_normal[axis] = -1.0
         plane_origin = np.zeros(3)
-        plane_origin[axis] = block_size[axis] - tolerance[axis]
+        plane_origin[axis] = block_size[axis]
         mesh = trimesh.intersections.slice_mesh_plane(
             mesh, plane_normal=plane_normal, plane_origin=plane_origin, cap=False,
         )
@@ -366,8 +364,8 @@ def remove_boundary_vertices(mesh, voxel_size, block_size=None, verbose=False):
             )
 
     vertices = mesh.vertices
-    below_min = vertices < tolerance
-    beyond_max = vertices > (block_size - tolerance)
+    below_min = vertices < 0
+    beyond_max = vertices > block_size
     outside_valid_range = np.any(below_min | beyond_max, axis=1)
 
     if not np.any(outside_valid_range):
