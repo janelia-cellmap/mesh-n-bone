@@ -136,6 +136,13 @@ def open_dataset(filename, ds_name, mode="r"):
     dtype = ts_ds.dtype.numpy_dtype
     chunks = tuple(ts_ds.chunk_layout.read_chunk.shape)
 
+    # N5 stores shape in XYZ order, but funlib expects ZYX.  Reverse so
+    # ROI computation (shape * voxel_size) and chunk-aligned operations
+    # use consistent axis order.
+    if _is_n5(full_path):
+        shape = shape[::-1]
+        chunks = chunks[::-1]
+
     data = ArrayMetadata(shape, dtype, chunks, attrs)
     voxel_size, offset = _read_voxel_size_offset(data)
     return CellMapArray(data, voxel_size, offset, dataset_path=full_path)
@@ -163,9 +170,16 @@ def _read_voxel_size_offset(data):
     elif "voxel_size" in attrs:
         voxel_size = Coordinate(int(v) for v in attrs["voxel_size"])
     elif "pixelResolution" in attrs:
-        voxel_size = Coordinate(
-            int(v) for v in attrs["pixelResolution"]["dimensions"]
-        )
+        # N5 pixelResolution.dimensions is in XYZ order, but funlib
+        # Coordinates are ZYX.  Prefer transform.scale (already ZYX
+        # via transform.axes) when available; otherwise reverse
+        # pixelResolution.
+        transform = attrs.get("transform", {})
+        if "scale" in transform:
+            voxel_size = Coordinate(int(round(v)) for v in transform["scale"])
+        else:
+            dims = list(attrs["pixelResolution"]["dimensions"])
+            voxel_size = Coordinate(int(round(v)) for v in reversed(dims))
     else:
         voxel_size = Coordinate(1 for _ in data.shape)
 
@@ -202,7 +216,11 @@ def read_raw_voxel_size(ds):
         return tuple(float(v) for v in attrs["resolution"])
 
     if "pixelResolution" in attrs:
-        return tuple(float(v) for v in attrs["pixelResolution"]["dimensions"])
+        transform = attrs.get("transform", {})
+        if "scale" in transform:
+            return tuple(float(v) for v in transform["scale"])
+        dims = list(attrs["pixelResolution"]["dimensions"])
+        return tuple(float(v) for v in reversed(dims))
 
     # Check OME-Zarr multiscales on parent group
     parent_attrs = _read_parent_attrs(ds)

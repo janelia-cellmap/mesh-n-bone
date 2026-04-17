@@ -132,6 +132,9 @@ def to_ndarray_tensorstore(dataset, roi, voxel_size, offset, swap_axes=False,
             roi = Roi(roi.begin[::-1], roi.shape[::-1])
         if offset:
             offset = Coordinate(offset[::-1])
+        # Reverse voxel_size too — the division below uses it on the
+        # already-reversed ROI, so they must be in the same axis order.
+        voxel_size = Coordinate(reversed(tuple(voxel_size)))
 
     domain = dataset.domain
     if len(domain) > 3:
@@ -146,8 +149,13 @@ def to_ndarray_tensorstore(dataset, roi, voxel_size, offset, swap_axes=False,
     if offset is None:
         offset = Coordinate(np.zeros(roi.dims, dtype=int))
 
-    roi = roi.snap_to_grid(voxel_size)
+    # Subtract offset first so snap_to_grid aligns to the dataset's
+    # voxel grid (offset + k*voxel_size), not multiples of voxel_size.
+    # Without this, datasets with non-zero offset (e.g., 60nm) get
+    # misaligned reads where adjacent blocks read different physical
+    # voxels for what should be overlap.
     roi -= offset
+    roi = roi.snap_to_grid(voxel_size)
     roi /= voxel_size
 
     roi_slices = roi.to_slices()

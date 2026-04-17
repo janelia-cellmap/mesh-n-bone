@@ -392,6 +392,49 @@ class TestMeshifyFixedEdgeSimplification:
         )
         assert mesh.volume > 0
 
+    def test_cross_block_fixed_edge_is_watertight(self, tmp_output_dir):
+        """Fixed-edge simplification across processing blocks is watertight.
+
+        Forces the object to span multiple processing blocks by setting
+        read_write_block_shape_pixels smaller than the object.  The
+        sphere surface crosses block boundaries, exercising the
+        boundary clipping and vertex deduplication path.
+        """
+        vol = np.zeros((32, 32, 32), dtype=np.uint64)
+        center = np.array([16, 16, 16], dtype=float)
+        for z in range(32):
+            for y in range(32):
+                for x in range(32):
+                    if np.linalg.norm(np.array([z, y, x], dtype=float) - center) < 12:
+                        vol[z, y, x] = 1
+
+        input_path = _create_zarr_volume(
+            tmp_output_dir, vol, voxel_size=(4, 4, 4), chunk_shape=(8, 8, 8)
+        )
+        output_dir = os.path.join(tmp_output_dir, "output")
+
+        m = Meshify(
+            input_path=input_path,
+            output_directory=output_dir,
+            num_workers=1,
+            do_analysis=False,
+            check_mesh_validity=False,
+            use_fixed_edge_simplification=True,
+            do_simplification=True,
+            target_reduction=0.9,
+            n_smoothing_iter=5,
+            remove_smallest_components=False,
+            read_write_block_shape_pixels=[8, 8, 8],
+        )
+        m.get_meshes()
+
+        mesh = trimesh.load(os.path.join(output_dir, "meshes", "1.ply"))
+        assert mesh.is_watertight, (
+            "Fixed-edge simplified mesh should be watertight when object "
+            "surface crosses processing block boundaries"
+        )
+        assert mesh.volume > 0
+
     def test_cross_chunk_fixed_edge_no_spikes(self, tmp_output_dir):
         """Fixed-edge simplification should not produce spike edges."""
         vol = np.zeros((32, 32, 32), dtype=np.uint64)

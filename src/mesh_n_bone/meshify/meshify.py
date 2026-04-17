@@ -212,6 +212,16 @@ def _get_chunked_mesh_worker(block, tmpdirname, config):
 
         if config["use_fixed_edge_simplification"] and config["do_simplification"]:
             mesh_tri = trimesh.Trimesh(vertices=mesh.vertices, faces=mesh.faces)
+            # Shift by half a voxel so clip planes in
+            # remove_boundary_vertices land exactly on the MC crossing
+            # vertices (midpoints between padding and unpadded voxels).
+            # This makes both adjacent blocks clip at the same world
+            # plane, producing matching boundary vertices.  Padding
+            # parallel-edge vertices end up strictly outside [0,
+            # block_size] and are removed by the strict > check.
+            half_pad = 0.5 * np.array(output_voxel_size)[::-1]
+            mesh_tri.vertices -= half_pad
+
             stage_1_reduction, _ = staged_reductions(
                 config["target_reduction"],
                 config["stage_1_reduction_fraction"],
@@ -231,7 +241,8 @@ def _get_chunked_mesh_worker(block, tmpdirname, config):
                 verbose=False,
                 fix_edges=True,
             )
-            mesh_tri_simplified.vertices += block_offset[::-1] + ds_shift[::-1]
+            half_pad_offset = block_offset + 0.5 * np.array(output_voxel_size)
+            mesh_tri_simplified.vertices += half_pad_offset[::-1] + ds_shift[::-1]
 
             mesh_simplified = CloudVolumeMesh(
                 mesh_tri_simplified.vertices,
@@ -975,11 +986,12 @@ class Meshify:
                 offset=self.roi.offset[::-1],
             )
             if self.use_fixed_edge_simplification:
-                # Fixed-edge simplification clips block meshes at exact
-                # chunk boundaries.  deduplicate_chunk_boundaries merges
-                # vertices at mod(pos, chunk_size)==0; merge_vertices
-                # catches any remaining near-duplicates from slice
-                # interpolation.
+                # The half-voxel shift places clip planes on the MC
+                # crossing vertices between padding and unpadded voxels.
+                # Both adjacent blocks clip at the same world plane and
+                # produce identical boundary vertices.  merge_vertices
+                # merges them even though they aren't at exact chunk-
+                # size multiples (where deduplicate looks).
                 tri_tmp = trimesh.Trimesh(
                     vertices=mesh.vertices, faces=mesh.faces, process=False
                 )
