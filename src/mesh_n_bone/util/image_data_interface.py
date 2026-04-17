@@ -132,6 +132,9 @@ def to_ndarray_tensorstore(dataset, roi, voxel_size, offset, swap_axes=False,
             roi = Roi(roi.begin[::-1], roi.shape[::-1])
         if offset:
             offset = Coordinate(offset[::-1])
+        # Reverse voxel_size too — the division below uses it on the
+        # already-reversed ROI, so they must be in the same axis order.
+        voxel_size = Coordinate(reversed(tuple(voxel_size)))
 
     domain = dataset.domain
     if len(domain) > 3:
