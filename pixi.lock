@@ -6073,7 +6073,7 @@ packages:
   requires_python: '>=3.9'
 - pypi: .
   name: mesh-n-bone
-  version: 0.1.2
+  version: 0.1.3
   sha256: 02191c7e57f0bf5682d688ef2ecf71288e5fe18534a47e9575f58b9fe42bed9f
   requires_dist:
   - numpy
