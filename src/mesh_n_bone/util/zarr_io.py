@@ -146,109 +146,117 @@ def open_dataset(filename, ds_name, mode="r"):
     data = ArrayMetadata(shape, dtype, chunks, attrs)
     parent_dir = os.path.dirname(full_path)
     parent_attrs = _read_attrs(parent_dir) if parent_dir and parent_dir != full_path else None
-    voxel_size, offset = _read_voxel_size_offset(data, parent_attrs=parent_attrs)
+    dataset_name = os.path.basename(full_path) or None
+    voxel_size, offset = _read_voxel_size_offset(
+        data, parent_attrs=parent_attrs, dataset_name=dataset_name,
+    )
     return CellMapArray(data, voxel_size, offset, dataset_path=full_path)
 
 
-def _read_voxel_size_offset(data, parent_attrs=None):
-    """Read voxel_size and offset from array attributes.
+def _read_funlib_voxel_offset(attrs):
+    """Pull funlib/N5-style ``voxel_size`` and ``offset`` from a single attrs dict.
 
-    Checks funlib-style, N5, and OME-Zarr metadata formats. When the
-    array itself carries no resolution/offset, falls back to OME-Zarr
-    multiscales on the parent group (both v0.4 top-level layout and
-    v0.5 ``ome``-namespaced layout).
-
-    Parameters
-    ----------
-    data : ArrayMetadata
-        Metadata container with ``.attrs`` dict.
-    parent_attrs : dict, optional
-        Attributes of the parent group (used for OME multiscales
-        fallback). Pass ``None`` to skip the fallback.
-
-    Returns
-    -------
-    tuple[Coordinate, Coordinate]
-        ``(voxel_size, offset)``. Values are truncated to int via
-        funlib ``Coordinate``; for non-integer voxel sizes use
-        :func:`read_raw_voxel_size` instead.
+    Returns ``(voxel_size, offset)`` as float lists, with each component
+    ``None`` when not declared. Combined into one helper so both the
+    array attrs and the parent-group attrs can use the same lookup.
     """
-    attrs = data.attrs
+    if not attrs:
+        return None, None
     voxel_size = None
-    offset = None
-
     if "resolution" in attrs:
-        voxel_size = Coordinate(int(v) for v in attrs["resolution"])
+        voxel_size = [float(v) for v in attrs["resolution"]]
     elif "voxel_size" in attrs:
-        voxel_size = Coordinate(int(v) for v in attrs["voxel_size"])
+        voxel_size = [float(v) for v in attrs["voxel_size"]]
     elif "pixelResolution" in attrs:
-        # N5 pixelResolution.dimensions is in XYZ order, but funlib
-        # Coordinates are ZYX.  Prefer transform.scale (already ZYX
-        # via transform.axes) when available; otherwise reverse
-        # pixelResolution.
+        # N5 pixelResolution.dimensions is XYZ; funlib expects ZYX.
+        # Prefer transform.scale (already ZYX via transform.axes).
         transform = attrs.get("transform", {})
         if "scale" in transform:
-            voxel_size = Coordinate(int(round(v)) for v in transform["scale"])
+            voxel_size = [float(v) for v in transform["scale"]]
         else:
             dims = list(attrs["pixelResolution"]["dimensions"])
-            voxel_size = Coordinate(int(round(v)) for v in reversed(dims))
+            voxel_size = [float(v) for v in reversed(dims)]
 
-    if "offset" in attrs:
-        offset = Coordinate(int(v) for v in attrs["offset"])
+    offset = [float(v) for v in attrs["offset"]] if "offset" in attrs else None
+    return voxel_size, offset
+
+
+def _resolve_voxel_size_offset(attrs, parent_attrs, dataset_name):
+    """Resolve voxel_size and offset as float lists from any supported source.
+
+    Checks, in order: (1) the array's own attrs (funlib/N5 keys),
+    (2) the parent group's attrs (same funlib/N5 keys — used by some
+    N5 multiscales setups that put resolution at the group level),
+    (3) OME-Zarr multiscales on the parent group (v0.4 + v0.5,
+    arbitrary axis order, root-level coordinateTransformations,
+    arbitrary dataset path).
+
+    Either component may come back ``None`` if no source declared it.
+    """
+    voxel_size, offset = _read_funlib_voxel_offset(attrs)
 
     if (voxel_size is None or offset is None) and parent_attrs:
-        ome_scale, ome_translation = _extract_ome_scale_translation(parent_attrs)
-        if voxel_size is None and ome_scale is not None:
-            voxel_size = Coordinate(int(round(v)) for v in ome_scale)
-        if offset is None and ome_translation is not None:
-            offset = Coordinate(int(round(v)) for v in ome_translation)
+        p_voxel, p_offset = _read_funlib_voxel_offset(parent_attrs)
+        if voxel_size is None:
+            voxel_size = p_voxel
+        if offset is None:
+            offset = p_offset
 
-    if voxel_size is None:
-        voxel_size = Coordinate(1 for _ in data.shape)
-    if offset is None:
-        offset = Coordinate(0 for _ in voxel_size)
+    if (voxel_size is None or offset is None) and parent_attrs:
+        ome_scale, ome_translation = _extract_ome_scale_translation(
+            parent_attrs, dataset_name=dataset_name,
+        )
+        if voxel_size is None and ome_scale is not None:
+            voxel_size = list(ome_scale)
+        if offset is None and ome_translation is not None:
+            offset = list(ome_translation)
 
     return voxel_size, offset
 
 
-def read_raw_voxel_size(ds):
-    """Read the original float voxel_size from dataset attributes.
+def _read_voxel_size_offset(data, parent_attrs=None, dataset_name=None):
+    """Read voxel_size and offset and return them as funlib ``Coordinate``s.
 
-    Unlike ``_read_voxel_size_offset``, preserves float precision
-    (funlib.geometry.Coordinate truncates to int).
-
-    Parameters
-    ----------
-    ds : CellMapArray
-        Dataset wrapper.
-
-    Returns
-    -------
-    tuple[float, ...]
-        True voxel size as floats.
+    Composes ``_resolve_voxel_size_offset`` and casts to int; logs a
+    warning if non-integer voxel sizes are silently rounded so callers
+    needing float precision use :func:`read_raw_voxel_size` instead.
     """
-    attrs = ds.data.attrs
+    voxel_size, offset = _resolve_voxel_size_offset(
+        data.attrs, parent_attrs, dataset_name,
+    )
 
-    if "voxel_size" in attrs:
-        return tuple(float(v) for v in attrs["voxel_size"])
+    if voxel_size is not None and any(v != int(v) for v in voxel_size):
+        logger.warning(
+            "Rounding non-integer voxel_size %s to integers for "
+            "Coordinate; use read_raw_voxel_size for float-precision access.",
+            voxel_size,
+        )
 
-    if "resolution" in attrs:
-        return tuple(float(v) for v in attrs["resolution"])
+    if voxel_size is None:
+        voxel_size = [1] * len(data.shape)
+    if offset is None:
+        offset = [0] * len(voxel_size)
 
-    if "pixelResolution" in attrs:
-        transform = attrs.get("transform", {})
-        if "scale" in transform:
-            return tuple(float(v) for v in transform["scale"])
-        dims = list(attrs["pixelResolution"]["dimensions"])
-        return tuple(float(v) for v in reversed(dims))
+    return (
+        Coordinate(int(round(v)) for v in voxel_size),
+        Coordinate(int(round(v)) for v in offset),
+    )
 
-    # Check OME-Zarr multiscales on parent group
+
+def read_raw_voxel_size(ds):
+    """Return the float voxel_size, preserving non-integer precision.
+
+    Same source-resolution as :func:`_read_voxel_size_offset` but does
+    not round. Falls back to ``ds.voxel_size`` (already a Coordinate)
+    when no metadata source declares a value.
+    """
     parent_attrs = _read_parent_attrs(ds)
-    if parent_attrs is not None:
-        scale, _ = _extract_ome_scale_translation(parent_attrs)
-        if scale is not None:
-            return tuple(float(v) for v in scale)
-
+    dataset_name = os.path.basename(getattr(ds, "_dataset_path", "")) or None
+    voxel_size, _ = _resolve_voxel_size_offset(
+        ds.data.attrs, parent_attrs, dataset_name,
+    )
+    if voxel_size is not None:
+        return tuple(float(v) for v in voxel_size)
     return tuple(float(v) for v in ds.voxel_size)
 
 
@@ -256,37 +264,205 @@ def _get_multiscales(attrs):
     """Return the OME-Zarr ``multiscales`` list, or ``None``.
 
     Handles OME-Zarr v0.4 (top-level ``multiscales``) and v0.5
-    (``ome.multiscales``). Returns ``None`` if neither is present.
+    (``ome.multiscales``). Logs a warning and returns ``None`` if an
+    ``ome`` block is present but does not contain ``multiscales``,
+    which usually means the spec has moved on to a layout this
+    helper does not recognise yet.
     """
     if not attrs:
         return None
     if "multiscales" in attrs:
         return attrs["multiscales"]
     ome = attrs.get("ome")
-    if isinstance(ome, dict) and "multiscales" in ome:
-        return ome["multiscales"]
+    if isinstance(ome, dict):
+        if "multiscales" in ome:
+            return ome["multiscales"]
+        logger.warning(
+            "OME-Zarr 'ome' attribute block present but no 'multiscales' "
+            "found inside it (keys=%s). Falling back to default voxel size; "
+            "this likely means a newer OME-Zarr spec layout the helper "
+            "needs to be updated for.",
+            sorted(ome.keys()),
+        )
     return None
 
 
-def _extract_ome_scale_translation(attrs):
-    """Extract scale and translation from OME-Zarr multiscales metadata.
+def _read_transforms(transforms):
+    """Compose a coordinateTransformations list in document order.
 
-    Reads the first dataset's ``coordinateTransformations``. Returns
-    ``(scale, translation)`` as float tuples; either may be ``None``
-    if absent.
+    OME-Zarr applies transformations left-to-right, so ``[scale,
+    translation]`` differs from ``[translation, scale]``. This helper
+    accumulates the equivalent affine ``(scale, translation)`` such
+    that ``physical = scale * voxel + translation``, regardless of
+    order. Unknown types (e.g. ``identity``) are ignored.
+
+    Returns ``(scale, translation)`` as ``list[float] | None``.
+    """
+    s_acc = None
+    t_acc = None
+    for entry in transforms or []:
+        if not isinstance(entry, dict):
+            continue
+        ttype = entry.get("type")
+        if ttype == "scale" and "scale" in entry:
+            s = [float(v) for v in entry["scale"]]
+            if s_acc is None:
+                s_acc = list(s)
+            else:
+                s_acc = [s_acc[i] * s[i] for i in range(len(s))]
+            if t_acc is not None:
+                t_acc = [t_acc[i] * s[i] for i in range(len(s))]
+        elif ttype == "translation" and "translation" in entry:
+            t = [float(v) for v in entry["translation"]]
+            if t_acc is None:
+                t_acc = list(t)
+            else:
+                t_acc = [t_acc[i] + t[i] for i in range(len(t))]
+    return s_acc, t_acc
+
+
+def _compose_transforms(scale_d, trans_d, scale_r, trans_r):
+    """Compose dataset-level then root-level transforms.
+
+    OME-Zarr applies coordinateTransformations in document order; the
+    multiscales root-level list applies on top of the per-dataset list.
+
+    Going from voxel coords ``v`` to physical coords::
+
+        physical = trans_r + scale_r * (trans_d + scale_d * v)
+                 = (trans_r + scale_r * trans_d) + (scale_r * scale_d) * v
+
+    Missing components default to scale=1, translation=0. Returns the
+    composed ``(scale, translation)`` as ``list[float] | None``.
+    """
+    if scale_r is None and trans_r is None:
+        return scale_d, trans_d
+
+    n = None
+    for vec in (scale_d, trans_d, scale_r, trans_r):
+        if vec is not None:
+            n = len(vec)
+            break
+    if n is None:
+        return None, None
+
+    s_d = [float(v) for v in scale_d] if scale_d else [1.0] * n
+    t_d = [float(v) for v in trans_d] if trans_d else [0.0] * n
+    s_r = [float(v) for v in scale_r] if scale_r else [1.0] * n
+    t_r = [float(v) for v in trans_r] if trans_r else [0.0] * n
+
+    composed_scale = [s_r[i] * s_d[i] for i in range(n)]
+    composed_trans = [t_r[i] + s_r[i] * t_d[i] for i in range(n)]
+    return composed_scale, composed_trans
+
+
+def _spatial_permutation(axes):
+    """Return indices that select spatial axes in ZYX order.
+
+    Falls back to ``None`` (caller should treat the array as already
+    ZYX) when the axes list is missing, has no per-axis ``type``
+    metadata, or doesn't use the canonical x/y/z names.
+
+    This lets OME datasets with ``axes=[t, c, z, y, x]`` (5D) or
+    ``axes=[x, y, z]`` (XYZ) be read correctly from a 3D mesh-n-bone
+    pipeline.
+    """
+    if not axes:
+        return None
+
+    space_indices = []
+    space_names = []
+    for i, ax in enumerate(axes):
+        if not isinstance(ax, dict):
+            continue
+        ax_type = ax.get("type", "space")
+        if ax_type == "space":
+            space_indices.append(i)
+            space_names.append(str(ax.get("name", "")).lower())
+
+    if not space_indices:
+        return None
+
+    if set(space_names) >= {"x", "y", "z"} and len(space_names) >= 3:
+        ordered = []
+        for target in ("z", "y", "x"):
+            ordered.append(space_indices[space_names.index(target)])
+        return ordered
+
+    return space_indices
+
+
+def _apply_permutation(values, permutation):
+    """Reorder *values* by *permutation*; return a tuple of floats."""
+    if values is None:
+        return None
+    if permutation is None:
+        return tuple(float(v) for v in values)
+    return tuple(float(values[i]) for i in permutation)
+
+
+def _select_dataset(datasets, dataset_name):
+    """Pick the multiscales dataset entry matching *dataset_name*.
+
+    Falls back to the first entry when *dataset_name* is None or when
+    no entry has a matching ``path``. Returns ``None`` if there are no
+    datasets.
+    """
+    if not datasets:
+        return None
+    if dataset_name is not None:
+        for d in datasets:
+            if isinstance(d, dict) and d.get("path") == dataset_name:
+                return d
+    return datasets[0]
+
+
+def _extract_ome_scale_translation(attrs, dataset_name=None):
+    """Read scale and translation from OME-Zarr multiscales metadata.
+
+    Robust to:
+      * v0.4 top-level ``multiscales`` and v0.5 ``ome.multiscales``,
+      * ``s0`` not being the first dataset (matches by ``path``),
+      * root-level ``coordinateTransformations`` (composed with the
+        per-dataset transforms),
+      * non-ZYX axis ordering and 4D/5D axes lists with non-spatial
+        dimensions (axes are filtered to ``type=="space"`` and reordered
+        to ZYX when named ``x``/``y``/``z``).
+
+    Parameters
+    ----------
+    attrs : dict
+        Group attributes containing multiscales metadata.
+    dataset_name : str, optional
+        ``path`` of the dataset to match (e.g. ``"s0"``). When omitted,
+        the first dataset entry is used.
+
+    Returns
+    -------
+    tuple
+        ``(scale, translation)`` as float tuples in ZYX order, or
+        ``(None, None)`` if no multiscales metadata is found. Either
+        component may be ``None`` if the corresponding transform was
+        not declared.
     """
     multiscales = _get_multiscales(attrs)
     if not multiscales:
         return None, None
-    transforms = multiscales[0]["datasets"][0].get("coordinateTransformations", [])
-    scale = None
-    translation = None
-    for t in transforms:
-        if t.get("type") == "scale":
-            scale = tuple(float(v) for v in t["scale"])
-        elif t.get("type") == "translation":
-            translation = tuple(float(v) for v in t["translation"])
-    return scale, translation
+
+    ms = multiscales[0] if isinstance(multiscales, list) and multiscales else None
+    if not isinstance(ms, dict):
+        return None, None
+
+    chosen = _select_dataset(ms.get("datasets", []), dataset_name)
+    if chosen is None:
+        return None, None
+
+    scale_d, trans_d = _read_transforms(chosen.get("coordinateTransformations", []))
+    scale_r, trans_r = _read_transforms(ms.get("coordinateTransformations", []))
+    scale, translation = _compose_transforms(scale_d, trans_d, scale_r, trans_r)
+
+    perm = _spatial_permutation(ms.get("axes", []))
+    return _apply_permutation(scale, perm), _apply_permutation(translation, perm)
 
 
 def _read_parent_attrs(ds):

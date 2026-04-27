@@ -20,6 +20,7 @@ from mesh_n_bone.util.zarr_io import (
     read_raw_voxel_size,
     _read_attrs,
     _get_multiscales,
+    _extract_ome_scale_translation,
 )
 from mesh_n_bone.util.image_data_interface import open_ds_tensorstore, to_ndarray_tensorstore
 from mesh_n_bone.meshify.downsample import (
@@ -44,13 +45,17 @@ _OME_UNIT_TO_ABBREVIATION = {
 def _read_ome_ngff_transform(input_path):
     """Extract voxel_size, offset, and coordinate unit from OME-NGFF metadata.
 
-    Looks at the parent group's .zattrs for coordinateTransformations
-    that apply to the dataset at input_path. Returns
-    (voxel_size, offset, coordinate_units) in ZYX order,
-    or (None, None, None) if not found.
+    Reads multiscales from the parent group of *input_path*. Robust to
+    OME-Zarr v0.4 / v0.5 layouts, non-ZYX axes, root-level
+    coordinateTransformations, and arbitrary dataset paths — all via
+    :func:`mesh_n_bone.util.zarr_io._extract_ome_scale_translation`.
+
+    Returns ``(voxel_size, offset, coordinate_units)`` in ZYX order
+    (or ``(None, None, None)`` when no metadata is found). The voxel
+    size and offset are returned as ``np.ndarray`` for consistency
+    with existing callers.
     """
-    # Find the zarr/n5 root and dataset path within it
-    for ext in [".zarr", ".n5"]:
+    for ext in (".zarr", ".n5"):
         if ext in input_path:
             parts = input_path.split(ext + "/")
             zarr_root_path = parts[0] + ext
@@ -59,51 +64,38 @@ def _read_ome_ngff_transform(input_path):
     else:
         return None, None, None
 
-    # The dataset name is the last component (e.g. "s0" from "cell/s0")
     dataset_name = os.path.basename(dataset_path)
-    # The parent group path (e.g. "cell" from "cell/s0")
     parent_path = os.path.dirname(dataset_path)
+    parent_dir = os.path.join(zarr_root_path, parent_path) if parent_path else zarr_root_path
 
     try:
-        # Read parent group attributes directly from JSON metadata files
-        if parent_path:
-            parent_dir = os.path.join(zarr_root_path, parent_path)
-        else:
-            parent_dir = zarr_root_path
-
         parent_attrs = _read_attrs(parent_dir)
         multiscales = _get_multiscales(parent_attrs)
         if not multiscales:
             return None, None, None
 
-        for ms in multiscales:
-            # Extract coordinate unit from axes metadata
-            coordinate_units = None
-            axes = ms.get("axes", [])
-            for ax in axes:
-                if ax.get("type") == "space":
-                    unit = ax.get("unit")
-                    if unit is not None:
-                        coordinate_units = _OME_UNIT_TO_ABBREVIATION.get(
-                            unit, unit
-                        )
-                    break
+        scale, translation = _extract_ome_scale_translation(
+            parent_attrs, dataset_name=dataset_name,
+        )
+        if scale is None and translation is None:
+            return None, None, None
 
-            for ds_info in ms.get("datasets", []):
-                if ds_info.get("path") == dataset_name:
-                    transforms = ds_info.get("coordinateTransformations", [])
-                    voxel_size = None
-                    offset = None
-                    for t in transforms:
-                        if t.get("type") == "scale":
-                            voxel_size = np.array(t["scale"], dtype=float)
-                        elif t.get("type") == "translation":
-                            offset = np.array(t["translation"], dtype=float)
-                    return voxel_size, offset, coordinate_units
+        # Pull the unit off the first spatial axis (units are per-axis but
+        # mesh-n-bone treats voxel_size isotropically here).
+        coordinate_units = None
+        for ax in multiscales[0].get("axes", []) or []:
+            if isinstance(ax, dict) and ax.get("type") == "space":
+                unit = ax.get("unit")
+                if unit is not None:
+                    coordinate_units = _OME_UNIT_TO_ABBREVIATION.get(unit, unit)
+                break
+
+        voxel_size = np.array(scale, dtype=float) if scale is not None else None
+        offset = np.array(translation, dtype=float) if translation is not None else None
+        return voxel_size, offset, coordinate_units
     except Exception as e:
         logger.debug(f"Could not read OME-NGFF metadata: {e}")
-
-    return None, None, None
+        return None, None, None
 
 
 try:
