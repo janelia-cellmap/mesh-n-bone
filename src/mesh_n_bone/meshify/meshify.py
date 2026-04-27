@@ -14,7 +14,13 @@ import json
 import pymeshlab
 from mesh_n_bone.util import dask_util
 from mesh_n_bone.util.logging import Timing_Messager
-from mesh_n_bone.util.zarr_io import open_dataset, split_dataset_path, read_raw_voxel_size, _read_attrs
+from mesh_n_bone.util.zarr_io import (
+    open_dataset,
+    split_dataset_path,
+    read_raw_voxel_size,
+    _read_attrs,
+    _get_multiscales,
+)
 from mesh_n_bone.util.image_data_interface import open_ds_tensorstore, to_ndarray_tensorstore
 from mesh_n_bone.meshify.downsample import (
     downsample_labels_3d_suppress_zero,
@@ -66,7 +72,7 @@ def _read_ome_ngff_transform(input_path):
             parent_dir = zarr_root_path
 
         parent_attrs = _read_attrs(parent_dir)
-        multiscales = parent_attrs.get("multiscales")
+        multiscales = _get_multiscales(parent_attrs)
         if not multiscales:
             return None, None, None
 

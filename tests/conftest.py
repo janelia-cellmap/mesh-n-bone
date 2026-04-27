@@ -216,10 +216,17 @@ def zarr_sphere(tmp_output_dir):
 
 
 def _make_zarr_cube_ome_ngff(tmp_dir, voxel_size, offset, vol_shape, cube_slice,
-                              label=1, chunk_shape=None):
+                              label=1, chunk_shape=None, ome_version="0.4"):
     """Like _make_zarr_cube but stores metadata in OME-NGFF multiscales format
     (parent .zattrs) instead of per-dataset .zattrs. This mimics how most
-    cellmap/OME-Zarr datasets store their coordinate transforms."""
+    cellmap/OME-Zarr datasets store their coordinate transforms.
+
+    ome_version selects the spec layout:
+      - "0.4": multiscales placed directly on the parent group's attrs
+        (legacy / cellmap convention).
+      - "0.5": multiscales nested under an ``ome`` key on the parent
+        group's attrs (paintera v0.5 convention).
+    """
     if chunk_shape is None:
         chunk_shape = vol_shape
     zarr_path = os.path.join(tmp_dir, "ome.zarr")
@@ -228,9 +235,7 @@ def _make_zarr_cube_ome_ngff(tmp_dir, voxel_size, offset, vol_shape, cube_slice,
     vol[cube_slice] = label
     root.create_array("seg/s0", data=vol, chunks=chunk_shape)
 
-    # Write OME-NGFF multiscales metadata on the PARENT group
-    seg_group = root["seg"]
-    seg_group.attrs["multiscales"] = [{
+    multiscales = [{
         "axes": [
             {"name": "z", "type": "space", "unit": "nanometer"},
             {"name": "y", "type": "space", "unit": "nanometer"},
@@ -243,10 +248,16 @@ def _make_zarr_cube_ome_ngff(tmp_dir, voxel_size, offset, vol_shape, cube_slice,
             ],
             "path": "s0",
         }],
-        "version": "0.4",
+        "version": ome_version,
     }]
 
-    # NO attrs on the dataset itself — open_dataset will see voxel_size=(1,1,1)
+    seg_group = root["seg"]
+    if ome_version == "0.5":
+        seg_group.attrs["ome"] = {"multiscales": multiscales, "version": "0.5"}
+    else:
+        seg_group.attrs["multiscales"] = multiscales
+
+    # NO attrs on the dataset itself — open_dataset must traverse to parent.
 
     vs = np.array(voxel_size, dtype=float)
     off = np.array(offset, dtype=float)
@@ -266,7 +277,7 @@ def _make_zarr_cube_ome_ngff(tmp_dir, voxel_size, offset, vol_shape, cube_slice,
 
 @pytest.fixture
 def zarr_cube_ome_ngff(tmp_output_dir):
-    """Zarr volume with OME-NGFF multiscales metadata (no per-dataset .zattrs).
+    """Zarr volume with OME-NGFF v0.4 multiscales metadata (no per-dataset .zattrs).
 
     Volume: 64x64x64, voxel_size=[8,8,8], offset=[100,100,100] (ZYX).
     Cube: label 1 at voxels [8:48, 8:48, 8:48].
@@ -279,4 +290,23 @@ def zarr_cube_ome_ngff(tmp_output_dir):
         vol_shape=(64, 64, 64),
         cube_slice=(slice(8, 48), slice(8, 48), slice(8, 48)),
         chunk_shape=(16, 16, 16),
+        ome_version="0.4",
+    )
+
+
+@pytest.fixture
+def zarr_cube_ome_ngff_v05(tmp_output_dir):
+    """Zarr volume with OME-NGFF v0.5 (``ome.multiscales``) metadata.
+
+    Mirrors ``zarr_cube_ome_ngff`` but stores multiscales under the
+    ``ome`` namespace, matching the paintera v0.5 convention.
+    """
+    return _make_zarr_cube_ome_ngff(
+        tmp_output_dir,
+        voxel_size=[8, 8, 8],
+        offset=[100, 100, 100],
+        vol_shape=(64, 64, 64),
+        cube_slice=(slice(8, 48), slice(8, 48), slice(8, 48)),
+        chunk_shape=(16, 16, 16),
+        ome_version="0.5",
     )

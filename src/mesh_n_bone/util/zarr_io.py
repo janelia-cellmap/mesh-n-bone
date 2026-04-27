@@ -144,26 +144,38 @@ def open_dataset(filename, ds_name, mode="r"):
         chunks = chunks[::-1]
 
     data = ArrayMetadata(shape, dtype, chunks, attrs)
-    voxel_size, offset = _read_voxel_size_offset(data)
+    parent_dir = os.path.dirname(full_path)
+    parent_attrs = _read_attrs(parent_dir) if parent_dir and parent_dir != full_path else None
+    voxel_size, offset = _read_voxel_size_offset(data, parent_attrs=parent_attrs)
     return CellMapArray(data, voxel_size, offset, dataset_path=full_path)
 
 
-def _read_voxel_size_offset(data):
+def _read_voxel_size_offset(data, parent_attrs=None):
     """Read voxel_size and offset from array attributes.
 
-    Checks funlib-style, N5, and OME-Zarr metadata formats.
+    Checks funlib-style, N5, and OME-Zarr metadata formats. When the
+    array itself carries no resolution/offset, falls back to OME-Zarr
+    multiscales on the parent group (both v0.4 top-level layout and
+    v0.5 ``ome``-namespaced layout).
 
     Parameters
     ----------
     data : ArrayMetadata
         Metadata container with ``.attrs`` dict.
+    parent_attrs : dict, optional
+        Attributes of the parent group (used for OME multiscales
+        fallback). Pass ``None`` to skip the fallback.
 
     Returns
     -------
     tuple[Coordinate, Coordinate]
-        ``(voxel_size, offset)``
+        ``(voxel_size, offset)``. Values are truncated to int via
+        funlib ``Coordinate``; for non-integer voxel sizes use
+        :func:`read_raw_voxel_size` instead.
     """
     attrs = data.attrs
+    voxel_size = None
+    offset = None
 
     if "resolution" in attrs:
         voxel_size = Coordinate(int(v) for v in attrs["resolution"])
@@ -180,12 +192,20 @@ def _read_voxel_size_offset(data):
         else:
             dims = list(attrs["pixelResolution"]["dimensions"])
             voxel_size = Coordinate(int(round(v)) for v in reversed(dims))
-    else:
-        voxel_size = Coordinate(1 for _ in data.shape)
 
     if "offset" in attrs:
         offset = Coordinate(int(v) for v in attrs["offset"])
-    else:
+
+    if (voxel_size is None or offset is None) and parent_attrs:
+        ome_scale, ome_translation = _extract_ome_scale_translation(parent_attrs)
+        if voxel_size is None and ome_scale is not None:
+            voxel_size = Coordinate(int(round(v)) for v in ome_scale)
+        if offset is None and ome_translation is not None:
+            offset = Coordinate(int(round(v)) for v in ome_translation)
+
+    if voxel_size is None:
+        voxel_size = Coordinate(1 for _ in data.shape)
+    if offset is None:
         offset = Coordinate(0 for _ in voxel_size)
 
     return voxel_size, offset
@@ -224,19 +244,49 @@ def read_raw_voxel_size(ds):
 
     # Check OME-Zarr multiscales on parent group
     parent_attrs = _read_parent_attrs(ds)
-    if parent_attrs and "multiscales" in parent_attrs:
-        return _extract_ome_scale(parent_attrs)
+    if parent_attrs is not None:
+        scale, _ = _extract_ome_scale_translation(parent_attrs)
+        if scale is not None:
+            return tuple(float(v) for v in scale)
 
     return tuple(float(v) for v in ds.voxel_size)
 
 
-def _extract_ome_scale(attrs):
-    """Extract voxel size from OME-Zarr multiscales metadata."""
-    transforms = attrs["multiscales"][0]["datasets"][0]["coordinateTransformations"]
+def _get_multiscales(attrs):
+    """Return the OME-Zarr ``multiscales`` list, or ``None``.
+
+    Handles OME-Zarr v0.4 (top-level ``multiscales``) and v0.5
+    (``ome.multiscales``). Returns ``None`` if neither is present.
+    """
+    if not attrs:
+        return None
+    if "multiscales" in attrs:
+        return attrs["multiscales"]
+    ome = attrs.get("ome")
+    if isinstance(ome, dict) and "multiscales" in ome:
+        return ome["multiscales"]
+    return None
+
+
+def _extract_ome_scale_translation(attrs):
+    """Extract scale and translation from OME-Zarr multiscales metadata.
+
+    Reads the first dataset's ``coordinateTransformations``. Returns
+    ``(scale, translation)`` as float tuples; either may be ``None``
+    if absent.
+    """
+    multiscales = _get_multiscales(attrs)
+    if not multiscales:
+        return None, None
+    transforms = multiscales[0]["datasets"][0].get("coordinateTransformations", [])
+    scale = None
+    translation = None
     for t in transforms:
-        if t["type"] == "scale":
-            return tuple(float(v) for v in t["scale"])
-    raise ValueError("No scale transform found in OME-Zarr multiscales metadata")
+        if t.get("type") == "scale":
+            scale = tuple(float(v) for v in t["scale"])
+        elif t.get("type") == "translation":
+            translation = tuple(float(v) for v in t["translation"])
+    return scale, translation
 
 
 def _read_parent_attrs(ds):
