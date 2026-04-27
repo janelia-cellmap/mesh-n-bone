@@ -388,6 +388,7 @@ class Meshify:
         do_multires: bool = False,
         num_lods: int = 3,
         lod_0_box_size=None,
+        target_faces_per_lod0_chunk: int = 25_000,
         downsample_method: str = "mode_suppress_zero",
         multires_strategy: str = "decimate",
         decimation_factor: int = 4,
@@ -527,6 +528,7 @@ class Meshify:
                 self.lod_0_box_size = np.repeat(self.lod_0_box_size, 3)
         else:
             self.lod_0_box_size = None
+        self.target_faces_per_lod0_chunk = target_faces_per_lod0_chunk
         self.downsample_method = downsample_method
         self.input_path = input_path
         self.multires_strategy = multires_strategy
@@ -1247,6 +1249,7 @@ class Meshify:
                     mesh_ext,
                     np.array(file_sizes, dtype=float),
                     self.lod_0_box_size,
+                    target_faces_per_lod0_chunk=self.target_faces_per_lod0_chunk,
                 )
 
         with Timing_Messager("Writing info and segment properties files", logger):

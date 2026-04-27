@@ -29,6 +29,7 @@ def read_multires_config(config_path):
         - ``aggressiveness``: ``7``
         - ``delete_decimated_meshes``: ``False``
         - ``roi``: ``None``
+        - ``target_faces_per_lod0_chunk``: ``25000``
 
         *optional_properties_settings* defaults:
 
@@ -60,6 +61,13 @@ def read_multires_config(config_path):
             optional_decimation_settings["delete_decimated_meshes"] = False
         if "roi" not in optional_decimation_settings:
             optional_decimation_settings["roi"] = None
+        if "target_faces_per_lod0_chunk" not in optional_decimation_settings:
+            from mesh_n_bone.multires.multires import (
+                DEFAULT_TARGET_FACES_PER_LOD0_CHUNK,
+            )
+            optional_decimation_settings["target_faces_per_lod0_chunk"] = (
+                DEFAULT_TARGET_FACES_PER_LOD0_CHUNK
+            )
 
         optional_properties_settings = config.get("optional_properties_settings", {})
         if "segment_properties_csv" not in optional_properties_settings:

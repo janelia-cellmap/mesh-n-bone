@@ -449,6 +449,54 @@ class TestLodTruncation:
         assert num_lods == 3, f"Expected 3 LODs, got {num_lods}"
 
 
+class TestTargetFacesPerLod0Chunk:
+    """``target_faces_per_lod0_chunk`` overrides the auto-sizing heuristic.
+
+    The default 25k-faces threshold collapses small meshes (under 25k
+    faces) to a single LOD-0 chunk and therefore a single LOD overall.
+    Lowering the threshold should force a multi-chunk grid and keep
+    additional LODs.
+    """
+
+    def test_low_threshold_keeps_multiple_lods(self, multires_mesh_dir):
+        # ``multires_mesh_dir`` contains an icosphere (subdivisions=3,
+        # 1280 faces at LOD 0) — well below 25k, so the default
+        # heuristic collapses it to 1 LOD even though both LOD files
+        # exist on disk.
+        output_path = multires_mesh_dir
+
+        generate_neuroglancer_multires_mesh(
+            id=1,
+            num_subtask_workers=1,
+            output_path=output_path,
+            lods=[0, 1],
+            original_ext=".ply",
+        )
+        with open(os.path.join(output_path, "multires", "1.index"), "rb") as f:
+            default_num_lods = struct.unpack("<I", f.read()[24:28])[0]
+        assert default_num_lods == 1, (
+            f"Default 25k-face heuristic should collapse a 1280-face mesh "
+            f"to 1 LOD; got {default_num_lods}."
+        )
+
+        # Force the heuristic to chunk by setting the per-chunk target
+        # well below the LOD-0 face count.
+        generate_neuroglancer_multires_mesh(
+            id=1,
+            num_subtask_workers=1,
+            output_path=output_path,
+            lods=[0, 1],
+            original_ext=".ply",
+            target_faces_per_lod0_chunk=100,
+        )
+        with open(os.path.join(output_path, "multires", "1.index"), "rb") as f:
+            tuned_num_lods = struct.unpack("<I", f.read()[24:28])[0]
+        assert tuned_num_lods > default_num_lods, (
+            "Lowering target_faces_per_lod0_chunk should produce more LODs"
+            f" than the default; got {tuned_num_lods} vs {default_num_lods}."
+        )
+
+
 class TestIndexFileFormat:
     """Test the neuroglancer multilod_draco index file format."""
 
