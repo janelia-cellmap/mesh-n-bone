@@ -19,9 +19,13 @@ from mesh_n_bone.config import read_multires_config
 logger = logging.getLogger(__name__)
 
 
+DEFAULT_TARGET_FACES_PER_LOD0_CHUNK = 25_000
+
+
 def generate_neuroglancer_multires_mesh(
     id, num_subtask_workers, output_path, lods, original_ext, lod_0_box_size=None,
     vertex_quantization_bits=16,
+    target_faces_per_lod0_chunk=DEFAULT_TARGET_FACES_PER_LOD0_CHUNK,
 ):
     """Create a complete multiresolution mesh for a single segment.
 
@@ -43,7 +47,15 @@ def generate_neuroglancer_multires_mesh(
         File extension of LOD 0 meshes (e.g. ``".ply"``).
     lod_0_box_size : ndarray of float or None
         Chunk box size for LOD 0. If ``None``, computed from mesh
-        bounding box targeting ~25k faces per chunk.
+        bounding box targeting ``target_faces_per_lod0_chunk`` faces
+        per chunk.
+    target_faces_per_lod0_chunk : int
+        Target face count per LOD-0 fragment used by the
+        auto-sizing heuristic. Lower values produce more, smaller
+        chunks (and force multi-LOD output for smaller meshes);
+        higher values keep small meshes in a single fragment so
+        they collapse to 1 LOD. Ignored when *lod_0_box_size* is
+        passed explicitly.
     """
     with ExitStack() as stack:
         if num_subtask_workers > 1:
@@ -80,10 +92,11 @@ def generate_neuroglancer_multires_mesh(
                 distances_per_axis = np.ceil(
                     vertices.max(axis=0) - vertices.min(axis=0)
                 )
-                # Target ~25k faces per LOD 0 fragment (~30 KB Draco-
-                # compressed at 10-bit quantization).  This balances
-                # spatial selectivity against HTTP per-request overhead.
-                heuristic_num_chunks = np.ceil(num_faces / 25_000)
+                # Target ``target_faces_per_lod0_chunk`` faces per LOD-0
+                # fragment (default 25k ≈ 30 KB Draco-compressed at
+                # 10-bit quantization).  This balances spatial
+                # selectivity against HTTP per-request overhead.
+                heuristic_num_chunks = np.ceil(num_faces / target_faces_per_lod0_chunk)
                 if heuristic_num_chunks == 1:
                     lod_0_box_size = distances_per_axis + 1
                 else:
@@ -261,6 +274,7 @@ def _mesh_intersects_roi(mesh_path, roi_begin, roi_end):
 def generate_all_neuroglancer_multires_meshes(
     output_path, num_workers, ids, lods, original_ext, file_sizes,
     lod_0_box_size=None, vertex_quantization_bits=16,
+    target_faces_per_lod0_chunk=DEFAULT_TARGET_FACES_PER_LOD0_CHUNK,
 ):
     """Generate Neuroglancer multiresolution meshes for all segments.
 
@@ -283,6 +297,8 @@ def generate_all_neuroglancer_multires_meshes(
         File sizes of LOD 0 meshes (used for work balancing).
     lod_0_box_size : ndarray of float or None
         Chunk box size for LOD 0. ``None`` for auto-computation.
+    target_faces_per_lod0_chunk : int
+        Forwarded to :func:`generate_neuroglancer_multires_mesh`.
     """
 
     def get_number_of_subtask_workers(file_sizes, num_workers):
@@ -293,7 +309,10 @@ def generate_all_neuroglancer_multires_meshes(
 
     num_subtask_workers = get_number_of_subtask_workers(file_sizes, num_workers)
     variable_args_list = []
-    fixed_args_list = [output_path, lods, original_ext, lod_0_box_size, vertex_quantization_bits]
+    fixed_args_list = [
+        output_path, lods, original_ext, lod_0_box_size,
+        vertex_quantization_bits, target_faces_per_lod0_chunk,
+    ]
     for idx, id in enumerate(ids):
         variable_args_list.append((id, num_subtask_workers[idx]))
     dask_util.compute_bag(
@@ -336,6 +355,7 @@ def run_multires(config_path, num_workers, roi=None):
     decimation_factor = optional_decimation_settings["decimation_factor"]
     aggressiveness = optional_decimation_settings["aggressiveness"]
     delete_decimated_meshes_flag = optional_decimation_settings["delete_decimated_meshes"]
+    target_faces_per_lod0_chunk = optional_decimation_settings["target_faces_per_lod0_chunk"]
 
     segment_properties_csv = optional_properties_settings["segment_properties_csv"]
     segment_properties_columns = optional_properties_settings["segment_properties_columns"]
@@ -416,6 +436,7 @@ def run_multires(config_path, num_workers, roi=None):
                         output_path, num_workers, mesh_ids, lods, mesh_ext,
                         np.array(file_sizes), lod_0_box_size,
                         vertex_quantization_bits=16,
+                        target_faces_per_lod0_chunk=target_faces_per_lod0_chunk,
                     )
 
             with Timing_Messager("Writing info and segment properties files", logger):

@@ -151,6 +151,22 @@ class TestOmeNgffCoordinates:
             f"voxel_size may not have been applied"
         )
 
+    def test_ome_ngff_v05_cube_bounds(self, zarr_cube_ome_ngff_v05, tmp_output_dir):
+        """Same as v0.4 test but with multiscales nested under ``ome`` (v0.5)."""
+        zarr_path, expected_min, expected_max, expected_center = zarr_cube_ome_ngff_v05
+        output_dir = os.path.join(tmp_output_dir, "ome_v05_cube")
+        _run_meshify(zarr_path, output_dir)
+
+        mesh = trimesh.load(os.path.join(output_dir, "meshes", "1.ply"))
+
+        voxel_size = 8.0
+        np.testing.assert_allclose(mesh.bounds[0], expected_min, atol=voxel_size,
+                                   err_msg="OME-NGFF v0.5 cube min bounds wrong")
+        np.testing.assert_allclose(mesh.bounds[1], expected_max, atol=voxel_size,
+                                   err_msg="OME-NGFF v0.5 cube max bounds wrong")
+        np.testing.assert_allclose(mesh.centroid, expected_center, atol=voxel_size,
+                                   err_msg="OME-NGFF v0.5 cube centroid wrong")
+
 
 class TestSphereGeometry:
     """Test that a sphere mesh has approximately correct volume and shape."""
