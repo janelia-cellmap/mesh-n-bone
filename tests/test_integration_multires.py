@@ -405,44 +405,61 @@ class TestLodTruncation:
         # LOD 1 has same face count as LOD 0, so it should be truncated
         assert num_lods == 1
 
-    def test_lods_capped_to_octree_unit_covering_mesh(self, multires_mesh_dir):
-        """Excess LODs are dropped when ``octree_unit`` already covers the mesh.
+    def test_listed_grid_stays_tight_with_many_lods(self, tmp_output_dir):
+        """Listed-fragment grid tracks union mesh extent, not ``octree_unit``.
 
-        With ``num_chunks_per_axis=[2,2,2]`` and the user requesting 4 LODs,
-        ``octree_unit`` would be 8 — listing 8x8x8=512 fragments at LOD 0
-        for a mesh that only occupies a 2x2x2 cube. NG's segment bounding
-        box would then span the full grid, so camera fly-to lands far
-        from the mesh. Cap LODs at the smallest count whose top-LOD
-        chunk already covers the mesh.
+        Regression for the empty-placeholder bloat: requesting more LODs
+        than the mesh strictly needs used to inflate
+        ``total_chunks_per_axis`` to ``2^(num_lods-1)``, listing
+        ``octree_unit^3`` LOD-0 placeholders per top-LOD parent (e.g. 512
+        for 4 LODs over a 2x2x2-chunk mesh). NG read those positions for
+        its segment bounding box, so camera fly-to landed far outside
+        the mesh. The fix lists only chunks that intersect the union of
+        per-LOD mesh footprints, so the listed grid stays close to the
+        mesh AABB regardless of LOD count.
         """
-        output_path = multires_mesh_dir
+        import pyfqmr
 
-        # Force num_chunks_per_axis = [2,2,2] via small box_size
-        # (mesh extent ~2.0 in each axis, box_size 1.0 → 2 chunks/axis).
-        # Request 4 LODs; expect cap at 2 (since log2(2) + 1 = 2).
+        output_path = os.path.join(tmp_output_dir, "many_lods_tight")
+        mesh_lods = os.path.join(output_path, "mesh_lods")
+        mesh = trimesh.creation.icosphere(subdivisions=4, radius=50.0)
+        mesh.vertices += 100  # offset to positive coords
+
+        for lod in range(4):
+            lod_dir = os.path.join(mesh_lods, f"s{lod}")
+            os.makedirs(lod_dir)
+            if lod == 0:
+                mesh.export(os.path.join(lod_dir, "1.ply"))
+            else:
+                simp = pyfqmr.Simplify()
+                simp.setMesh(mesh.vertices, mesh.faces)
+                target = max(len(mesh.faces) // (4 ** lod), 4)
+                simp.simplify_mesh(
+                    target_count=target, aggressiveness=7,
+                    preserve_border=False, verbose=False,
+                )
+                v, f, _ = simp.getMesh()
+                trimesh.Trimesh(v, f).export(os.path.join(lod_dir, "1.ply"))
+
+        # box_size of 50 → mesh extent (100) gives 2 LOD-0 chunks per axis.
+        # Request 4 LODs; with the old code this produced an 8x8x8 listed
+        # grid. Expect the listed grid to stay within ~2x mesh extent.
         generate_neuroglancer_multires_mesh(
             id=1,
             num_subtask_workers=1,
             output_path=output_path,
             lods=[0, 1, 2, 3],
             original_ext=".ply",
-            lod_0_box_size=np.array([1.0, 1.0, 1.0]),
+            lod_0_box_size=np.array([50.0, 50.0, 50.0]),
         )
 
         index_file = os.path.join(output_path, "multires", "1.index")
         with open(index_file, "rb") as f:
             data = f.read()
         chunk_shape = np.frombuffer(data, "<f", 3, 0).copy()
-        grid_origin = np.frombuffer(data, "<f", 3, 12).copy()
         num_lods = struct.unpack("<I", data[24:28])[0]
+        assert num_lods == 4, f"Expected all 4 LODs preserved, got {num_lods}"
 
-        # Expect the cap: max(num_chunks)=2 → log2(2)+1 = 2 LODs.
-        assert num_lods == 2, (
-            f"Expected 2 LODs after cap, got {num_lods}. "
-            "Excess LODs should be dropped to avoid bloated empty grids."
-        )
-
-        # And the LOD-0 listed-fragment grid should be tight around the mesh.
         off = 28 + 4 * num_lods + 12 * num_lods
         num_frags_per_lod = np.frombuffer(data, "<I", num_lods, off).copy()
         off += 4 * num_lods
@@ -454,11 +471,13 @@ class TestLodTruncation:
         verts, _ = mesh_loader(os.path.join(output_path, "mesh_lods", "s0", "1.ply"))
         mesh_extent = verts.max(axis=0) - verts.min(axis=0)
 
-        # Listed grid should be within 2x mesh extent (allows octree-unit
-        # rounding, but rejects the 8x bloat from the un-capped case).
+        # With the bloat bug, listed_extent would be ~8x mesh_extent.
+        # Union-bbox empty placeholders keep it within 2x.
         assert np.all(listed_extent <= 2.0 * mesh_extent + chunk_shape), (
             f"Listed-fragment extent {listed_extent} too large for mesh "
-            f"extent {mesh_extent} (chunk_shape {chunk_shape})."
+            f"extent {mesh_extent} (chunk_shape {chunk_shape}). "
+            "Empty-placeholder enumeration should be bounded by union "
+            "mesh extent, not octree_unit."
         )
 
     def test_three_lods_all_valid(self, tmp_output_dir):
@@ -508,17 +527,15 @@ class TestLodTruncation:
 class TestTargetFacesPerLod0Chunk:
     """``target_faces_per_lod0_chunk`` overrides the auto-sizing heuristic.
 
-    The default 25k-faces threshold collapses small meshes (under 25k
-    faces) to a single LOD-0 chunk and therefore a single LOD overall.
-    Lowering the threshold should force a multi-chunk grid and keep
-    additional LODs.
+    The default 25k-faces threshold puts small meshes in a single LOD-0
+    chunk; lowering the threshold forces a multi-chunk grid. Either way,
+    decimated LODs are preserved when their mesh files exist.
     """
 
-    def test_low_threshold_keeps_multiple_lods(self, multires_mesh_dir):
+    def test_low_threshold_produces_more_lod0_chunks(self, multires_mesh_dir):
         # ``multires_mesh_dir`` contains an icosphere (subdivisions=3,
         # 1280 faces at LOD 0) — well below 25k, so the default
-        # heuristic collapses it to 1 LOD even though both LOD files
-        # exist on disk.
+        # heuristic puts the whole mesh in 1 LOD-0 chunk.
         output_path = multires_mesh_dir
 
         generate_neuroglancer_multires_mesh(
@@ -529,11 +546,14 @@ class TestTargetFacesPerLod0Chunk:
             original_ext=".ply",
         )
         with open(os.path.join(output_path, "multires", "1.index"), "rb") as f:
-            default_num_lods = struct.unpack("<I", f.read()[24:28])[0]
-        assert default_num_lods == 1, (
-            f"Default 25k-face heuristic should collapse a 1280-face mesh "
-            f"to 1 LOD; got {default_num_lods}."
-        )
+            default_data = f.read()
+        default_num_lods = struct.unpack("<I", default_data[24:28])[0]
+        # LOD-0 chunk count under default heuristic: read num_fragments_per_lod
+        # entry for LOD 0.
+        default_off = 28 + 4 * default_num_lods + 12 * default_num_lods
+        default_num_frags_lod0 = struct.unpack(
+            "<I", default_data[default_off:default_off + 4],
+        )[0]
 
         # Force the heuristic to chunk by setting the per-chunk target
         # well below the LOD-0 face count.
@@ -546,10 +566,17 @@ class TestTargetFacesPerLod0Chunk:
             target_faces_per_lod0_chunk=100,
         )
         with open(os.path.join(output_path, "multires", "1.index"), "rb") as f:
-            tuned_num_lods = struct.unpack("<I", f.read()[24:28])[0]
-        assert tuned_num_lods > default_num_lods, (
-            "Lowering target_faces_per_lod0_chunk should produce more LODs"
-            f" than the default; got {tuned_num_lods} vs {default_num_lods}."
+            tuned_data = f.read()
+        tuned_num_lods = struct.unpack("<I", tuned_data[24:28])[0]
+        tuned_off = 28 + 4 * tuned_num_lods + 12 * tuned_num_lods
+        tuned_num_frags_lod0 = struct.unpack(
+            "<I", tuned_data[tuned_off:tuned_off + 4],
+        )[0]
+
+        assert tuned_num_frags_lod0 > default_num_frags_lod0, (
+            "Lowering target_faces_per_lod0_chunk should produce more "
+            f"LOD-0 fragments than the default; got {tuned_num_frags_lod0}"
+            f" vs {default_num_frags_lod0}."
         )
 
 
