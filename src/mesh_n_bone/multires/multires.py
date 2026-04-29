@@ -121,12 +121,18 @@ def generate_neuroglancer_multires_mesh(
             np.ceil(mesh_extent / lod_0_box_size).astype(int), 1
         )
 
-        # For meshes that fit in a single chunk, drop to 1 LOD.
-        # With 1 LOD the octree is just 1 cell, so grid_origin
-        # centers the mesh exactly and there are no internal chunk
-        # boundaries that would create LOD-transition seam artifacts.
-        if np.all(num_chunks_per_axis == 1) and len(lods) > 1:
-            lods = lods[:1]
+        # Cap len(lods) at the smallest count whose top-LOD chunk
+        # already covers the mesh. The octree top must satisfy
+        # ``2^(len(lods)-1) >= max(num_chunks_per_axis)``; going beyond
+        # that just doubles ``total_chunks_per_axis`` per extra LOD,
+        # which inflates the listed-fragment grid (every top-LOD parent
+        # demands all its LOD-0 children, even empty ones) and pushes
+        # NG's segment bounding box — and the camera fly-to that uses
+        # it — far away from the actual mesh.
+        max_chunks = int(num_chunks_per_axis.max())
+        max_useful_lods = int(np.ceil(np.log2(max_chunks))) + 1 if max_chunks > 1 else 1
+        if len(lods) > max_useful_lods:
+            lods = lods[:max_useful_lods]
 
         # Center the mesh within the full octree grid so that
         # Neuroglancer's bounding-box center matches the actual mesh
