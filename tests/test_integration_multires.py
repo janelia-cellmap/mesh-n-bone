@@ -405,6 +405,62 @@ class TestLodTruncation:
         # LOD 1 has same face count as LOD 0, so it should be truncated
         assert num_lods == 1
 
+    def test_lods_capped_to_octree_unit_covering_mesh(self, multires_mesh_dir):
+        """Excess LODs are dropped when ``octree_unit`` already covers the mesh.
+
+        With ``num_chunks_per_axis=[2,2,2]`` and the user requesting 4 LODs,
+        ``octree_unit`` would be 8 — listing 8x8x8=512 fragments at LOD 0
+        for a mesh that only occupies a 2x2x2 cube. NG's segment bounding
+        box would then span the full grid, so camera fly-to lands far
+        from the mesh. Cap LODs at the smallest count whose top-LOD
+        chunk already covers the mesh.
+        """
+        output_path = multires_mesh_dir
+
+        # Force num_chunks_per_axis = [2,2,2] via small box_size
+        # (mesh extent ~2.0 in each axis, box_size 1.0 → 2 chunks/axis).
+        # Request 4 LODs; expect cap at 2 (since log2(2) + 1 = 2).
+        generate_neuroglancer_multires_mesh(
+            id=1,
+            num_subtask_workers=1,
+            output_path=output_path,
+            lods=[0, 1, 2, 3],
+            original_ext=".ply",
+            lod_0_box_size=np.array([1.0, 1.0, 1.0]),
+        )
+
+        index_file = os.path.join(output_path, "multires", "1.index")
+        with open(index_file, "rb") as f:
+            data = f.read()
+        chunk_shape = np.frombuffer(data, "<f", 3, 0).copy()
+        grid_origin = np.frombuffer(data, "<f", 3, 12).copy()
+        num_lods = struct.unpack("<I", data[24:28])[0]
+
+        # Expect the cap: max(num_chunks)=2 → log2(2)+1 = 2 LODs.
+        assert num_lods == 2, (
+            f"Expected 2 LODs after cap, got {num_lods}. "
+            "Excess LODs should be dropped to avoid bloated empty grids."
+        )
+
+        # And the LOD-0 listed-fragment grid should be tight around the mesh.
+        off = 28 + 4 * num_lods + 12 * num_lods
+        num_frags_per_lod = np.frombuffer(data, "<I", num_lods, off).copy()
+        off += 4 * num_lods
+        nf = num_frags_per_lod[0]
+        positions = np.frombuffer(data, "<I", nf * 3, off).reshape(3, nf).T.copy()
+        listed_extent = (positions.max(axis=0) + 1 - positions.min(axis=0)) * chunk_shape
+
+        from mesh_n_bone.util.mesh_io import mesh_loader
+        verts, _ = mesh_loader(os.path.join(output_path, "mesh_lods", "s0", "1.ply"))
+        mesh_extent = verts.max(axis=0) - verts.min(axis=0)
+
+        # Listed grid should be within 2x mesh extent (allows octree-unit
+        # rounding, but rejects the 8x bloat from the un-capped case).
+        assert np.all(listed_extent <= 2.0 * mesh_extent + chunk_shape), (
+            f"Listed-fragment extent {listed_extent} too large for mesh "
+            f"extent {mesh_extent} (chunk_shape {chunk_shape})."
+        )
+
     def test_three_lods_all_valid(self, tmp_output_dir):
         """Three LODs with progressively fewer faces should all be included."""
         output_path = os.path.join(tmp_output_dir, "three_lods")
