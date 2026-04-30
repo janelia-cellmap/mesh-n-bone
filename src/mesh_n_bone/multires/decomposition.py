@@ -211,6 +211,24 @@ def generate_mesh_decomposition(
                 local_vertices = fragment.vertices.astype(np.float64) - quantization_origin
                 local_vertices = np.clip(local_vertices, 0.0, current_box_size)
 
+                # Snap vertices that fall within half a quantization
+                # step of a chunk boundary to the boundary itself. The
+                # slicer may emit boundary vertices a hair off the
+                # plane in float64; without this snap the same
+                # conceptual vertex in two adjacent chunks can round
+                # to two different lattice positions, decoding to two
+                # slightly-different world coords and creating a
+                # visible sub-pixel seam at every chunk boundary.
+                half_step = current_box_size / max_q / 2.0
+                local_vertices = np.where(
+                    local_vertices < half_step, 0.0, local_vertices,
+                )
+                local_vertices = np.where(
+                    local_vertices > current_box_size - half_step,
+                    current_box_size,
+                    local_vertices,
+                )
+
                 # Compute integer quantized positions per axis
                 int_positions = np.round(
                     local_vertices * (max_q / current_box_size)
