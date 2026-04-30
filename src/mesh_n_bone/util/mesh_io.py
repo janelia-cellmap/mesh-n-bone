@@ -167,23 +167,25 @@ def zorder_fragments(fragments):
     return list(fragments)
 
 
-def rewrite_index_with_empty_fragments(path, current_lod_fragments):
+def rewrite_index_with_empty_fragments(
+    path, current_lod_fragments,
+    union_lod0_min=None, union_lod0_max=None,
+):
     """Rewrite an existing index file, inserting empty fragments for completeness.
 
     For Neuroglancer to switch cleanly between LODs without rendering
     multiple scales over the same world region, every LOD must have a
     fragment (possibly empty) at every chunk that intersects the
-    *union* of mesh footprints across LODs. This function rewrites the
-    index so each LOD lists exactly that envelope of chunks: the
-    non-empty fragments produced by decomposition, plus zero-length
-    placeholders for cells inside the union bbox that the current LOD
-    didn't write data for.
+    *union of every LOD's vertex bbox* (a face-correct footprint:
+    triangles can span multiple chunks even when their vertices live
+    in only one). This function rewrites the index so each LOD lists
+    exactly that envelope of chunks: the non-empty fragments produced
+    by decomposition, plus zero-length placeholders for cells inside
+    the union bbox that the current LOD didn't write data for.
 
     Compared to the older "every top-LOD parent enumerates all
     octree-unit^3 LOD-0 children" rule, this scales with the actual
-    mesh extent rather than ``octree_unit^3``, which keeps the listed
-    grid (and therefore NG's segment bounding box) tight when the
-    requested LOD count is larger than the mesh strictly needs.
+    mesh extent rather than ``octree_unit^3``.
 
     Parameters
     ----------
@@ -192,6 +194,14 @@ def rewrite_index_with_empty_fragments(path, current_lod_fragments):
         expected at ``path + ".index"``.
     current_lod_fragments : list[CompressedFragment]
         Newly created fragments for the next LOD level to be appended.
+    union_lod0_min, union_lod0_max : numpy.ndarray, optional
+        Inclusive-min / exclusive-max LOD-0 chunk indices defining the
+        envelope of chunks that may need fragments at any LOD. When
+        provided this is the union of every LOD's vertex bbox (so
+        decimated LODs whose vertices drift outside LOD 0's footprint
+        are still covered). When omitted, falls back to the LOD-0
+        fragment positions only — correct when no LOD drifts outside
+        LOD 0's bbox, but undercounts otherwise.
     """
 
     with open(f"{path}.index", mode="rb") as file:
@@ -232,25 +242,20 @@ def rewrite_index_with_empty_fragments(path, current_lod_fragments):
         [fragment.offset for fragment in current_lod_fragments]
     )
 
-    # Compute the mesh footprint in LOD-0 chunk units from the LOD-0
-    # fragment positions only. LOD 0 has the finest cells, so its
-    # non-empty positions tightly bound the actual mesh extent.
-    # Higher-LOD chunks have ``2^l``-times-larger world bbox, so
-    # using their positions would inflate the union back to the
-    # ``octree_unit^3`` bloat we're trying to avoid.
-    #
-    # Higher-LOD non-empty fragments whose chunk positions happen to
-    # fall outside this LOD-0 footprint (e.g. when pyfqmr vertex
-    # movement on a decimated LOD slightly extends beyond LOD 0)
-    # are still listed via ``existing`` below — they just won't
-    # contribute to ``required`` empty placeholders.
-    lod0_positions = np.asarray(all_current_fragment_positions[0]).reshape(-1, 3)
-    if lod0_positions.size > 0:
-        union_lod0_min = lod0_positions.min(axis=0).astype(int)
-        union_lod0_max = (lod0_positions.max(axis=0) + 1).astype(int)
+    # Use the caller-provided union bbox (face-correct: covers every
+    # LOD's vertex extent) if given. Otherwise fall back to LOD-0
+    # fragment positions only — correct when no LOD drifts beyond
+    # LOD 0, but undercounts when a decimated LOD has faces in chunks
+    # LOD 0 didn't reach. Vertex AABB == triangle AABB, so unioning
+    # vertex bboxes is the same as unioning face bboxes.
+    if union_lod0_min is None or union_lod0_max is None:
+        lod0_positions = np.asarray(all_current_fragment_positions[0]).reshape(-1, 3)
+        if lod0_positions.size > 0:
+            union_lod0_min = lod0_positions.min(axis=0).astype(int)
+            union_lod0_max = (lod0_positions.max(axis=0) + 1).astype(int)
     else:
-        union_lod0_min = None
-        union_lod0_max = None
+        union_lod0_min = np.asarray(union_lod0_min, dtype=int)
+        union_lod0_max = np.asarray(union_lod0_max, dtype=int)
 
     all_missing_fragment_positions = []
     for lod in range(num_lods):
@@ -318,7 +323,10 @@ def rewrite_index_with_empty_fragments(path, current_lod_fragments):
     os.system(f"mv {path}.index_with_empty_fragments {path}.index")
 
 
-def write_index_file(path, grid_origin, fragments, current_lod, lods, chunk_shape):
+def write_index_file(
+    path, grid_origin, fragments, current_lod, lods, chunk_shape,
+    union_lod0_min=None, union_lod0_max=None,
+):
     """Write or update the ``.index`` file for a multi-LOD Draco mesh.
 
     If this is the first LOD or no index file exists yet, a new file is
@@ -339,6 +347,8 @@ def write_index_file(path, grid_origin, fragments, current_lod, lods, chunk_shap
         All LOD levels that have been (or will be) generated.
     chunk_shape : numpy.ndarray
         Size of a single LOD 0 chunk in model coordinates, shape ``(3,)``.
+    union_lod0_min, union_lod0_max : numpy.ndarray, optional
+        Forwarded to ``rewrite_index_with_empty_fragments`` (see there).
     """
     lods = [lod for lod in lods if lod <= current_lod]
 
@@ -365,7 +375,10 @@ def write_index_file(path, grid_origin, fragments, current_lod, lods, chunk_shap
                 .tobytes(order="C")
             )
     else:
-        rewrite_index_with_empty_fragments(path, fragments)
+        rewrite_index_with_empty_fragments(
+            path, fragments,
+            union_lod0_min=union_lod0_min, union_lod0_max=union_lod0_max,
+        )
 
 
 def write_mesh_file(path, fragments):
@@ -396,7 +409,8 @@ def write_mesh_file(path, fragments):
 
 
 def write_mesh_files(
-    mesh_directory, object_id, grid_origin, fragments, current_lod, lods, chunk_shape
+    mesh_directory, object_id, grid_origin, fragments, current_lod, lods, chunk_shape,
+    union_lod0_min=None, union_lod0_max=None,
 ):
     """Write the mesh data and index files for a single segment.
 
@@ -419,9 +433,18 @@ def write_mesh_files(
         All LOD levels that have been (or will be) generated.
     chunk_shape : numpy.ndarray
         Size of a single LOD 0 chunk in model coordinates, shape ``(3,)``.
+    union_lod0_min, union_lod0_max : numpy.ndarray, optional
+        Inclusive-min / exclusive-max bounds (in LOD-0 chunk index units)
+        of the union of every LOD's vertex bbox. Used by
+        ``rewrite_index_with_empty_fragments`` to enumerate empty
+        placeholders covering the actual face footprint of every LOD.
+        If omitted, falls back to the LOD-0 fragment positions only.
     """
     path = mesh_directory + "/" + object_id
     if len(fragments) > 0:
         fragments = zorder_fragments(fragments)
         fragments = write_mesh_file(path, fragments)
-        write_index_file(path, grid_origin, fragments, current_lod, lods, chunk_shape)
+        write_index_file(
+            path, grid_origin, fragments, current_lod, lods, chunk_shape,
+            union_lod0_min=union_lod0_min, union_lod0_max=union_lod0_max,
+        )
