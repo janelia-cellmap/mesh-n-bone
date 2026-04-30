@@ -167,14 +167,25 @@ def zorder_fragments(fragments):
     return list(fragments)
 
 
-def rewrite_index_with_empty_fragments(path, current_lod_fragments):
+def rewrite_index_with_empty_fragments(
+    path, current_lod_fragments,
+    union_lod0_min=None, union_lod0_max=None,
+):
     """Rewrite an existing index file, inserting empty fragments for completeness.
 
-    Neuroglancer requires that every parent fragment at a coarser LOD has all
-    of its child fragments present (even if empty) so that LOD transitions
-    work correctly. This function reads the current ``.index`` file, computes
-    which child fragments are missing, inserts zero-length placeholders, and
-    writes the updated index back.
+    For Neuroglancer to switch cleanly between LODs without rendering
+    multiple scales over the same world region, every LOD must have a
+    fragment (possibly empty) at every chunk that intersects the
+    *union of every LOD's vertex bbox* (a face-correct footprint:
+    triangles can span multiple chunks even when their vertices live
+    in only one). This function rewrites the index so each LOD lists
+    exactly that envelope of chunks: the non-empty fragments produced
+    by decomposition, plus zero-length placeholders for cells inside
+    the union bbox that the current LOD didn't write data for.
+
+    Compared to the older "every top-LOD parent enumerates all
+    octree-unit^3 LOD-0 children" rule, this scales with the actual
+    mesh extent rather than ``octree_unit^3``.
 
     Parameters
     ----------
@@ -183,6 +194,14 @@ def rewrite_index_with_empty_fragments(path, current_lod_fragments):
         expected at ``path + ".index"``.
     current_lod_fragments : list[CompressedFragment]
         Newly created fragments for the next LOD level to be appended.
+    union_lod0_min, union_lod0_max : numpy.ndarray, optional
+        Inclusive-min / exclusive-max LOD-0 chunk indices defining the
+        envelope of chunks that may need fragments at any LOD. When
+        provided this is the union of every LOD's vertex bbox (so
+        decimated LODs whose vertices drift outside LOD 0's footprint
+        are still covered). When omitted, falls back to the LOD-0
+        fragment positions only — correct when no LOD drifts outside
+        LOD 0's bbox, but undercounts otherwise.
     """
 
     with open(f"{path}.index", mode="rb") as file:
@@ -223,37 +242,37 @@ def rewrite_index_with_empty_fragments(path, current_lod_fragments):
         [fragment.offset for fragment in current_lod_fragments]
     )
 
+    # Use the caller-provided union bbox (face-correct: covers every
+    # LOD's vertex extent) if given. Otherwise fall back to LOD-0
+    # fragment positions only — correct when no LOD drifts beyond
+    # LOD 0, but undercounts when a decimated LOD has faces in chunks
+    # LOD 0 didn't reach. Vertex AABB == triangle AABB, so unioning
+    # vertex bboxes is the same as unioning face bboxes.
+    if union_lod0_min is None or union_lod0_max is None:
+        lod0_positions = np.asarray(all_current_fragment_positions[0]).reshape(-1, 3)
+        if lod0_positions.size > 0:
+            union_lod0_min = lod0_positions.min(axis=0).astype(int)
+            union_lod0_max = (lod0_positions.max(axis=0) + 1).astype(int)
+    else:
+        union_lod0_min = np.asarray(union_lod0_min, dtype=int)
+        union_lod0_max = np.asarray(union_lod0_max, dtype=int)
+
     all_missing_fragment_positions = []
     for lod in range(num_lods):
-        all_required_fragment_positions = set()
-
-        if lod == current_lod:
-            for lower_lod in range(lod):
-                all_required_fragment_positions_np = np.unique(
-                    all_current_fragment_positions[lower_lod] // 2 ** (lod - lower_lod),
-                    axis=0,
-                ).astype(int)
-                all_required_fragment_positions.update(
-                    set(map(tuple, all_required_fragment_positions_np))
-                )
+        scale = 2 ** lod
+        if union_lod0_min is None:
+            required = set()
         else:
-            # For each new LOD fragment at position p, ALL children at
-            # LOD `lod` must exist (even if empty) so neuroglancer can
-            # properly replace the parent with its children.  Enumerate
-            # every child position from p*scale to (p+1)*scale - 1.
-            for fragment in current_lod_fragments:
-                scale = 2 ** (current_lod - lod)
-                base = (np.asarray(fragment.position) * scale).astype(int)
-                for dx in range(scale):
-                    for dy in range(scale):
-                        for dz in range(scale):
-                            all_required_fragment_positions.add(
-                                (base[0] + dx, base[1] + dy, base[2] + dz)
-                            )
-        current_missing_fragment_positions = all_required_fragment_positions - set(
-            map(tuple, all_current_fragment_positions[lod])
-        )
-        all_missing_fragment_positions.append(current_missing_fragment_positions)
+            lo = (union_lod0_min // scale).astype(int)
+            hi = ((union_lod0_max + scale - 1) // scale).astype(int)
+            required = {
+                (x, y, z)
+                for x in range(lo[0], hi[0])
+                for y in range(lo[1], hi[1])
+                for z in range(lo[2], hi[2])
+            }
+        existing = set(map(tuple, all_current_fragment_positions[lod]))
+        all_missing_fragment_positions.append(required - existing)
 
     num_fragments_per_lod = []
     all_fragment_positions = []
@@ -304,7 +323,10 @@ def rewrite_index_with_empty_fragments(path, current_lod_fragments):
     os.system(f"mv {path}.index_with_empty_fragments {path}.index")
 
 
-def write_index_file(path, grid_origin, fragments, current_lod, lods, chunk_shape):
+def write_index_file(
+    path, grid_origin, fragments, current_lod, lods, chunk_shape,
+    union_lod0_min=None, union_lod0_max=None,
+):
     """Write or update the ``.index`` file for a multi-LOD Draco mesh.
 
     If this is the first LOD or no index file exists yet, a new file is
@@ -325,6 +347,8 @@ def write_index_file(path, grid_origin, fragments, current_lod, lods, chunk_shap
         All LOD levels that have been (or will be) generated.
     chunk_shape : numpy.ndarray
         Size of a single LOD 0 chunk in model coordinates, shape ``(3,)``.
+    union_lod0_min, union_lod0_max : numpy.ndarray, optional
+        Forwarded to ``rewrite_index_with_empty_fragments`` (see there).
     """
     lods = [lod for lod in lods if lod <= current_lod]
 
@@ -351,7 +375,10 @@ def write_index_file(path, grid_origin, fragments, current_lod, lods, chunk_shap
                 .tobytes(order="C")
             )
     else:
-        rewrite_index_with_empty_fragments(path, fragments)
+        rewrite_index_with_empty_fragments(
+            path, fragments,
+            union_lod0_min=union_lod0_min, union_lod0_max=union_lod0_max,
+        )
 
 
 def write_mesh_file(path, fragments):
@@ -382,7 +409,8 @@ def write_mesh_file(path, fragments):
 
 
 def write_mesh_files(
-    mesh_directory, object_id, grid_origin, fragments, current_lod, lods, chunk_shape
+    mesh_directory, object_id, grid_origin, fragments, current_lod, lods, chunk_shape,
+    union_lod0_min=None, union_lod0_max=None,
 ):
     """Write the mesh data and index files for a single segment.
 
@@ -405,9 +433,18 @@ def write_mesh_files(
         All LOD levels that have been (or will be) generated.
     chunk_shape : numpy.ndarray
         Size of a single LOD 0 chunk in model coordinates, shape ``(3,)``.
+    union_lod0_min, union_lod0_max : numpy.ndarray, optional
+        Inclusive-min / exclusive-max bounds (in LOD-0 chunk index units)
+        of the union of every LOD's vertex bbox. Used by
+        ``rewrite_index_with_empty_fragments`` to enumerate empty
+        placeholders covering the actual face footprint of every LOD.
+        If omitted, falls back to the LOD-0 fragment positions only.
     """
     path = mesh_directory + "/" + object_id
     if len(fragments) > 0:
         fragments = zorder_fragments(fragments)
         fragments = write_mesh_file(path, fragments)
-        write_index_file(path, grid_origin, fragments, current_lod, lods, chunk_shape)
+        write_index_file(
+            path, grid_origin, fragments, current_lod, lods, chunk_shape,
+            union_lod0_min=union_lod0_min, union_lod0_max=union_lod0_max,
+        )

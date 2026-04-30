@@ -68,6 +68,15 @@ def generate_neuroglancer_multires_mesh(
 
         vertex_min = None
         vertex_max = None
+        # Union of vertex bboxes across ALL valid LODs. The grid below
+        # is sized from LOD 0's bbox (the canonical extent), but
+        # decimated LODs can drift slightly outside it; the empty-
+        # placeholder logic needs to cover the full union so NG always
+        # has a finer-LOD fragment under any region a coarser LOD has
+        # geometry in (otherwise zoom-in transitions show two scales
+        # at once on the regions LOD 0 doesn't cover but LOD 1+ does).
+        union_vertex_min = None
+        union_vertex_max = None
         previous_num_faces = np.inf
         for idx, current_lod in enumerate(lods):
             if current_lod == 0:
@@ -82,11 +91,21 @@ def generate_neuroglancer_multires_mesh(
             num_faces = len(faces)
             if num_faces >= previous_num_faces:
                 break
-            # Use s0 bounds only for grid computation — decimated LODs
-            # can expand beyond s0 due to pyfqmr vertex movement.
+            # LOD-0 bounds drive the chunk grid; union bounds drive
+            # the empty-placeholder envelope (which must cover every
+            # LOD's actual face footprint, not just LOD 0's).
             if current_lod == 0 and vertices is not None:
                 vertex_min = vertices.min(axis=0)
                 vertex_max = vertices.max(axis=0)
+            if vertices is not None and len(vertices) > 0:
+                lod_vmin = vertices.min(axis=0)
+                lod_vmax = vertices.max(axis=0)
+                if union_vertex_min is None:
+                    union_vertex_min = lod_vmin.copy()
+                    union_vertex_max = lod_vmax.copy()
+                else:
+                    union_vertex_min = np.minimum(union_vertex_min, lod_vmin)
+                    union_vertex_max = np.maximum(union_vertex_max, lod_vmax)
 
             if lod_0_box_size is None and current_lod == 0:
                 distances_per_axis = np.ceil(
@@ -121,12 +140,11 @@ def generate_neuroglancer_multires_mesh(
             np.ceil(mesh_extent / lod_0_box_size).astype(int), 1
         )
 
-        # For meshes that fit in a single chunk, drop to 1 LOD.
-        # With 1 LOD the octree is just 1 cell, so grid_origin
-        # centers the mesh exactly and there are no internal chunk
-        # boundaries that would create LOD-transition seam artifacts.
-        if np.all(num_chunks_per_axis == 1) and len(lods) > 1:
-            lods = lods[:1]
+        # No LOD-count truncation here. The union-bbox empty-placeholder
+        # logic in ``rewrite_index_with_empty_fragments`` keeps the
+        # listed-fragment grid tight regardless of LOD count, and a
+        # single-LOD-0-chunk mesh still benefits from extra decimation
+        # passes when the user is zoomed far out.
 
         # Center the mesh within the full octree grid so that
         # Neuroglancer's bounding-box center matches the actual mesh
@@ -143,6 +161,20 @@ def generate_neuroglancer_multires_mesh(
             grid_origin,
             np.ceil(vertex_max - full_grid_extent),
             np.floor(vertex_min),
+        )
+
+        # Convert union-of-LOD-vertex bbox to LOD-0 chunk units. This is
+        # the face-correct footprint we list at every LOD: a chunk with
+        # any face in any LOD must have a fragment (possibly empty) at
+        # every other LOD whose chunk contains it, so cross-LOD zoom
+        # transitions don't show two scales side by side.
+        union_lod0_min = np.maximum(
+            np.floor((union_vertex_min - grid_origin) / lod_0_box_size).astype(int),
+            0,
+        )
+        union_lod0_max = np.maximum(
+            np.ceil((union_vertex_max - grid_origin) / lod_0_box_size).astype(int),
+            union_lod0_min + 1,
         )
 
         results = []
@@ -240,6 +272,8 @@ def generate_neuroglancer_multires_mesh(
                     current_lod,
                     lods[: idx + 1],
                     np.asarray(lod_0_box_size, dtype=float),
+                    union_lod0_min=union_lod0_min,
+                    union_lod0_max=union_lod0_max,
                 )
 
                 del fragments
