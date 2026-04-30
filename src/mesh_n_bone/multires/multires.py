@@ -111,21 +111,23 @@ def generate_neuroglancer_multires_mesh(
                 distances_per_axis = np.ceil(
                     vertices.max(axis=0) - vertices.min(axis=0)
                 )
-                # Target ``target_faces_per_lod0_chunk`` faces per LOD-0
-                # fragment (default 25k ≈ 30 KB Draco-compressed at
-                # 10-bit quantization).  This balances spatial
-                # selectivity against HTTP per-request overhead.
+                # Surface-area scaling: triangles distribute across the
+                # mesh's 2-D surface, so total chunks ∝ N²-on-axis. Use
+                # sqrt for the per-axis count.
                 heuristic_num_chunks = np.ceil(num_faces / target_faces_per_lod0_chunk)
-                if heuristic_num_chunks == 1:
-                    lod_0_box_size = distances_per_axis + 1
-                else:
-                    lod_0_box_size = (
-                        np.ceil(
-                            distances_per_axis
-                            / np.ceil(heuristic_num_chunks ** (1 / 2))
-                        )
-                        + 1
-                    )
+                num_chunks_per_axis = max(
+                    1, int(np.ceil(np.sqrt(heuristic_num_chunks)))
+                )
+                # Cap so each top-LOD chunk fits within the mesh extent
+                # along every axis. Otherwise NG's per-chunk LOD-select
+                # gate doesn't fire for the oversized root chunk and
+                # the coarsest LOD stays painted persistently. The
+                # constraint is num_chunks_per_axis >= octree_unit.
+                octree_unit = 2 ** (len(lods) - 1)
+                num_chunks_per_axis = max(num_chunks_per_axis, octree_unit)
+                lod_0_box_size = (
+                    np.ceil(distances_per_axis / num_chunks_per_axis) + 1
+                )
 
             previous_num_faces = num_faces
         else:

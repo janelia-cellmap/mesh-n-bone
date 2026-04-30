@@ -173,26 +173,16 @@ def rewrite_index_with_empty_fragments(
 ):
     """Append a new LOD's fragments to an existing index file.
 
-    Lists only the non-empty fragments at each LOD — does NOT emit
-    empty placeholders. The earlier "every top-LOD parent enumerates
-    all octree-unit^3 LOD-0 children" / "fill the union bbox with
-    placeholders" rules made NG's per-chunk LOD selector see "this
-    fine-LOD child is empty" and render *nothing* at any LOD-K-1
-    sub-cell where LOD K-1 lacked data — even when the LOD-K parent
-    above had geometry covering that sub-cell. Decimation freely
-    moves vertices, so it's normal for a decimated LOD-K parent to
-    cover sub-cells that the unconstrained-source LOD-K-1 doesn't
-    reach. The empty-placeholder approach turned that mismatch into
-    visible holes at intermediate zoom.
+    For every LOD this writes the existing non-empty fragments plus
+    empty (offset=0) placeholders covering the *union* of every LOD's
+    vertex bbox in LOD-0 chunk units. Empty placeholders signal to
+    NG's per-chunk LOD selector that the corresponding sub-chunk is
+    genuinely empty (not just unloaded), so NG can replace the parent
+    LOD with finer LODs over those regions cleanly.
 
-    Without empty placeholders, NG's behavior for unlisted child
-    positions is to fall back to the parent LOD — which produces a
-    bit of LOD overlap at transition zones but no missing geometry.
-    For most viewing that's the better tradeoff; the only true fix
-    for both gap and overlap is to constrain decimation so each
-    LOD's coverage is a strict subset of its parent's (per-chunk
-    decimation with boundary-vertex pinning, or re-meshing per LOD
-    from a downsampled segmentation).
+    Vertex AABB == triangle AABB for triangular faces, so unioning
+    vertex bboxes is face-correct: a triangle that spans multiple
+    chunks is still bounded by its three vertices' AABB.
 
     Parameters
     ----------
@@ -202,12 +192,10 @@ def rewrite_index_with_empty_fragments(
     current_lod_fragments : list[CompressedFragment]
         Newly created fragments for the next LOD level to be appended.
     union_lod0_min, union_lod0_max : numpy.ndarray, optional
-        Accepted for backward compatibility but no longer used:
-        empty placeholders aren't emitted, so a placeholder envelope
-        isn't needed. Kept in the signature so callers and tests that
-        pass these values continue to work.
+        Inclusive-min / exclusive-max LOD-0 chunk indices defining the
+        envelope of chunks to enumerate empty placeholders for. When
+        omitted, falls back to the LOD-0 fragment positions only.
     """
-    del union_lod0_min, union_lod0_max  # no longer needed; see docstring
 
     with open(f"{path}.index", mode="rb") as file:
         file_content = file.read()
@@ -247,11 +235,33 @@ def rewrite_index_with_empty_fragments(
         [fragment.offset for fragment in current_lod_fragments]
     )
 
-    # No empty placeholders — list only the non-empty fragments at
-    # each LOD. See the docstring for why: NG renders nothing at
-    # listed-empty positions, which produces holes wherever a LOD
-    # K-1 sub-cell is empty under a LOD K parent that has data.
-    all_missing_fragment_positions = [set() for _ in range(num_lods)]
+    # Use caller-provided union bbox if given, else fall back to the
+    # LOD-0 fragment positions only.
+    if union_lod0_min is None or union_lod0_max is None:
+        lod0_positions = np.asarray(all_current_fragment_positions[0]).reshape(-1, 3)
+        if lod0_positions.size > 0:
+            union_lod0_min = lod0_positions.min(axis=0).astype(int)
+            union_lod0_max = (lod0_positions.max(axis=0) + 1).astype(int)
+    else:
+        union_lod0_min = np.asarray(union_lod0_min, dtype=int)
+        union_lod0_max = np.asarray(union_lod0_max, dtype=int)
+
+    all_missing_fragment_positions = []
+    for lod in range(num_lods):
+        scale = 2 ** lod
+        if union_lod0_min is None:
+            required = set()
+        else:
+            lo = (union_lod0_min // scale).astype(int)
+            hi = ((union_lod0_max + scale - 1) // scale).astype(int)
+            required = {
+                (x, y, z)
+                for x in range(lo[0], hi[0])
+                for y in range(lo[1], hi[1])
+                for z in range(lo[2], hi[2])
+            }
+        existing = set(map(tuple, all_current_fragment_positions[lod]))
+        all_missing_fragment_positions.append(required - existing)
 
     num_fragments_per_lod = []
     all_fragment_positions = []
