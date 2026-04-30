@@ -93,7 +93,9 @@ def split_dataset_path(dataset_path):
     splitter = (
         ".zarr" if dataset_path.rfind(".zarr") > dataset_path.rfind(".n5") else ".n5"
     )
-    parts = dataset_path.split(splitter)
+    # Split on the LAST occurrence so nested containers like
+    # ``outer.zarr/inner.zarr/s0`` resolve to ``inner.zarr`` + ``s0``.
+    parts = dataset_path.rsplit(splitter, 1)
     container = parts[0] + splitter
     dataset_name = parts[1].lstrip("/") if len(parts) > 1 else ""
     return container, dataset_name
