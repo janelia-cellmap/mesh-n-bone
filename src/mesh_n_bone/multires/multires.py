@@ -107,26 +107,14 @@ def generate_neuroglancer_multires_mesh(
                     union_vertex_min = np.minimum(union_vertex_min, lod_vmin)
                     union_vertex_max = np.maximum(union_vertex_max, lod_vmax)
 
-            if lod_0_box_size is None and current_lod == 0:
-                distances_per_axis = np.ceil(
+            # Capture LOD-0 face count for the chunk-shape heuristic
+            # below. We compute lod_0_box_size AFTER the loop so the
+            # octree_unit cap uses the effective num_lods (after any
+            # face-count truncation), not the requested num_lods.
+            if current_lod == 0:
+                lod0_num_faces = num_faces
+                lod0_distances_per_axis = np.ceil(
                     vertices.max(axis=0) - vertices.min(axis=0)
-                )
-                # Surface-area scaling: triangles distribute across the
-                # mesh's 2-D surface, so total chunks ∝ N²-on-axis. Use
-                # sqrt for the per-axis count.
-                heuristic_num_chunks = np.ceil(num_faces / target_faces_per_lod0_chunk)
-                num_chunks_per_axis = max(
-                    1, int(np.ceil(np.sqrt(heuristic_num_chunks)))
-                )
-                # Cap so each top-LOD chunk fits within the mesh extent
-                # along every axis. Otherwise NG's per-chunk LOD-select
-                # gate doesn't fire for the oversized root chunk and
-                # the coarsest LOD stays painted persistently. The
-                # constraint is num_chunks_per_axis >= octree_unit.
-                octree_unit = 2 ** (len(lods) - 1)
-                num_chunks_per_axis = max(num_chunks_per_axis, octree_unit)
-                lod_0_box_size = (
-                    np.ceil(distances_per_axis / num_chunks_per_axis) + 1
                 )
 
             previous_num_faces = num_faces
@@ -135,6 +123,30 @@ def generate_neuroglancer_multires_mesh(
             idx += 1
 
         lods = lods[:idx]
+
+        if lod_0_box_size is None:
+            # Surface-area scaling: triangles distribute across the
+            # mesh's 2-D surface, so total chunks ∝ N²-on-axis. Use
+            # sqrt for the per-axis count.
+            heuristic_num_chunks = np.ceil(
+                lod0_num_faces / target_faces_per_lod0_chunk
+            )
+            num_chunks_per_axis = max(
+                1, int(np.ceil(np.sqrt(heuristic_num_chunks)))
+            )
+            # Cap so each top-LOD chunk fits within the mesh extent
+            # along every axis. Otherwise NG's per-chunk LOD-select
+            # gate doesn't fire for the oversized root chunk and the
+            # coarsest LOD stays painted persistently. The constraint
+            # is num_chunks_per_axis >= octree_unit, using the
+            # effective num_lods after truncation (uses requested
+            # num_lods would inflate chunk count for meshes whose
+            # face-count monotonicity check truncates LODs).
+            octree_unit = 2 ** (len(lods) - 1)
+            num_chunks_per_axis = max(num_chunks_per_axis, octree_unit)
+            lod_0_box_size = (
+                np.ceil(lod0_distances_per_axis / num_chunks_per_axis) + 1
+            )
 
         # Compute the LOD 0 chunk grid from the s0 mesh extent.
         mesh_extent = vertex_max - vertex_min
