@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 
 
 DEFAULT_TARGET_FACES_PER_LOD0_CHUNK = 25_000
+MAX_AUTO_LOD_GRID_PADDING_RATIO = 2.0
 
 
 def generate_neuroglancer_multires_mesh(
@@ -53,9 +54,9 @@ def generate_neuroglancer_multires_mesh(
         Target face count per LOD-0 fragment used by the
         auto-sizing heuristic. Lower values produce more, smaller
         chunks (and force multi-LOD output for smaller meshes);
-        higher values keep small meshes in a single fragment so
-        they collapse to 1 LOD. Ignored when *lod_0_box_size* is
-        passed explicitly.
+        higher values keep small meshes in fewer fragments and may
+        reduce the effective LOD count to avoid an over-padded
+        octree. Ignored when *lod_0_box_size* is passed explicitly.
     """
     with ExitStack() as stack:
         if num_subtask_workers > 1:
@@ -68,15 +69,8 @@ def generate_neuroglancer_multires_mesh(
 
         vertex_min = None
         vertex_max = None
-        # Union of vertex bboxes across ALL valid LODs. The grid below
-        # is sized from LOD 0's bbox (the canonical extent), but
-        # decimated LODs can drift slightly outside it; the empty-
-        # placeholder logic needs to cover the full union so NG always
-        # has a finer-LOD fragment under any region a coarser LOD has
-        # geometry in (otherwise zoom-in transitions show two scales
-        # at once on the regions LOD 0 doesn't cover but LOD 1+ does).
-        union_vertex_min = None
-        union_vertex_max = None
+        lod_vertex_mins = []
+        lod_vertex_maxs = []
         previous_num_faces = np.inf
         for idx, current_lod in enumerate(lods):
             if current_lod == 0:
@@ -100,12 +94,8 @@ def generate_neuroglancer_multires_mesh(
             if vertices is not None and len(vertices) > 0:
                 lod_vmin = vertices.min(axis=0)
                 lod_vmax = vertices.max(axis=0)
-                if union_vertex_min is None:
-                    union_vertex_min = lod_vmin.copy()
-                    union_vertex_max = lod_vmax.copy()
-                else:
-                    union_vertex_min = np.minimum(union_vertex_min, lod_vmin)
-                    union_vertex_max = np.maximum(union_vertex_max, lod_vmax)
+                lod_vertex_mins.append(lod_vmin)
+                lod_vertex_maxs.append(lod_vmax)
 
             # Capture LOD-0 face count for the chunk-shape heuristic
             # below. We compute lod_0_box_size AFTER the loop so the
@@ -124,6 +114,7 @@ def generate_neuroglancer_multires_mesh(
 
         lods = lods[:idx]
 
+        auto_lod_0_box_size = lod_0_box_size is None
         if lod_0_box_size is None:
             # Surface-area scaling: triangles distribute across the
             # mesh's 2-D surface, so total chunks ∝ N²-on-axis. Use
@@ -134,16 +125,6 @@ def generate_neuroglancer_multires_mesh(
             num_chunks_per_axis = max(
                 1, int(np.ceil(np.sqrt(heuristic_num_chunks)))
             )
-            # Cap so each top-LOD chunk fits within the mesh extent
-            # along every axis. Otherwise NG's per-chunk LOD-select
-            # gate doesn't fire for the oversized root chunk and the
-            # coarsest LOD stays painted persistently. The constraint
-            # is num_chunks_per_axis >= octree_unit, using the
-            # effective num_lods after truncation (uses requested
-            # num_lods would inflate chunk count for meshes whose
-            # face-count monotonicity check truncates LODs).
-            octree_unit = 2 ** (len(lods) - 1)
-            num_chunks_per_axis = max(num_chunks_per_axis, octree_unit)
             lod_0_box_size = (
                 np.ceil(lod0_distances_per_axis / num_chunks_per_axis) + 1
             )
@@ -154,11 +135,45 @@ def generate_neuroglancer_multires_mesh(
             np.ceil(mesh_extent / lod_0_box_size).astype(int), 1
         )
 
-        # No LOD-count truncation here. The union-bbox empty-placeholder
-        # logic in ``rewrite_index_with_empty_fragments`` keeps the
-        # listed-fragment grid tight regardless of LOD count, and a
-        # single-LOD-0-chunk mesh still benefits from extra decimation
-        # passes when the user is zoomed far out.
+        if auto_lod_0_box_size:
+            requested_lod_count = len(lods)
+            effective_lod_count = requested_lod_count
+            for candidate_lod_count in range(requested_lod_count, 0, -1):
+                octree_unit = 2 ** (candidate_lod_count - 1)
+                padded_chunks_per_axis = (
+                    np.ceil(num_chunks_per_axis / octree_unit).astype(int)
+                    * octree_unit
+                )
+                padding_ratio = np.max(
+                    padded_chunks_per_axis / num_chunks_per_axis
+                )
+                if padding_ratio <= MAX_AUTO_LOD_GRID_PADDING_RATIO:
+                    effective_lod_count = candidate_lod_count
+                    break
+
+            if effective_lod_count < requested_lod_count:
+                logger.info(
+                    "Reducing segment %s from %d to %d LODs for auto chunking "
+                    "to keep the multires grid padding <= %.1fx",
+                    id,
+                    requested_lod_count,
+                    effective_lod_count,
+                    MAX_AUTO_LOD_GRID_PADDING_RATIO,
+                )
+                lods = lods[:effective_lod_count]
+                lod_vertex_mins = lod_vertex_mins[:effective_lod_count]
+                lod_vertex_maxs = lod_vertex_maxs[:effective_lod_count]
+
+        # The union bbox is only over retained LODs. Decimated meshes can
+        # drift slightly outside LOD 0; empty-placeholder coverage must
+        # include that retained drift, but not LODs dropped by the auto
+        # padding guard above.
+        if lod_vertex_mins:
+            union_vertex_min = np.min(np.stack(lod_vertex_mins), axis=0)
+            union_vertex_max = np.max(np.stack(lod_vertex_maxs), axis=0)
+        else:
+            union_vertex_min = vertex_min.copy()
+            union_vertex_max = vertex_max.copy()
 
         # Center the mesh within the full octree grid so that
         # Neuroglancer's bounding-box center matches the actual mesh

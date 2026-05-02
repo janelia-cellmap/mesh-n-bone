@@ -509,6 +509,54 @@ class TestLodTruncation:
             "mesh extent, not octree_unit."
         )
 
+    def test_auto_lods_truncated_to_bound_grid_padding(self, tmp_output_dir):
+        """Auto chunking treats requested LODs as an upper bound.
+
+        Small meshes should not be forced into a deep octree whose padded
+        grid is much larger than the object bounds; that inflated manifest
+        footprint can keep coarse LODs visible in Neuroglancer.
+        """
+        import pyfqmr
+
+        output_path = os.path.join(tmp_output_dir, "auto_lod_padding")
+        mesh_lods = os.path.join(output_path, "mesh_lods")
+        mesh = trimesh.creation.icosphere(subdivisions=4, radius=50.0)
+        mesh.vertices += 100
+
+        for lod in range(4):
+            lod_dir = os.path.join(mesh_lods, f"s{lod}")
+            os.makedirs(lod_dir)
+            if lod == 0:
+                mesh.export(os.path.join(lod_dir, "1.ply"))
+            else:
+                simplifier = pyfqmr.Simplify()
+                simplifier.setMesh(mesh.vertices, mesh.faces)
+                target = max(len(mesh.faces) // (4 ** lod), 4)
+                simplifier.simplify_mesh(
+                    target_count=target, aggressiveness=7,
+                    preserve_border=False, verbose=False,
+                )
+                v, f, _ = simplifier.getMesh()
+                trimesh.Trimesh(v, f).export(os.path.join(lod_dir, "1.ply"))
+
+        generate_neuroglancer_multires_mesh(
+            id=1,
+            num_subtask_workers=1,
+            output_path=output_path,
+            lods=[0, 1, 2, 3],
+            original_ext=".ply",
+            lod_0_box_size=None,
+        )
+
+        index_file = os.path.join(output_path, "multires", "1.index")
+        with open(index_file, "rb") as f:
+            data = f.read()
+        num_lods = struct.unpack("<I", data[24:28])[0]
+        assert num_lods == 2, (
+            "Default auto chunking should drop excessive LODs for this "
+            f"small mesh; got {num_lods} LODs."
+        )
+
     def test_three_lods_all_valid(self, tmp_output_dir):
         """Three LODs with progressively fewer faces should all be included."""
         output_path = os.path.join(tmp_output_dir, "three_lods")

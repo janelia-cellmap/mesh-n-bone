@@ -1,11 +1,95 @@
 """Shared fixtures for mesh-n-bone tests."""
 
+import asyncio
+import errno
 import json
+import os
+import socket
+import tempfile
+
 import numpy as np
 import pytest
 import trimesh
-import os
-import tempfile
+
+
+def _asyncio_socketpair_wakeup_blocked():
+    """Return True if this sandbox blocks asyncio's default socket wakeup."""
+    if not hasattr(socket, "socketpair"):
+        return False
+
+    read_sock, write_sock = socket.socketpair()
+    try:
+        try:
+            write_sock.send(b"\0")
+        except PermissionError as exc:
+            return exc.errno == errno.EPERM
+        except OSError:
+            return False
+        return False
+    finally:
+        read_sock.close()
+        write_sock.close()
+
+
+class _PipeWakeupSelectorEventLoop(asyncio.SelectorEventLoop):
+    """Selector event loop that uses os.pipe() for cross-thread wakeups."""
+
+    def _make_self_pipe(self):
+        self._ssock, self._csock = os.pipe()
+        os.set_blocking(self._ssock, False)
+        os.set_blocking(self._csock, False)
+        self._internal_fds += 1
+        self._add_reader(self._ssock, self._read_from_self)
+
+    def _read_from_self(self):
+        while True:
+            try:
+                data = os.read(self._ssock, 4096)
+                if not data:
+                    break
+                self._process_self_data(data)
+            except InterruptedError:
+                continue
+            except BlockingIOError:
+                break
+
+    def _write_to_self(self):
+        fd = self._csock
+        if fd is None:
+            return
+        try:
+            os.write(fd, b"\0")
+        except OSError:
+            if self._debug:
+                import logging
+
+                logging.getLogger("asyncio").debug(
+                    "Fail to write a null byte into the self-pipe",
+                    exc_info=True,
+                )
+
+    def _close_self_pipe(self):
+        if self._ssock is not None:
+            self._remove_reader(self._ssock)
+            os.close(self._ssock)
+            self._ssock = None
+        if self._csock is not None:
+            os.close(self._csock)
+            self._csock = None
+        self._internal_fds -= 1
+
+
+class _PipeWakeupEventLoopPolicy(asyncio.DefaultEventLoopPolicy):
+    def new_event_loop(self):
+        return _PipeWakeupSelectorEventLoop()
+
+
+if _asyncio_socketpair_wakeup_blocked():
+    # zarr's sync API runs coroutines on a background asyncio loop. Some
+    # sandboxed Linux environments block AF_UNIX socket writes, so the default
+    # socketpair wakeup never reaches that loop and zarr.open_group hangs.
+    asyncio.set_event_loop_policy(_PipeWakeupEventLoopPolicy())
+
 import zarr
 
 

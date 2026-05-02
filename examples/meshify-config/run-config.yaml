@@ -3,12 +3,15 @@ output_directory: ../output
 num_workers: 1
 
 do_simplification: true
-target_reduction: 0.9
-n_smoothing_iter: 5
+target_reduction: 0.5
+n_smoothing_iter: 2
 check_mesh_validity: false
 
 do_multires: true
-num_lods: 4
+num_lods: 3
 multires_strategy: decimate
 decimation_factor: 2
+# Lower than the production default (25,000) so these small toy meshes
+# split into enough chunks for multires loading to be apparent in the viewer.
+target_faces_per_lod0_chunk: 2000
 delete_decimated_meshes: true
