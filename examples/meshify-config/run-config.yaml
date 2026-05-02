@@ -3,12 +3,12 @@ output_directory: ../output
 num_workers: 1
 
 do_simplification: true
-target_reduction: 0.5
+target_reduction: 0.9
 n_smoothing_iter: 5
 check_mesh_validity: false
 
 do_multires: true
-num_lods: 5
+num_lods: 4
 multires_strategy: decimate
 decimation_factor: 2
 delete_decimated_meshes: true
