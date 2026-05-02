@@ -6,7 +6,7 @@ import socket
 import sys
 from functools import partial
 from http.server import HTTPServer, SimpleHTTPRequestHandler
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 
 class CORSHandler(SimpleHTTPRequestHandler):
@@ -205,6 +205,47 @@ def _build_neuroglancer_url(directory, host, port, zarr_path=None, meshes_path=N
     return f"https://neuroglancer-demo.appspot.com/#!{quote(json.dumps(state))}"
 
 
+# Strong references to live neuroglancer viewers — server.viewers is a
+# WeakValueDictionary, so dropping these would let the viewer get GC'd and
+# every later /v/<token>/ request would 404.
+_live_viewers = []
+
+
+def _start_local_neuroglancer(directory, http_port, host, zarr_path, meshes_path):
+    """Start a local Python neuroglancer server with the given sources loaded.
+
+    Returns the viewer URL, or ``None`` if neuroglancer is not installed or
+    there is nothing to display.
+    """
+    try:
+        import neuroglancer
+    except ImportError:
+        return None
+
+    base = f"http://{host}:{http_port}"
+    sources = []
+    if zarr_path:
+        group_path = _resolve_ome_ngff_group(directory, zarr_path)
+        scheme = _detect_zarr_scheme(os.path.join(directory, group_path))
+        sources.append(f"{scheme}://{base}/{group_path}")
+    if meshes_path:
+        sources.append(f"precomputed://{base}/{meshes_path}")
+    if not sources:
+        return None
+
+    segment_ids = [int(s) for s in (_get_segment_ids(directory, meshes_path) if meshes_path else [])]
+
+    neuroglancer.set_server_bind_address("0.0.0.0")
+    viewer = neuroglancer.Viewer()
+    _live_viewers.append(viewer)
+    with viewer.txn() as s:
+        s.layers["segmentation"] = neuroglancer.SegmentationLayer(
+            source=sources,
+            segments=segment_ids,
+        )
+    return viewer.get_viewer_url()
+
+
 def serve(directory, port=9015, zarr_path=None, meshes_path=None):
     """Serve *directory* over HTTP with CORS headers and Range request support.
 
@@ -235,10 +276,20 @@ def serve(directory, port=9015, zarr_path=None, meshes_path=None):
         print(f"  network:    http://{local_ip}:{port}")
 
     if zarr_path or meshes_path:
-        ng_local = _build_neuroglancer_url(directory, "localhost", port, zarr_path, meshes_path)
-        if ng_local:
-            print(f"\nOpen in neuroglancer:\n  {ng_local}")
+        ng_demo = _build_neuroglancer_url(directory, "localhost", port, zarr_path, meshes_path)
+        if ng_demo:
+            print(f"\nOpen in neuroglancer demo (this machine only — HTTPS blocks LAN HTTP fetches):\n  {ng_demo}")
 
+        data_host = local_ip if local_ip and local_ip != "127.0.0.1" else "localhost"
+        ng_local_url = _start_local_neuroglancer(directory, port, data_host, zarr_path, meshes_path)
+        if ng_local_url:
+            parsed = urlparse(ng_local_url)
+            ng_path = parsed.path + (f"?{parsed.query}" if parsed.query else "") + (f"#{parsed.fragment}" if parsed.fragment else "")
+            ng_port = parsed.port
+            print("\nOpen in local neuroglancer server:")
+            print(f"  localhost:  http://localhost:{ng_port}{ng_path}")
+            if local_ip and local_ip != "127.0.0.1":
+                print(f"  network:    http://{local_ip}:{ng_port}{ng_path}")
 
     print("\nPress Ctrl+C to stop.")
 
