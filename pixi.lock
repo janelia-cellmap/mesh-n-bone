@@ -6073,8 +6073,8 @@ packages:
   requires_python: '>=3.9'
 - pypi: .
   name: mesh-n-bone
-  version: 0.1.5
-  sha256: 866d193040a8c362343c21e9458fae0656ebf4f0e5d6939c511f9f67494cb1db
+  version: 0.1.6
+  sha256: 902731aa27f18b0ff227bcb286d664dbe5e8d0e1de2628ecbfdd503a1e05ab6c
   requires_dist:
   - numpy
   - trimesh>=4.6.8

@@ -1,6 +1,6 @@
 [project]
 name = "mesh-n-bone"
-version = "0.1.5"
+version = "0.1.6"
 description = "Unified tool for mesh generation, multiresolution mesh creation, skeletonization, and analysis."
 readme = "README.md"
 requires-python = ">=3.10"
