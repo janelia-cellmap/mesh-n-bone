@@ -95,6 +95,26 @@ def _get_local_ip():
         return None
 
 
+def _get_colab_proxy_url(port):
+    """Return Colab's HTTPS proxy URL for *port*, or None outside Colab."""
+    try:
+        import google.colab.output
+    except ImportError:
+        return None
+
+    try:
+        return google.colab.output.eval_js(
+            f"google.colab.kernel.proxyPort({int(port)})"
+        ).rstrip("/")
+    except Exception:
+        return None
+
+
+def _get_data_base_url(host, port):
+    """Return the browser-reachable base URL for the local data server."""
+    return _get_colab_proxy_url(port) or f"http://{host}:{port}"
+
+
 def _detect_zarr_scheme(full_path):
     """Return 'zarr3' for zarr v3 (zarr.json), 'zarr' for zarr v2 (.zarray/.zgroup)."""
     if os.path.exists(os.path.join(full_path, "zarr.json")):
@@ -157,7 +177,25 @@ def _get_segment_ids(directory, meshes_path):
     return sorted(ids, key=int)
 
 
-def _build_neuroglancer_url(directory, host, port, zarr_path=None, meshes_path=None):
+def _build_source_urls(directory, base_url, zarr_path=None, meshes_path=None):
+    """Build Neuroglancer source URLs for the given browser-reachable base URL."""
+    base_url = base_url.rstrip("/")
+    sources = []
+
+    if zarr_path:
+        group_path = _resolve_ome_ngff_group(directory, zarr_path)
+        scheme = _detect_zarr_scheme(os.path.join(directory, group_path))
+        sources.append(f"{scheme}://{base_url}/{group_path}")
+
+    if meshes_path:
+        sources.append(f"precomputed://{base_url}/{meshes_path}")
+
+    return sources
+
+
+def _build_neuroglancer_url(
+    directory, host, port, zarr_path=None, meshes_path=None, data_base_url=None
+):
     """Build a neuroglancer URL with a single segmentation layer for the given data sources.
 
     Parameters
@@ -172,23 +210,17 @@ def _build_neuroglancer_url(directory, host, port, zarr_path=None, meshes_path=N
         Relative path (from server root) to a zarr dataset.
     meshes_path : str or None
         Relative path (from server root) to precomputed meshes.
+    data_base_url : str or None
+        Browser-reachable base URL for the data server.  If omitted, uses
+        ``http://{host}:{port}``.
 
     Returns
     -------
     str
         A neuroglancer URL.
     """
-    base = f"http://{host}:{port}"
-    sources = []
-
-    if zarr_path:
-        group_path = _resolve_ome_ngff_group(directory, zarr_path)
-        scheme = _detect_zarr_scheme(os.path.join(directory, group_path))
-        sources.append(f"{scheme}://{base}/{group_path}")
-
-    if meshes_path:
-        sources.append(f"precomputed://{base}/{meshes_path}")
-
+    base_url = data_base_url or f"http://{host}:{port}"
+    sources = _build_source_urls(directory, base_url, zarr_path, meshes_path)
     if not sources:
         return None
 
@@ -211,7 +243,9 @@ def _build_neuroglancer_url(directory, host, port, zarr_path=None, meshes_path=N
 _live_viewers = []
 
 
-def _start_local_neuroglancer(directory, http_port, host, zarr_path, meshes_path):
+def _start_local_neuroglancer(
+    directory, http_port, host, zarr_path, meshes_path, data_base_url=None
+):
     """Start a local Python neuroglancer server with the given sources loaded.
 
     Returns the viewer URL, or ``None`` if neuroglancer is not installed or
@@ -222,14 +256,8 @@ def _start_local_neuroglancer(directory, http_port, host, zarr_path, meshes_path
     except ImportError:
         return None
 
-    base = f"http://{host}:{http_port}"
-    sources = []
-    if zarr_path:
-        group_path = _resolve_ome_ngff_group(directory, zarr_path)
-        scheme = _detect_zarr_scheme(os.path.join(directory, group_path))
-        sources.append(f"{scheme}://{base}/{group_path}")
-    if meshes_path:
-        sources.append(f"precomputed://{base}/{meshes_path}")
+    base_url = data_base_url or f"http://{host}:{http_port}"
+    sources = _build_source_urls(directory, base_url, zarr_path, meshes_path)
     if not sources:
         return None
 
@@ -276,12 +304,34 @@ def serve(directory, port=9015, zarr_path=None, meshes_path=None):
         print(f"  network:    http://{local_ip}:{port}")
 
     if zarr_path or meshes_path:
-        ng_demo = _build_neuroglancer_url(directory, "localhost", port, zarr_path, meshes_path)
-        if ng_demo:
-            print(f"\nOpen in neuroglancer demo (this machine only — HTTPS blocks LAN HTTP fetches):\n  {ng_demo}")
-
         data_host = local_ip if local_ip and local_ip != "127.0.0.1" else "localhost"
-        ng_local_url = _start_local_neuroglancer(directory, port, data_host, zarr_path, meshes_path)
+        data_base_url = _get_data_base_url(data_host, port)
+        if data_base_url.startswith("https://"):
+            print(f"  Colab proxy: {data_base_url}")
+
+        demo_base_url = data_base_url if data_base_url.startswith("https://") else None
+        ng_demo = _build_neuroglancer_url(
+            directory,
+            "localhost",
+            port,
+            zarr_path,
+            meshes_path,
+            data_base_url=demo_base_url,
+        )
+        if ng_demo:
+            demo_note = ""
+            if not data_base_url.startswith("https://"):
+                demo_note = " (this machine only — HTTPS blocks LAN HTTP fetches)"
+            print(f"\nOpen in neuroglancer demo{demo_note}:\n  {ng_demo}")
+
+        ng_local_url = _start_local_neuroglancer(
+            directory,
+            port,
+            data_host,
+            zarr_path,
+            meshes_path,
+            data_base_url=data_base_url,
+        )
         if ng_local_url:
             parsed = urlparse(ng_local_url)
             ng_path = parsed.path + (f"?{parsed.query}" if parsed.query else "") + (f"#{parsed.fragment}" if parsed.fragment else "")
