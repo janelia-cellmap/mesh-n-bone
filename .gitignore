@@ -37,3 +37,7 @@ examples/output/
 examples/meshify-config-*/
 failed_mesh.ply
 .codex
+
+# CGAL skeletonizer binary — built locally via `pixi run -e build-cgal build-cgal`
+cgal_skeletonize_mesh/skeletonize_mesh
+cgal_skeletonize_mesh/build/
