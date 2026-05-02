@@ -21,12 +21,39 @@ class Fragment:
         Triangle face indices with shape ``(M, 3)``.
     lod_0_fragment_pos : list
         List of LOD 0 fragment grid positions associated with this fragment.
+    vertex_lod_0_fragment_pos : numpy.ndarray, optional
+        Per-vertex source fragment positions with shape ``(N, 3)``.
     """
 
-    def __init__(self, vertices, faces, lod_0_fragment_pos):
+    def __init__(
+        self, vertices, faces, lod_0_fragment_pos, vertex_lod_0_fragment_pos=None
+    ):
         self.vertices = vertices
         self.faces = faces
         self.lod_0_fragment_pos = lod_0_fragment_pos
+        if vertex_lod_0_fragment_pos is None:
+            self.vertex_lod_0_fragment_pos = self._per_vertex_fragment_pos(
+                vertices, lod_0_fragment_pos
+            )
+        else:
+            vertex_lod_0_fragment_pos = np.asarray(
+                vertex_lod_0_fragment_pos, dtype=np.int64
+            )
+            if vertex_lod_0_fragment_pos.shape != (len(vertices), 3):
+                raise ValueError(
+                    "vertex_lod_0_fragment_pos must have shape "
+                    f"({len(vertices)}, 3)"
+                )
+            self.vertex_lod_0_fragment_pos = vertex_lod_0_fragment_pos
+
+    @staticmethod
+    def _per_vertex_fragment_pos(vertices, lod_0_fragment_pos):
+        positions = np.asarray(lod_0_fragment_pos, dtype=np.int64)
+        if positions.ndim == 1:
+            position = positions
+        else:
+            position = positions[-1]
+        return np.repeat(position.reshape(1, 3), len(vertices), axis=0)
 
     def update_faces(self, new_faces):
         self.faces = np.vstack((self.faces, new_faces + len(self.vertices)))
@@ -37,10 +64,19 @@ class Fragment:
     def update_lod_0_fragment_pos(self, new_lod_0_fragment_pos):
         self.lod_0_fragment_pos.append(new_lod_0_fragment_pos)
 
+    def update_vertex_lod_0_fragment_pos(self, new_vertices, new_lod_0_fragment_pos):
+        new_vertex_lod_0_fragment_pos = self._per_vertex_fragment_pos(
+            new_vertices, new_lod_0_fragment_pos
+        )
+        self.vertex_lod_0_fragment_pos = np.vstack(
+            (self.vertex_lod_0_fragment_pos, new_vertex_lod_0_fragment_pos)
+        )
+
     def update(self, new_vertices, new_faces, new_lod_0_fragment_pos):
         self.update_faces(new_faces)
         self.update_vertices(new_vertices)
         self.update_lod_0_fragment_pos(new_lod_0_fragment_pos)
+        self.update_vertex_lod_0_fragment_pos(new_vertices, new_lod_0_fragment_pos)
 
 
 CompressedFragment = namedtuple(

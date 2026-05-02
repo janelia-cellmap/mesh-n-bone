@@ -85,6 +85,13 @@ class TestSingleresMultiresFormat:
             mesh.vertices, mesh.faces, path
         )
 
+        import DracoPy
+
+        decoded = DracoPy.decode(res)
+        decoded_points = np.asarray(decoded.points)
+        assert np.issubdtype(decoded_points.dtype, np.integer)
+        assert decoded_points.max() == 2**16 - 1
+
         # Mesh data file
         assert os.path.exists(path)
         assert os.path.getsize(path) > 0

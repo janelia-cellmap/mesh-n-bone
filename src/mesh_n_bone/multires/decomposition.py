@@ -200,15 +200,22 @@ def generate_mesh_decomposition(
                 current_box_size = lod_0_box_size * 2**current_lod
                 quantization_origin = np.asarray(fragment_pos) * current_box_size
                 quantization_bits = vertex_quantization_bits
+                if quantization_bits < 1 or quantization_bits > 16:
+                    raise ValueError(
+                        "vertex_quantization_bits must be between 1 and 16"
+                    )
                 # The spec requires Draco-encoded INTEGER positions in
                 # [0, 2^bits).  Compute per-axis integer positions:
                 #   q[j] = round(local[j] / current_box_size[j] * max_q)
-                # then encode with range=max_q so DracoPy stores them
-                # as-is.  Neuroglancer decodes via:
+                # then pass those integers to DracoPy directly.
+                # Neuroglancer decodes via:
                 #   world[j] = grid_origin[j] + chunk_shape[j] * 2^lod
                 #              * (frag_pos[j] + q[j] / max_q)
-                max_q = float((1 << quantization_bits) - 1)
-                local_vertices = fragment.vertices.astype(np.float64) - quantization_origin
+                max_q = (1 << quantization_bits) - 1
+                max_q_float = float(max_q)
+                local_vertices = (
+                    fragment.vertices.astype(np.float64) - quantization_origin
+                )
                 local_vertices = np.clip(local_vertices, 0.0, current_box_size)
 
                 # Snap vertices that fall within half a quantization
@@ -219,7 +226,7 @@ def generate_mesh_decomposition(
                 # to two different lattice positions, decoding to two
                 # slightly-different world coords and creating a
                 # visible sub-pixel seam at every chunk boundary.
-                half_step = current_box_size / max_q / 2.0
+                half_step = current_box_size / max_q_float / 2.0
                 local_vertices = np.where(
                     local_vertices < half_step, 0.0, local_vertices,
                 )
@@ -229,20 +236,62 @@ def generate_mesh_decomposition(
                     local_vertices,
                 )
 
-                # Compute integer quantized positions per axis
+                # Compute integer quantized positions per axis. Pass an
+                # unsigned integer attribute to DracoPy, since
+                # neuroglancer's multilod_draco format explicitly does
+                # not support Draco's built-in position quantization.
                 int_positions = np.round(
-                    local_vertices * (max_q / current_box_size)
-                ).astype(np.float64)
-                int_positions = np.clip(int_positions, 0.0, max_q)
+                    local_vertices * (max_q_float / current_box_size)
+                )
+                int_positions = np.clip(int_positions, 0, max_q)
+
+                if current_lod != 0:
+                    # Neuroglancer partitions every nonzero-LOD Draco
+                    # fragment into 2x2x2 subchunks. Coordinates below
+                    # partition_q are lower-only, coordinates above
+                    # partition_q are upper-only, and coordinates exactly
+                    # equal to partition_q are treated as lying on the
+                    # shared boundary and may be used by either side.
+                    # The mesh was already sliced into those subchunks
+                    # before merging into this parent fragment, but
+                    # slice vertices can land just across the half-plane
+                    # after rounding. Snap near-boundary vertices to
+                    # partition_q and keep non-boundary vertices on
+                    # their source side.
+                    source_fragment_pos = np.asarray(
+                        fragment.vertex_lod_0_fragment_pos, dtype=np.int64
+                    )
+                    subchunk_bits = (
+                        source_fragment_pos
+                        - np.asarray(fragment_pos, dtype=np.int64) * 2
+                    )
+                    if np.any((subchunk_bits < 0) | (subchunk_bits > 1)):
+                        raise ValueError(
+                            "higher-LOD fragment contains vertices outside its "
+                            "2x2x2 subchunk set"
+                        )
+
+                    partition_q = 1 << (quantization_bits - 1)
+                    boundary_vertices = (
+                        ((subchunk_bits == 0) & (int_positions >= partition_q - 1))
+                        | ((subchunk_bits == 1) & (int_positions <= partition_q + 1))
+                    )
+                    int_positions = np.where(
+                        boundary_vertices, partition_q, int_positions
+                    )
+                    int_positions = np.where(
+                        subchunk_bits == 0,
+                        np.minimum(int_positions, partition_q),
+                        np.maximum(int_positions, partition_q),
+                    )
+
+                int_positions = int_positions.astype(np.uint16)
 
                 draco_bytes, _ = capture_draco_output(
                     2,
                     DracoPy.encode,
                     points=int_positions,
                     faces=fragment.faces,
-                    quantization_bits=quantization_bits,
-                    quantization_range=max_q,
-                    quantization_origin=[0.0, 0.0, 0.0],
                 )
 
                 if len(draco_bytes) > 12:
