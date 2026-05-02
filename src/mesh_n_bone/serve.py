@@ -1,7 +1,9 @@
 """Local HTTP server with CORS and Range support for viewing zarr volumes and meshes in neuroglancer."""
 
+import concurrent.futures
 import json
 import os
+import re
 import socket
 import sys
 from functools import partial
@@ -241,6 +243,64 @@ def _build_neuroglancer_url(
 # WeakValueDictionary, so dropping these would let the viewer get GC'd and
 # every later /v/<token>/ request would 404.
 _live_viewers = []
+_NG_DATA_ROUTE = "/mesh_n_bone_data"
+
+
+def _viewer_data_base_url(viewer_url, route):
+    """Return a data base URL on the same origin as a Python neuroglancer viewer."""
+    parsed = urlparse(viewer_url)
+    path_prefix = parsed.path.split("/v/", 1)[0].rstrip("/")
+    return f"{parsed.scheme}://{parsed.netloc}{path_prefix}{route}"
+
+
+def _mount_neuroglancer_static_files(directory, viewer_url, route_id=None):
+    """Serve *directory* from the active Python neuroglancer server.
+
+    This is useful in Colab, where fetching a separate proxied data port from
+    the viewer can fail CORS checks.  Serving files from the viewer server keeps
+    all Neuroglancer data requests on the same browser origin.
+    """
+    import tornado.web
+    from neuroglancer import server as neuroglancer_server
+
+    directory = os.path.abspath(directory)
+    route_id = route_id or os.urandom(8).hex()
+    route = f"{_NG_DATA_ROUTE}/{route_id}"
+    pattern = rf"{re.escape(route)}/(.*)"
+
+    class NeuroglancerDataFileHandler(tornado.web.StaticFileHandler):
+        def set_default_headers(self):
+            self.set_header("Access-Control-Allow-Origin", "*")
+            self.set_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+            self.set_header("Access-Control-Allow-Headers", "Content-Type, Range")
+            self.set_header(
+                "Access-Control-Expose-Headers",
+                "Content-Length, Content-Range",
+            )
+
+        def options(self, path):
+            self.set_status(204)
+            self.finish()
+
+    ng_server = neuroglancer_server.global_server
+    if ng_server is None:
+        raise RuntimeError("Python neuroglancer server has not started")
+
+    future = concurrent.futures.Future()
+
+    def add_handler():
+        try:
+            ng_server.app.add_handlers(
+                r".*$",
+                [(pattern, NeuroglancerDataFileHandler, {"path": directory})],
+            )
+            future.set_result(None)
+        except Exception as exc:
+            future.set_exception(exc)
+
+    ng_server.loop.call_soon_threadsafe(add_handler)
+    future.result(timeout=5)
+    return _viewer_data_base_url(viewer_url, route)
 
 
 def _start_local_neuroglancer(
@@ -248,30 +308,36 @@ def _start_local_neuroglancer(
 ):
     """Start a local Python neuroglancer server with the given sources loaded.
 
-    Returns the viewer URL, or ``None`` if neuroglancer is not installed or
-    there is nothing to display.
+    Returns ``(viewer_url, data_base_url)``, or ``None`` if neuroglancer is
+    not installed or there is nothing to display.
     """
     try:
         import neuroglancer
     except ImportError:
         return None
 
-    base_url = data_base_url or f"http://{host}:{http_port}"
-    sources = _build_source_urls(directory, base_url, zarr_path, meshes_path)
-    if not sources:
-        return None
-
-    segment_ids = [int(s) for s in (_get_segment_ids(directory, meshes_path) if meshes_path else [])]
+    segment_ids = [
+        int(s)
+        for s in (_get_segment_ids(directory, meshes_path) if meshes_path else [])
+    ]
 
     neuroglancer.set_server_bind_address("0.0.0.0")
     viewer = neuroglancer.Viewer()
     _live_viewers.append(viewer)
+    viewer_url = viewer.get_viewer_url()
+    base_url = data_base_url or _mount_neuroglancer_static_files(
+        directory, viewer_url, route_id=viewer.token
+    )
+    sources = _build_source_urls(directory, base_url, zarr_path, meshes_path)
+    if not sources:
+        return None
+
     with viewer.txn() as s:
         s.layers["segmentation"] = neuroglancer.SegmentationLayer(
             source=sources,
             segments=segment_ids,
         )
-    return viewer.get_viewer_url()
+    return viewer_url, base_url
 
 
 def serve(directory, port=9015, zarr_path=None, meshes_path=None):
@@ -309,7 +375,23 @@ def serve(directory, port=9015, zarr_path=None, meshes_path=None):
         if data_base_url.startswith("https://"):
             print(f"  Colab proxy: {data_base_url}")
 
-        demo_base_url = data_base_url if data_base_url.startswith("https://") else None
+        ng_local = _start_local_neuroglancer(
+            directory,
+            port,
+            data_host,
+            zarr_path,
+            meshes_path,
+        )
+        ng_local_url = None
+        ng_data_base_url = None
+        if ng_local:
+            ng_local_url, ng_data_base_url = ng_local
+
+        demo_base_url = (
+            ng_data_base_url
+            if ng_data_base_url and ng_data_base_url.startswith("https://")
+            else None
+        )
         ng_demo = _build_neuroglancer_url(
             directory,
             "localhost",
@@ -320,26 +402,26 @@ def serve(directory, port=9015, zarr_path=None, meshes_path=None):
         )
         if ng_demo:
             demo_note = ""
-            if not data_base_url.startswith("https://"):
+            if not demo_base_url:
                 demo_note = " (this machine only — HTTPS blocks LAN HTTP fetches)"
             print(f"\nOpen in neuroglancer demo{demo_note}:\n  {ng_demo}")
 
-        ng_local_url = _start_local_neuroglancer(
-            directory,
-            port,
-            data_host,
-            zarr_path,
-            meshes_path,
-            data_base_url=data_base_url,
-        )
         if ng_local_url:
             parsed = urlparse(ng_local_url)
-            ng_path = parsed.path + (f"?{parsed.query}" if parsed.query else "") + (f"#{parsed.fragment}" if parsed.fragment else "")
-            ng_port = parsed.port
             print("\nOpen in local neuroglancer server:")
-            print(f"  localhost:  http://localhost:{ng_port}{ng_path}")
-            if local_ip and local_ip != "127.0.0.1":
-                print(f"  network:    http://{local_ip}:{ng_port}{ng_path}")
+            if parsed.scheme == "http" and parsed.port:
+                ng_path = (
+                    parsed.path
+                    + (f"?{parsed.query}" if parsed.query else "")
+                    + (f"#{parsed.fragment}" if parsed.fragment else "")
+                )
+                print(f"  localhost:  http://localhost:{parsed.port}{ng_path}")
+                if local_ip and local_ip != "127.0.0.1":
+                    print(f"  network:    http://{local_ip}:{parsed.port}{ng_path}")
+            else:
+                print(f"  viewer:     {ng_local_url}")
+            if ng_data_base_url:
+                print(f"  data:       {ng_data_base_url}")
 
     print("\nPress Ctrl+C to stop.")
 
