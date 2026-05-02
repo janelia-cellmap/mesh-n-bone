@@ -12,12 +12,24 @@ from urllib.parse import quote
 class CORSHandler(SimpleHTTPRequestHandler):
     """HTTP handler that adds CORS headers and supports HTTP Range requests for neuroglancer."""
 
+    _client_disconnect_errors = (
+        BrokenPipeError,
+        ConnectionAbortedError,
+        ConnectionResetError,
+    )
+
     def end_headers(self):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type, Range")
         self.send_header("Access-Control-Expose-Headers", "Content-Length, Content-Range")
         super().end_headers()
+
+    def finish(self):
+        try:
+            super().finish()
+        except self._client_disconnect_errors:
+            pass
 
     def do_OPTIONS(self):
         self.send_response(200)
@@ -26,7 +38,10 @@ class CORSHandler(SimpleHTTPRequestHandler):
     def do_GET(self):
         range_header = self.headers.get("Range")
         if not range_header:
-            return super().do_GET()
+            try:
+                return super().do_GET()
+            except self._client_disconnect_errors:
+                return
 
         path = self.translate_path(self.path)
         try:
@@ -59,7 +74,7 @@ class CORSHandler(SimpleHTTPRequestHandler):
                     break
                 self.wfile.write(chunk)
                 remaining -= len(chunk)
-        except (BrokenPipeError, ConnectionResetError):
+        except self._client_disconnect_errors:
             pass
         finally:
             f.close()
