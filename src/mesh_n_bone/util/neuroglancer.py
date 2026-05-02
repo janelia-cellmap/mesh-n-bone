@@ -407,7 +407,7 @@ def write_singleres_index_file(
 
 
 def write_singleres_multires_files(
-    vertices_xyz, faces, path, vertex_quantization_bits=10, draco_compression_level=10
+    vertices_xyz, faces, path, vertex_quantization_bits=16, draco_compression_level=10
 ):
     """Encode a single-resolution mesh as a multi-LOD Draco file with index.
 
@@ -425,7 +425,7 @@ def write_singleres_multires_files(
         Output file path for the Draco-encoded mesh data.
     vertex_quantization_bits : int, optional
         Number of quantization bits per vertex coordinate.  Default is
-        ``10``.
+        ``16``.
     draco_compression_level : int, optional
         Draco compression level (0--10).  Default is ``10``.
 
@@ -450,17 +450,11 @@ def write_singleres_multires_files(
         vertex_quantization_bits=vertex_quantization_bits,
     )
 
-    quantization_origin = np.min(vertices_xyz, axis=0)
-    quantization_range = np.max(vertices_xyz, axis=0) - quantization_origin
-    quantization_range = np.max(quantization_range)
     try:
         res = DracoPy.encode(
             vertices_xyz,
             faces,
-            quantization_bits=vertex_quantization_bits,
-            quantization_range=quantization_range,
             compression_level=draco_compression_level,
-            quantization_origin=quantization_origin,
         )
     except Exception:
         res = b""

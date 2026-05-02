@@ -44,6 +44,10 @@ class TestFragment:
         assert np.array_equal(frag.vertices, vertices)
         assert np.array_equal(frag.faces, faces)
         assert frag.lod_0_fragment_pos == [(0, 0, 0)]
+        assert np.array_equal(
+            frag.vertex_lod_0_fragment_pos,
+            np.repeat(np.array([[0, 0, 0]]), len(vertices), axis=0),
+        )
 
     def test_fragment_update(self, sample_vertices_and_faces):
         vertices, faces = sample_vertices_and_faces
@@ -52,6 +56,10 @@ class TestFragment:
         assert len(frag.vertices) == 8  # 4 + 4
         assert len(frag.faces) == 8  # 4 + 4
         assert (1, 1, 1) in frag.lod_0_fragment_pos
+        assert np.array_equal(
+            frag.vertex_lod_0_fragment_pos[-len(vertices) :],
+            np.repeat(np.array([[1, 1, 1]]), len(vertices), axis=0),
+        )
 
 
 class TestZorderFragments:

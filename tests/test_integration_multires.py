@@ -56,6 +56,14 @@ class TestDecompositionPipeline:
             assert frag.offset == len(frag.draco_bytes)
             assert len(frag.position) == 3
 
+        import DracoPy
+
+        decoded = DracoPy.decode(fragments[0].draco_bytes)
+        points = np.asarray(decoded.points)
+        assert np.issubdtype(points.dtype, np.integer)
+        assert points.min() >= 0
+        assert points.max() <= 2**16 - 1
+
     def test_higher_lod_decomposition(self, tmp_output_dir):
         """LOD > 0 should produce fragments with 2x larger effective box sizes."""
         mesh = trimesh.creation.icosphere(subdivisions=2, radius=50.0)
@@ -90,6 +98,27 @@ class TestDecompositionPipeline:
         assert fragments_lod1 is not None
         # Higher LOD should have fewer or equal fragments (larger effective box)
         assert len(fragments_lod1) <= len(fragments_lod0)
+
+        import DracoPy
+
+        partition_q = 1 << 15
+        for frag in fragments_lod1:
+            decoded = DracoPy.decode(frag.draco_bytes)
+            points = np.asarray(decoded.points)
+            faces = np.asarray(decoded.faces)
+            vertex_masks = np.full(len(points), 0xFF, dtype=np.uint16)
+            vertex_masks[points[:, 0] < partition_q] &= 0b01010101
+            vertex_masks[points[:, 0] > partition_q] &= 0b10101010
+            vertex_masks[points[:, 1] < partition_q] &= 0b00110011
+            vertex_masks[points[:, 1] > partition_q] &= 0b11001100
+            vertex_masks[points[:, 2] < partition_q] &= 0b00001111
+            vertex_masks[points[:, 2] > partition_q] &= 0b11110000
+            face_masks = (
+                vertex_masks[faces[:, 0]]
+                & vertex_masks[faces[:, 1]]
+                & vertex_masks[faces[:, 2]]
+            )
+            assert not np.any(face_masks == 0)
 
     def test_empty_region_returns_none(self, tmp_output_dir):
         """Decomposing a region with no mesh should return None."""

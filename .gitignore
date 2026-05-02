@@ -12,6 +12,7 @@ build/
 test_meshes_output/
 workspace.code-workspace
 *.ipynb
+!examples/example.ipynb
 job-logs/
 *.obj
 *.stl
@@ -33,3 +34,10 @@ fetchMeshes.py
 tests/test.py
 examples/data/
 examples/output/
+examples/meshify-config-*/
+failed_mesh.ply
+.codex
+
+# CGAL skeletonizer binary — built locally via `pixi run -e build-cgal build-cgal`
+cgal_skeletonize_mesh/skeletonize_mesh
+cgal_skeletonize_mesh/build/
