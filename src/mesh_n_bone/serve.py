@@ -420,8 +420,6 @@ def serve(directory, port=9015, zarr_path=None, meshes_path=None):
                     print(f"  network:    http://{local_ip}:{parsed.port}{ng_path}")
             else:
                 print(f"  viewer:     {ng_local_url}")
-            if ng_data_base_url:
-                print(f"  data:       {ng_data_base_url}")
 
     print("\nPress Ctrl+C to stop.")
 
