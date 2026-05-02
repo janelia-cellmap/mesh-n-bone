@@ -2,6 +2,12 @@
 
 End-to-end walkthrough: create a segmentation volume, generate meshes, and view both the volume and meshes in neuroglancer.
 
+## Run in Colab
+
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/janelia-cellmap/mesh-n-bone/blob/master/examples/example.ipynb)
+
+The [example notebook](example.ipynb) does the steps below in one click — install, build the zarr volume, run meshify, and launch a local neuroglancer viewer.
+
 ## Prerequisites
 
 ```bash
