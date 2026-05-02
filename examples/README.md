@@ -24,7 +24,7 @@ pixi install
 pixi run python examples/create_example_volume.py
 ```
 
-This creates a 256x256x256 uint8 segmentation volume with a sphere (label 1) and a cube (label 2) at `examples/data/example.zarr/seg/s0`.
+This creates a 256x256x256 uint8 segmentation volume with a sphere (label 1), a torus (label 2), and a ridged blob with high-frequency surface detail (label 3) at `examples/data/example.zarr/seg/s0`.
 
 ### 2. Generate meshes and multiresolution output
 
