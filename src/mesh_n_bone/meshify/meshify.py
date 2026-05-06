@@ -21,8 +21,16 @@ from mesh_n_bone.util.zarr_io import (
     _read_attrs,
     _get_multiscales,
     _extract_ome_scale_translation,
+    _first_multiscales_dataset_path,
+    _path_basename,
+    _path_dirname,
+    _path_join,
 )
-from mesh_n_bone.util.image_data_interface import open_ds_tensorstore, to_ndarray_tensorstore
+from mesh_n_bone.util.image_data_interface import (
+    _detect_zarr_driver,
+    open_ds_tensorstore,
+    to_ndarray_tensorstore,
+)
 from mesh_n_bone.meshify.downsample import (
     downsample_labels_3d_suppress_zero,
     downsample_labels_3d,
@@ -55,21 +63,23 @@ def _read_ome_ngff_transform(input_path):
     size and offset are returned as ``np.ndarray`` for consistency
     with existing callers.
     """
-    for ext in (".zarr", ".n5"):
-        if ext in input_path:
-            parts = input_path.split(ext + "/")
-            zarr_root_path = parts[0] + ext
-            dataset_path = parts[1] if len(parts) > 1 else ""
-            break
+    zarr_root_path, dataset_path = split_dataset_path(input_path)
+    if dataset_path:
+        dataset_name = _path_basename(dataset_path)
+        parent_path = _path_dirname(dataset_path)
+        parent_dir = _path_join(zarr_root_path, parent_path) if parent_path else zarr_root_path
     else:
-        return None, None, None
-
-    dataset_name = os.path.basename(dataset_path)
-    parent_path = os.path.dirname(dataset_path)
-    parent_dir = os.path.join(zarr_root_path, parent_path) if parent_path else zarr_root_path
+        dataset_name = _path_basename(input_path)
+        parent_dir = _path_dirname(input_path)
 
     try:
         parent_attrs = _read_attrs(parent_dir)
+        if not dataset_path:
+            input_attrs = _read_attrs(input_path)
+            selected_dataset_path = _first_multiscales_dataset_path(input_attrs)
+            if selected_dataset_path:
+                parent_attrs = input_attrs
+                dataset_name = selected_dataset_path
         multiscales = _get_multiscales(parent_attrs)
         if not multiscales:
             return None, None, None
@@ -404,8 +414,11 @@ class Meshify:
         self.segmentation_array = open_dataset(filename, dataset_name)
         self.output_directory = output_directory
         self.input_path = input_path
-        self._dataset_path = os.path.join(filename, dataset_name) if dataset_name else filename
-        self._swap_axes = input_path.rfind(".n5") > input_path.rfind(".zarr")
+        self._dataset_path = (
+            getattr(self.segmentation_array, "_dataset_path", None)
+            or (_path_join(filename, dataset_name) if dataset_name else filename)
+        )
+        self._swap_axes = _detect_zarr_driver(self._dataset_path) == "n5"
 
         # Get true (possibly non-integer) voxel size from the underlying data
         self.true_voxel_size = np.array(read_raw_voxel_size(self.segmentation_array))
