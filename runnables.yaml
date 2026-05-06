@@ -156,11 +156,12 @@ runnables:
               fileglancer/dask-config.yaml (8 processes per job), 48 fans out
               to 6 child jobs.
           - flag: --lsf-project
-            name: LSF project (-P) for worker jobs
+            name: LSF project name for worker jobs
             type: string
             description: >-
-              Optional charge group for the dask worker LSF jobs (e.g.
-              cellmap). Leave blank if your cluster doesn't require -P.
+              Optional charge group name for the dask worker LSF jobs (e.g.
+              cellmap). Enter the project name only, without the -P flag.
+              Leave blank if your cluster doesn't require a project.
 
     resources:
       cpus: 8
