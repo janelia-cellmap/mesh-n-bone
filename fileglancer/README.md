@@ -47,7 +47,7 @@ Fileglancer's outer LSF job acts as the driver (Resources tab: 2 cpus / 4 GB). T
 
 So the only LSF-related fields in the form are:
 
-- **Compute → Dask workers** (default `144`) — total worker processes
+- **Compute → Dask workers** (default `48`) — total worker processes
 - **Compute → LSF project** — charge group for the worker jobs (`cellmap`, etc.)
 
 If you want to change per-child-job cores/memory/walltime for the Fileglancer flow, edit [`dask-config.yaml`](dask-config.yaml) here. The production CLI still uses [`../lsf-config/dask-config.yaml`](../lsf-config/dask-config.yaml) and is not affected.
@@ -62,7 +62,7 @@ Current `fileglancer/dask-config.yaml` per-child-job settings:
 | `memory` | 120 GB (15 GB × 8) |
 | `walltime` | 01:00 |
 
-So `--num-workers 144` with `processes: 8` fans out to 18 child LSF jobs.
+So `--num-workers 48` with `processes: 8` fans out to 6 child LSF jobs.
 
 ### Driver job's own charge group
 

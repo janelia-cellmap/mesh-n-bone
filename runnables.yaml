@@ -135,11 +135,11 @@ runnables:
             name: Dask workers
             type: integer
             min: 1
-            default: 144
+            default: 48
             description: >-
               Total worker processes across child LSF jobs. With
-              fileglancer/dask-config.yaml (8 processes per job), 144 fans out
-              to 18 child jobs.
+              fileglancer/dask-config.yaml (8 processes per job), 48 fans out
+              to 6 child jobs.
           - flag: --lsf-project
             name: LSF project (-P) for worker jobs
             type: string
