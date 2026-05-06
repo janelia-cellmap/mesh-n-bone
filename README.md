@@ -80,13 +80,13 @@ mesh-n-bone <command> [options]
 mesh-n-bone meshify CONFIG_PATH -n NUM_WORKERS [--roi begin_z,begin_y,begin_x,end_z,end_y,end_x]
 ```
 
-Reads a `.zarr` or `.n5` segmentation volume, runs marching cubes per chunk, assembles across chunk boundaries (with boundary deduplication), optionally simplifies and smooths, and writes output as PLY or neuroglancer format.
+Reads a local or HTTP(S) `.zarr` / `.n5` segmentation volume, runs marching cubes per chunk, assembles across chunk boundaries (with boundary deduplication), optionally simplifies and smooths, and writes output as PLY or neuroglancer format.
 
 Example meshify `run-config.yaml`:
 
 ```yaml
 # ── Required ──
-input_path: /path/to/segmentation.zarr/s0   # Path to zarr/n5 segmentation dataset
+input_path: /path/to/segmentation.zarr/s0   # Local path or HTTP(S) URL to zarr/n5 dataset
 output_directory: /path/to/output            # Where to write output meshes
 
 # ── All remaining fields are optional ──
@@ -128,6 +128,8 @@ roi:                             # Restrict processing to this subregion
                                  # Boundary edges are preserved during simplification.
                                  # Can also be passed via CLI: --roi z0,y0,x0,z1,y1,x1
 ```
+
+HTTP(S) inputs are read-only and may point directly at an array path even when the served directory does not end in `.zarr` or `.n5`, for example `https://host/files/crop04_AIPv2/seg/s0`. If the URL points at an OME-Zarr multiscales group, meshify opens the first dataset listed in the group metadata.
 
 #### `to-neuroglancer` — Convert existing meshes to neuroglancer multiresolution format
 
