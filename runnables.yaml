@@ -143,8 +143,9 @@ runnables:
           - flag: --lsf-project
             name: LSF project (-P) for worker jobs
             type: string
-            required: true
-            description: Charge group for the dask worker LSF jobs (e.g. cellmap).
+            description: >-
+              Optional charge group for the dask worker LSF jobs (e.g.
+              cellmap). Leave blank if your cluster doesn't require -P.
 
     resources:
       cpus: 2

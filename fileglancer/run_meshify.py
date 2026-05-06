@@ -74,8 +74,8 @@ def _build_arg_parser():
 
     parser.add_argument(
         "--lsf-project",
-        required=True,
-        help="LSF project (-P) for child worker jobs.",
+        default=None,
+        help="Optional LSF project (-P) for child worker jobs.",
     )
 
     return parser
@@ -130,9 +130,12 @@ _DASK_TEMPLATE = Path(__file__).resolve().parent / "dask-config.yaml"
 
 
 def _build_dask_config(args):
-    """Reuse fileglancer/dask-config.yaml, substituting the LSF project."""
+    """Reuse fileglancer/dask-config.yaml, optionally overriding LSF project."""
     config = yaml.safe_load(_DASK_TEMPLATE.read_text())
-    config["jobqueue"]["lsf"]["project"] = args.lsf_project
+    if args.lsf_project:
+        config["jobqueue"]["lsf"]["project"] = args.lsf_project
+    else:
+        config["jobqueue"]["lsf"].pop("project", None)
     return config
 
 
