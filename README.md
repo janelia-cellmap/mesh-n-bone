@@ -129,7 +129,7 @@ roi:                             # Restrict processing to this subregion
                                  # Can also be passed via CLI: --roi z0,y0,x0,z1,y1,x1
 ```
 
-HTTP(S) inputs are read-only and may point directly at an array path even when the served directory does not end in `.zarr` or `.n5`, for example `https://host/files/crop04_AIPv2/seg/s0`. If the URL points at an OME-Zarr multiscales group, meshify opens the first dataset listed in the group metadata.
+`input_path` may be a local path or an HTTP(S) URL (HTTP(S) is read-only). In either case the path can point directly at an array even when no parent directory ends in `.zarr` or `.n5`, for example `/data/crop04_AIPv2/seg/s0` or `https://host/files/crop04_AIPv2/seg/s0`. If the path points at an OME-Zarr multiscales group rather than an array, meshify opens the first dataset listed in the group metadata.
 
 #### `to-neuroglancer` — Convert existing meshes to neuroglancer multiresolution format
 
