@@ -35,6 +35,19 @@ pixi run python fileglancer/run_meshify.py \
 
 `FG_WORK_DIR` defaults to the current working directory when not set, so the generated config lands in `./meshify-config/`.
 
+## Cluster vs. Compute — how the worker count works
+
+There are two places in the Fileglancer UI that look like "how many workers" and they are **not** the same thing:
+
+- **Cluster tab → Resources → CPUs** sizes the *one* outer LSF job Fileglancer submits to run the wrapper. That CPU count goes into `bsub -n`.
+- **Parameters tab → Compute → Dask workers** is `--num-workers`, fed to a Dask `LocalCluster` *inside* that single LSF job.
+
+There are no child LSF jobs spawned. So Dask workers > CPUs just contends for the same cores. Match the two: Resources CPUs = Dask workers.
+
+### Charge group / project
+
+Fileglancer's manifest has no field for `bsub -P`. Use the **Cluster tab → Submit Options → Extra Arguments** field to add it, e.g. `-P cellmap`. Don't also add `-n` there — it conflicts with the structured CPUs field above.
+
 ## Adding more runnables
 
 Each subcommand (`to-neuroglancer`, `skeletonize`, `analyze`) follows the same pattern: add a runnable entry in `runnables.yaml` and a matching `run_<subcommand>.py` wrapper that materializes its config directory.

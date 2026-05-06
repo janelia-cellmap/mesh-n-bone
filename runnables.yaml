@@ -130,14 +130,18 @@ runnables:
 
       - section: Compute
         collapsed: true
+        description: >-
+          Set this to match the CPUs allocated on the Cluster tab. Each Dask
+          worker is a process running inside the one LSF job Fileglancer
+          submits, so workers > CPUs just thrashes.
         parameters:
           - flag: --num-workers
             name: Dask workers
             type: integer
             min: 1
-            default: 4
+            default: 12
 
     resources:
-      cpus: 8
-      memory: "32 GB"
+      cpus: 12
+      memory: "48 GB"
       walltime: "04:00"
