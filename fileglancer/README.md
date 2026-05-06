@@ -1,25 +1,25 @@
 # Fileglancer integration
 
-This directory turns mesh-n-bone into a [Fileglancer](https://github.com/JaneliaSciComp/fileglancer) app. Fileglancer reads `runnables.yaml`, renders a form for the parameters defined there, and runs the resulting command on the cluster.
+mesh-n-bone exposes a [Fileglancer](https://github.com/JaneliaSciComp/fileglancer) app via the `runnables.yaml` manifest at the repo root. Fileglancer reads that manifest, renders a form for the parameters defined there, and runs the resulting command on the cluster.
 
 ## Files
 
-- `runnables.yaml` — the Fileglancer manifest. Defines one runnable, `meshify`, with form fields for input/output paths, simplification, multiresolution, ROI, etc.
-- `run_meshify.py` — small Python wrapper. Fileglancer passes flagged arguments; the wrapper writes a `run-config.yaml` and `dask-config.yaml` into `$FG_WORK_DIR/meshify-config/` and invokes `mesh-n-bone meshify` against them.
+- [`../runnables.yaml`](../runnables.yaml) — the Fileglancer manifest. Defines one runnable, `meshify`, with form fields for input/output paths, simplification, multiresolution, ROI, etc.
+- [`run_meshify.py`](run_meshify.py) — small Python wrapper. Fileglancer passes flagged arguments; the wrapper writes a `run-config.yaml` and `dask-config.yaml` into `$FG_WORK_DIR/meshify-config/` and invokes `mesh-n-bone meshify` against them.
 
 The wrapper exists because `mesh-n-bone meshify` reads a config directory, while Fileglancer is built around individual CLI flags.
 
 ## How to register the app
 
-In Fileglancer, point an app entry at the manifest URL:
+On the Fileglancer **Apps** page, add the GitHub repo URL:
 
 ```
-https://github.com/janelia-cellmap/mesh-n-bone/blob/fileglancer-app/fileglancer/runnables.yaml
+https://github.com/janelia-cellmap/mesh-n-bone
 ```
 
-(Or whatever branch / tag holds this manifest.)
+(Or a branch/tag-pinned URL while this lives outside `master`.)
 
-Fileglancer will clone the repo, run `pre_run` (`pixi install`) once, then execute the `command` with the user-selected parameters appended as flags.
+Fileglancer clones the repo, looks up `runnables.yaml` at the root, and on first launch `pixi run` resolves the environment automatically before invoking the wrapper.
 
 ## Local sanity check
 

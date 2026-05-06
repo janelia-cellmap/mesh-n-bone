@@ -2,19 +2,16 @@ name: mesh-n-bone
 description: Generate neuroglancer-compatible meshes from segmentation volumes
 version: "0.1.7"
 
-requirements:
-  - pixi>=0.40
-
 runnables:
   - id: meshify
     name: Meshify segmentation volume
+    requirements:
+      - "pixi>=0.40"
     description: >-
       Run marching cubes on a Zarr/N5 segmentation, assemble across chunks,
       simplify and smooth, and optionally write neuroglancer multiresolution
       Draco-compressed output.
     command: pixi run python fileglancer/run_meshify.py
-    pre_run: |
-      pixi install
 
     parameters:
       - flag: --input
