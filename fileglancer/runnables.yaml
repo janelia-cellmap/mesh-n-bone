@@ -1,0 +1,146 @@
+name: mesh-n-bone
+description: Generate neuroglancer-compatible meshes from segmentation volumes
+version: "0.1.7"
+
+requirements:
+  - pixi>=0.40
+
+runnables:
+  - id: meshify
+    name: Meshify segmentation volume
+    description: >-
+      Run marching cubes on a Zarr/N5 segmentation, assemble across chunks,
+      simplify and smooth, and optionally write neuroglancer multiresolution
+      Draco-compressed output.
+    command: pixi run python fileglancer/run_meshify.py
+    pre_run: |
+      pixi install
+
+    parameters:
+      - flag: --input
+        name: Input segmentation
+        type: directory
+        description: >-
+          Path to a Zarr/N5 dataset (e.g. /nrs/.../seg.zarr/s0). Can also be a
+          path to an OME-Zarr multiscales group; the first dataset will be used.
+        required: true
+
+      - flag: --output
+        name: Output directory
+        type: directory
+        description: Where to write meshes and multiresolution output.
+        required: true
+
+      - section: Mesh generation
+        collapsed: true
+        parameters:
+          - flag: --downsample-factor
+            name: Downsample factor
+            type: integer
+            min: 1
+            description: Optional integer factor to downsample volume before meshing.
+          - flag: --downsample-method
+            name: Downsample method
+            type: enum
+            options: [mode, mode_suppress_zero, binary]
+            default: mode_suppress_zero
+
+      - section: Simplification & smoothing
+        collapsed: true
+        parameters:
+          - flag: --target-reduction
+            name: Target face reduction
+            type: number
+            min: 0
+            max: 1
+            default: 0.99
+            description: Fraction of faces to remove during simplification (0–1).
+          - flag: --n-smoothing-iter
+            name: Smoothing iterations
+            type: integer
+            min: 0
+            default: 10
+            description: Taubin smoothing iterations.
+          - flag: --no-simplification
+            name: Disable simplification
+            type: boolean
+            default: false
+          - flag: --no-validity-check
+            name: Allow non-watertight meshes
+            type: boolean
+            default: false
+            description: Skip the watertightness check (recommended when using ROI).
+          - flag: --use-fixed-edge-simplification
+            name: Preserve chunk-boundary edges
+            type: boolean
+            default: false
+          - flag: --no-analysis
+            name: Skip mesh-metrics CSV
+            type: boolean
+            default: false
+
+      - section: Multiresolution output
+        collapsed: false
+        parameters:
+          - flag: --multires
+            name: Generate multiresolution output
+            type: boolean
+            default: true
+          - flag: --num-lods
+            name: Levels of detail
+            type: integer
+            min: 1
+            default: 3
+          - flag: --multires-strategy
+            name: LOD strategy
+            type: enum
+            options: [decimate, downsample]
+            default: decimate
+          - flag: --decimation-factor
+            name: Decimation factor per LOD
+            type: integer
+            min: 2
+            default: 4
+          - flag: --keep-decimated-meshes
+            name: Keep intermediate LOD mesh files
+            type: boolean
+            default: false
+
+      - section: Coordinates & ROI
+        collapsed: true
+        parameters:
+          - flag: --voxel-size-nm
+            name: Voxel size override (nm, ZYX)
+            type: string
+            description: >-
+              Override voxel size when dataset metadata is missing or incorrect.
+              Comma-separated z,y,x in nanometers.
+            pattern: "^[0-9]+(\\.[0-9]+)?,[0-9]+(\\.[0-9]+)?,[0-9]+(\\.[0-9]+)?$"
+          - flag: --roi
+            name: ROI (z0,y0,x0,z1,y1,x1)
+            type: string
+            description: >-
+              Restrict processing to this ZYX subregion in dataset world units.
+            pattern: "^-?[0-9]+(\\.[0-9]+)?(,-?[0-9]+(\\.[0-9]+)?){5}$"
+
+      - section: Segment properties
+        collapsed: true
+        parameters:
+          - flag: --segment-properties-csv
+            name: Segment properties CSV
+            type: file
+            description: CSV with per-segment metadata (must include an Object ID column).
+
+      - section: Compute
+        collapsed: true
+        parameters:
+          - flag: --num-workers
+            name: Dask workers
+            type: integer
+            min: 1
+            default: 4
+
+    resources:
+      cpus: 8
+      memory: "32 GB"
+      walltime: "04:00"
