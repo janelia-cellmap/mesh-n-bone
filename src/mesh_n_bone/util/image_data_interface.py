@@ -9,6 +9,12 @@ import numpy as np
 import tensorstore as ts
 from funlib.geometry import Coordinate, Roi
 
+from mesh_n_bone.util.zarr_io import (
+    _is_http_url,
+    _path_join,
+    _read_json_file,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -18,7 +24,7 @@ def _detect_zarr_driver(dataset_path):
     Parameters
     ----------
     dataset_path : str
-        Full filesystem path to the dataset.
+        Full filesystem path or HTTP(S) URL to the dataset.
 
     Returns
     -------
@@ -27,12 +33,16 @@ def _detect_zarr_driver(dataset_path):
     """
     if dataset_path.rfind(".n5") > dataset_path.rfind(".zarr"):
         return "n5"
-    if os.path.exists(os.path.join(dataset_path, "zarr.json")):
+    if _read_json_file(_path_join(dataset_path, "zarr.json")) is not None:
         return "zarr3"
+    if _read_json_file(_path_join(dataset_path, ".zarray")) is not None:
+        return "zarr"
+    if _read_json_file(_path_join(dataset_path, "attributes.json")) is not None:
+        return "n5"
     return "zarr"
 
 
-def open_ds_tensorstore(dataset_path, mode="r"):
+def open_ds_tensorstore(dataset_path, mode="r", filetype=None):
     """Open a zarr/n5 dataset with TensorStore.
 
     Parameters
@@ -47,13 +57,23 @@ def open_ds_tensorstore(dataset_path, mode="r"):
     tensorstore.TensorStore
         Opened dataset handle.
     """
-    filetype = _detect_zarr_driver(dataset_path)
-    spec = {
-        "driver": filetype,
-        "kvstore": {
+    filetype = filetype or _detect_zarr_driver(dataset_path)
+    if _is_http_url(dataset_path):
+        if mode != "r":
+            raise ValueError("HTTP(S) TensorStore datasets are read-only")
+        kvstore = {
+            "driver": "http",
+            "base_url": dataset_path,
+        }
+    else:
+        kvstore = {
             "driver": "file",
             "path": os.path.abspath(dataset_path),
-        },
+        }
+
+    spec = {
+        "driver": filetype,
+        "kvstore": kvstore,
     }
     if mode == "r":
         dataset_future = ts.open(spec, read=True, write=False)

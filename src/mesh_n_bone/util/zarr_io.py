@@ -3,12 +3,48 @@
 import json
 import logging
 import os
+import posixpath
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlparse, urlunparse
+from urllib.request import Request, urlopen
 
 from funlib.geometry import Coordinate
 
 from mesh_n_bone.util.cellmap_array import CellMapArray
 
 logger = logging.getLogger(__name__)
+
+
+def _is_http_url(path):
+    """Return True if *path* is an HTTP(S) URL."""
+    return urlparse(str(path)).scheme in {"http", "https"}
+
+
+def _path_join(base, path):
+    """Join local filesystem paths or append URL path components."""
+    if not path:
+        return base
+    if _is_http_url(base):
+        parsed = urlparse(base)
+        joined_path = posixpath.join(parsed.path.rstrip("/"), str(path).lstrip("/"))
+        return urlunparse(parsed._replace(path=joined_path))
+    return os.path.join(base, path)
+
+
+def _path_dirname(path):
+    """Return the parent path for local filesystem paths or URLs."""
+    if _is_http_url(path):
+        parsed = urlparse(path)
+        dirname = posixpath.dirname(parsed.path.rstrip("/"))
+        return urlunparse(parsed._replace(path=dirname or "/"))
+    return os.path.dirname(path)
+
+
+def _path_basename(path):
+    """Return the final path component for local filesystem paths or URLs."""
+    if _is_http_url(path):
+        return posixpath.basename(urlparse(path).path.rstrip("/"))
+    return os.path.basename(path)
 
 
 class ArrayMetadata:
@@ -19,20 +55,24 @@ class ArrayMetadata:
     and ``attrs``.
     """
 
-    def __init__(self, shape, dtype, chunks, attrs):
+    def __init__(
+        self, shape, dtype, chunks, attrs, parent_attrs=None, dataset_name=None,
+    ):
         self.shape = shape
         self.dtype = dtype
         self.chunks = chunks
         self.attrs = attrs
+        self.parent_attrs = parent_attrs
+        self.dataset_name = dataset_name
 
 
 def _read_json_file(path):
-    """Read a JSON file from a local path.
+    """Read a JSON file from a local path or HTTP(S) URL.
 
     Parameters
     ----------
     path : str
-        Path to the JSON file.
+        Path or URL to the JSON file.
 
     Returns
     -------
@@ -41,9 +81,21 @@ def _read_json_file(path):
         not valid JSON.
     """
     try:
-        with open(path) as f:
-            return json.load(f)
-    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        if _is_http_url(path):
+            request = Request(path, headers={"Accept": "application/json"})
+            with urlopen(request, timeout=10) as f:
+                return json.load(f)
+        else:
+            with open(path) as f:
+                return json.load(f)
+    except (
+        FileNotFoundError,
+        OSError,
+        HTTPError,
+        URLError,
+        TimeoutError,
+        json.JSONDecodeError,
+    ):
         return None
 
 
@@ -69,11 +121,14 @@ def _read_attrs(dataset_path):
         Parsed attributes (may be empty).
     """
     if _is_n5(dataset_path):
-        return _read_json_file(os.path.join(dataset_path, "attributes.json")) or {}
-    zarr_json = _read_json_file(os.path.join(dataset_path, "zarr.json"))
+        return _read_json_file(_path_join(dataset_path, "attributes.json")) or {}
+    zarr_json = _read_json_file(_path_join(dataset_path, "zarr.json"))
     if zarr_json is not None:
         return zarr_json.get("attributes", {})
-    return _read_json_file(os.path.join(dataset_path, ".zattrs")) or {}
+    zattrs = _read_json_file(_path_join(dataset_path, ".zattrs"))
+    if zattrs is not None:
+        return zattrs
+    return _read_json_file(_path_join(dataset_path, "attributes.json")) or {}
 
 
 def split_dataset_path(dataset_path):
@@ -90,9 +145,12 @@ def split_dataset_path(dataset_path):
         ``(container_path, dataset_name)`` e.g.
         ``("/data/seg.zarr", "volumes/labels/s0")``.
     """
-    splitter = (
-        ".zarr" if dataset_path.rfind(".zarr") > dataset_path.rfind(".n5") else ".n5"
-    )
+    zarr_pos = dataset_path.rfind(".zarr")
+    n5_pos = dataset_path.rfind(".n5")
+    if zarr_pos == -1 and n5_pos == -1:
+        return dataset_path, ""
+
+    splitter = ".zarr" if zarr_pos > n5_pos else ".n5"
     # Split on the LAST occurrence so nested containers like
     # ``outer.zarr/inner.zarr/s0`` resolve to ``inner.zarr`` + ``s0``.
     parts = dataset_path.rsplit(splitter, 1)
@@ -121,15 +179,29 @@ def open_dataset(filename, ds_name, mode="r"):
     CellMapArray
         Array wrapper with physical coordinate metadata.
     """
-    from mesh_n_bone.util.image_data_interface import open_ds_tensorstore
+    from mesh_n_bone.util.image_data_interface import (
+        _detect_zarr_driver,
+        open_ds_tensorstore,
+    )
 
     logger.debug("opening dataset %s in %s", ds_name, filename)
-    full_path = os.path.join(filename, ds_name) if ds_name else filename
+    full_path = _path_join(filename, ds_name) if ds_name else filename
 
     attrs = _read_attrs(full_path)
+    parent_attrs = None
+    metadata_dataset_name = None
+    selected_dataset_path = None
+    if not ds_name:
+        selected_dataset_path = _first_multiscales_dataset_path(attrs)
+        if selected_dataset_path:
+            parent_attrs = attrs
+            metadata_dataset_name = selected_dataset_path
+            full_path = _path_join(full_path, selected_dataset_path)
+            attrs = _read_attrs(full_path)
 
     try:
-        ts_ds = open_ds_tensorstore(full_path, mode=mode)
+        filetype = _detect_zarr_driver(full_path)
+        ts_ds = open_ds_tensorstore(full_path, mode=mode, filetype=filetype)
     except Exception as e:
         logger.error("failed to open %s/%s: %s", filename, ds_name, e)
         raise
@@ -141,16 +213,24 @@ def open_dataset(filename, ds_name, mode="r"):
     # N5 stores shape in XYZ order, but funlib expects ZYX.  Reverse so
     # ROI computation (shape * voxel_size) and chunk-aligned operations
     # use consistent axis order.
-    if _is_n5(full_path):
+    if filetype == "n5":
         shape = shape[::-1]
         chunks = chunks[::-1]
 
-    data = ArrayMetadata(shape, dtype, chunks, attrs)
-    parent_dir = os.path.dirname(full_path)
-    parent_attrs = _read_attrs(parent_dir) if parent_dir and parent_dir != full_path else None
-    dataset_name = os.path.basename(full_path) or None
+    if parent_attrs is None:
+        parent_dir = _path_dirname(full_path)
+        if parent_dir and parent_dir != full_path:
+            parent_attrs = _read_attrs(parent_dir)
+    if metadata_dataset_name is None:
+        metadata_dataset_name = _path_basename(full_path) or None
+
+    data = ArrayMetadata(
+        shape, dtype, chunks, attrs,
+        parent_attrs=parent_attrs,
+        dataset_name=metadata_dataset_name,
+    )
     voxel_size, offset = _read_voxel_size_offset(
-        data, parent_attrs=parent_attrs, dataset_name=dataset_name,
+        data, parent_attrs=parent_attrs, dataset_name=metadata_dataset_name,
     )
     return CellMapArray(data, voxel_size, offset, dataset_path=full_path)
 
@@ -252,8 +332,12 @@ def read_raw_voxel_size(ds):
     not round. Falls back to ``ds.voxel_size`` (already a Coordinate)
     when no metadata source declares a value.
     """
-    parent_attrs = _read_parent_attrs(ds)
-    dataset_name = os.path.basename(getattr(ds, "_dataset_path", "")) or None
+    parent_attrs = getattr(ds.data, "parent_attrs", None) or _read_parent_attrs(ds)
+    dataset_name = (
+        getattr(ds.data, "dataset_name", None)
+        or _path_basename(getattr(ds, "_dataset_path", ""))
+        or None
+    )
     voxel_size, _ = _resolve_voxel_size_offset(
         ds.data.attrs, parent_attrs, dataset_name,
     )
@@ -287,6 +371,20 @@ def _get_multiscales(attrs):
             sorted(ome.keys()),
         )
     return None
+
+
+def _first_multiscales_dataset_path(attrs):
+    """Return the first dataset path from OME-Zarr multiscales metadata."""
+    multiscales = _get_multiscales(attrs)
+    if not multiscales:
+        return None
+    ms = multiscales[0] if isinstance(multiscales, list) and multiscales else None
+    if not isinstance(ms, dict):
+        return None
+    datasets = ms.get("datasets") or []
+    if not datasets or not isinstance(datasets[0], dict):
+        return None
+    return datasets[0].get("path")
 
 
 def _read_transforms(transforms):
@@ -486,7 +584,11 @@ def _read_parent_attrs(ds):
     if dataset_path is None:
         return None
 
-    parent = os.path.dirname(dataset_path)
+    parent_attrs = getattr(ds.data, "parent_attrs", None)
+    if parent_attrs:
+        return parent_attrs
+
+    parent = _path_dirname(dataset_path)
     if parent and parent != dataset_path:
         attrs = _read_attrs(parent)
         if attrs:

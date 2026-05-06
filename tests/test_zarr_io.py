@@ -1,7 +1,10 @@
 """Unit tests for OME-NGFF metadata helpers in mesh_n_bone.util.zarr_io."""
 
+import functools
+import http.server
 import logging
 import os
+import threading
 
 import numpy as np
 import pytest
@@ -16,6 +19,7 @@ from mesh_n_bone.util.zarr_io import (
     _read_voxel_size_offset,
     open_dataset,
     read_raw_voxel_size,
+    split_dataset_path,
 )
 
 
@@ -128,6 +132,26 @@ def _ome_zarr_factory(tmp_output_dir):
     return _make
 
 
+@pytest.fixture
+def _http_directory_server(tmp_output_dir):
+    """Serve *tmp_output_dir* over localhost HTTP for TensorStore tests."""
+
+    class QuietHandler(http.server.SimpleHTTPRequestHandler):
+        def log_message(self, format, *args):
+            pass
+
+    handler = functools.partial(QuietHandler, directory=tmp_output_dir)
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}"
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
 class TestOpenDatasetOmeFallback:
     """``open_dataset`` must pick up voxel_size/offset from either layout."""
 
@@ -146,6 +170,52 @@ class TestOpenDatasetOmeFallback:
         ds = open_dataset(*os.path.split(path))
         raw = read_raw_voxel_size(ds)
         assert raw == (8.0, 16.0, 32.0)
+
+    def test_open_http_zarr_without_extension(
+        self, tmp_output_dir, _http_directory_server,
+    ):
+        zarr_path = os.path.join(tmp_output_dir, "crop04_AIPv2")
+        root = zarr.open_group(zarr_path, mode="w")
+        root.create_array(
+            "seg/s0",
+            data=np.zeros((4, 4, 4), dtype=np.uint32),
+            chunks=(4, 4, 4),
+        )
+        root["seg"].attrs["multiscales"] = _multiscales_block(
+            [8, 16, 32], [10, 20, 30],
+        )
+
+        url = f"{_http_directory_server}/crop04_AIPv2/seg/s0"
+        ds = open_dataset(*split_dataset_path(url))
+
+        assert ds.shape == (4, 4, 4)
+        assert tuple(ds.voxel_size) == (8, 16, 32)
+        assert tuple(ds.roi.begin) == (10, 20, 30)
+
+    def test_open_http_ome_group_without_extension_selects_first_dataset(
+        self, tmp_output_dir, _http_directory_server,
+    ):
+        zarr_path = os.path.join(tmp_output_dir, "crop04_group")
+        root = zarr.open_group(zarr_path, mode="w")
+        root.create_array(
+            "seg/s0",
+            data=np.zeros((4, 4, 4), dtype=np.uint32),
+            chunks=(4, 4, 4),
+        )
+        ms = _multiscales_block([8.5, 16.5, 32.5], [10, 20, 30])
+        ms[0]["datasets"][0]["path"] = "seg/s0"
+        root.attrs["multiscales"] = ms
+
+        url = f"{_http_directory_server}/crop04_group"
+        ds = open_dataset(*split_dataset_path(url))
+
+        assert ds.shape == (4, 4, 4)
+        assert ds._dataset_path == f"{url}/seg/s0"
+        assert read_raw_voxel_size(ds) == (8.5, 16.5, 32.5)
+
+    def test_split_http_dataset_path_without_extension(self):
+        url = "https://fileglancer.int.janelia.org/files/id/crop04_AIPv2"
+        assert split_dataset_path(url) == (url, "")
 
 
 def _empty_meta(attrs=None):
