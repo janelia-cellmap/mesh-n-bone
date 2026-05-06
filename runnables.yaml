@@ -24,8 +24,12 @@ runnables:
 
       - flag: --output
         name: Output directory
-        type: directory
-        description: Where to write meshes and multiresolution output.
+        type: string
+        description: >-
+          Where to write meshes and multiresolution output. Created if it
+          doesn't exist. Use an absolute path. (Type is `string` rather than
+          `directory` so Fileglancer doesn't reject paths that don't exist
+          yet.)
         required: true
 
       - section: Mesh generation
@@ -65,16 +69,27 @@ runnables:
           - flag: --no-validity-check
             name: Allow non-watertight meshes
             type: boolean
-            default: false
-            description: Skip the watertightness check (recommended when using ROI).
+            default: true
+            description: >-
+              Skip the watertightness check. On by default because most real
+              data produces non-watertight meshes (especially with ROI), and
+              the check otherwise blocks the pipeline.
           - flag: --use-fixed-edge-simplification
-            name: Preserve chunk-boundary edges
+            name: Allow blockwise simplification (preserve chunk-boundary edges)
             type: boolean
             default: false
+            description: >-
+              Simplify each block independently while preserving edges along
+              chunk boundaries, so seams stay aligned. Faster and uses less
+              memory than global simplification, at the cost of slightly
+              denser meshes near chunk borders.
           - flag: --no-analysis
             name: Skip mesh-metrics CSV
             type: boolean
-            default: false
+            default: true
+            description: >-
+              Skip the per-mesh metrics CSV (volume, surface area, curvature,
+              etc.). On by default since most users don't need it.
 
       - section: Multiresolution output
         collapsed: false
@@ -148,6 +163,6 @@ runnables:
               cellmap). Leave blank if your cluster doesn't require -P.
 
     resources:
-      cpus: 2
-      memory: "4 GB"
+      cpus: 8
+      memory: "120 GB"
       walltime: "04:00"

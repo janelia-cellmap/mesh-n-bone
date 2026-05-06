@@ -149,6 +149,8 @@ def main(argv=None):
     run_config = _build_run_config(args)
     dask_config = _build_dask_config(args)
 
+    Path(args.output).mkdir(parents=True, exist_ok=True)
+
     (config_dir / "run-config.yaml").write_text(yaml.safe_dump(run_config, sort_keys=False))
     (config_dir / "dask-config.yaml").write_text(yaml.safe_dump(dask_config, sort_keys=False))
 
