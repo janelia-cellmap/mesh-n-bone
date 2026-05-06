@@ -35,18 +35,26 @@ pixi run python fileglancer/run_meshify.py \
 
 `FG_WORK_DIR` defaults to the current working directory when not set, so the generated config lands in `./meshify-config/`.
 
-## Cluster vs. Compute — how the worker count works
+## How it maps to your CLI flow
 
-There are two places in the Fileglancer UI that look like "how many workers" and they are **not** the same thing:
+The wrapper mirrors your normal:
 
-- **Cluster tab → Resources → CPUs** sizes the *one* outer LSF job Fileglancer submits to run the wrapper. That CPU count goes into `bsub -n`.
-- **Parameters tab → Compute → Dask workers** is `--num-workers`, fed to a Dask `LocalCluster` *inside* that single LSF job.
+```bash
+bsub -n 2 -P cellmap mesh-n-bone meshify lsf-config -n 144
+```
 
-There are no child LSF jobs spawned. So Dask workers > CPUs just contends for the same cores. Match the two: Resources CPUs = Dask workers.
+Fileglancer's outer LSF job acts as the driver (Resources tab: 2 cpus / 4 GB). The driver reads [`../lsf-config/dask-config.yaml`](../lsf-config/dask-config.yaml) — same file you use today — substitutes the `project:` field with your `LSF project` form input, and runs `mesh-n-bone meshify` with `--num-workers`. dask-jobqueue spawns the worker LSF jobs.
 
-### Charge group / project
+So the only LSF-related fields in the form are:
 
-Fileglancer's manifest has no field for `bsub -P`. Use the **Cluster tab → Submit Options → Extra Arguments** field to add it, e.g. `-P cellmap`. Don't also add `-n` there — it conflicts with the structured CPUs field above.
+- **Compute → Dask workers** (default `144`) — total worker processes
+- **Compute → LSF project** — charge group for the worker jobs (`cellmap`, etc.)
+
+If you want to change cores/memory/walltime per child job, edit `lsf-config/dask-config.yaml` (just like you do today). No need to re-expose those in the UI.
+
+### Driver job's own charge group
+
+Fileglancer's manifest has no field for `bsub -P` on the driver itself. Set it in **Cluster tab → Submit Options → Extra Arguments** (e.g. `-P cellmap`). Don't add `-n` there — it conflicts with the structured CPUs field.
 
 ## Adding more runnables
 

@@ -72,6 +72,12 @@ def _build_arg_parser():
     parser.add_argument("--roi", type=_parse_roi, default=None)
     parser.add_argument("--segment-properties-csv", default=None)
 
+    parser.add_argument(
+        "--lsf-project",
+        required=True,
+        help="LSF project (-P) for child worker jobs.",
+    )
+
     return parser
 
 
@@ -120,33 +126,15 @@ def _build_run_config(args):
     return config
 
 
-def _build_dask_config(num_workers):
-    return {
-        "jobqueue": {
-            "local": {
-                "ncpus": num_workers,
-                "processes": num_workers,
-                "cores": num_workers,
-                "log-directory": "job-logs",
-                "name": "dask-worker",
-            }
-        },
-        "distributed": {
-            "scheduler": {"work-stealing": True},
-            "worker": {
-                "memory": {
-                    "target": 0.0,
-                    "spill": 0.0,
-                    "pause": 0.0,
-                    "terminate": 0.0,
-                }
-            },
-            "admin": {
-                "log-format": "[%(asctime)s] %(levelname)s %(message)s",
-                "tick": {"interval": "20ms", "limit": "3h"},
-            },
-        },
-    }
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_LSF_TEMPLATE = _REPO_ROOT / "lsf-config" / "dask-config.yaml"
+
+
+def _build_dask_config(args):
+    """Reuse the in-repo lsf-config/dask-config.yaml, substituting -P."""
+    config = yaml.safe_load(_LSF_TEMPLATE.read_text())
+    config["jobqueue"]["lsf"]["project"] = args.lsf_project
+    return config
 
 
 def main(argv=None):
@@ -157,7 +145,7 @@ def main(argv=None):
     config_dir.mkdir(parents=True, exist_ok=True)
 
     run_config = _build_run_config(args)
-    dask_config = _build_dask_config(args.num_workers)
+    dask_config = _build_dask_config(args)
 
     (config_dir / "run-config.yaml").write_text(yaml.safe_dump(run_config, sort_keys=False))
     (config_dir / "dask-config.yaml").write_text(yaml.safe_dump(dask_config, sort_keys=False))

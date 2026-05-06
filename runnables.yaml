@@ -129,19 +129,23 @@ runnables:
             description: CSV with per-segment metadata (must include an Object ID column).
 
       - section: Compute
-        collapsed: true
-        description: >-
-          Set this to match the CPUs allocated on the Cluster tab. Each Dask
-          worker is a process running inside the one LSF job Fileglancer
-          submits, so workers > CPUs just thrashes.
+        collapsed: false
         parameters:
           - flag: --num-workers
             name: Dask workers
             type: integer
             min: 1
-            default: 12
+            default: 144
+            description: >-
+              Total worker processes across child LSF jobs. With the in-repo
+              lsf-config (40 processes per job), 144 fans out to 4 child jobs.
+          - flag: --lsf-project
+            name: LSF project (-P) for worker jobs
+            type: string
+            required: true
+            description: Charge group for the dask worker LSF jobs (e.g. cellmap).
 
     resources:
-      cpus: 12
-      memory: "48 GB"
+      cpus: 2
+      memory: "4 GB"
       walltime: "04:00"
