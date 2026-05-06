@@ -56,9 +56,12 @@ def _build_arg_parser():
     parser.add_argument("--target-reduction", type=float, default=None)
     parser.add_argument("--n-smoothing-iter", type=int, default=None)
     parser.add_argument("--no-simplification", action="store_true")
-    parser.add_argument("--no-validity-check", action="store_true")
     parser.add_argument("--use-fixed-edge-simplification", action="store_true")
-    parser.add_argument("--no-analysis", action="store_true")
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="Enable both watertight validity check and mesh-metrics CSV.",
+    )
 
     parser.add_argument("--multires", action="store_true")
     parser.add_argument("--num-lods", type=int, default=None)
@@ -98,12 +101,10 @@ def _build_run_config(args):
         config["target_reduction"] = args.target_reduction
     if args.n_smoothing_iter is not None:
         config["n_smoothing_iter"] = args.n_smoothing_iter
-    if args.no_validity_check:
-        config["check_mesh_validity"] = False
     if args.use_fixed_edge_simplification:
         config["use_fixed_edge_simplification"] = True
-    if args.no_analysis:
-        config["do_analysis"] = False
+    config["check_mesh_validity"] = bool(args.strict)
+    config["do_analysis"] = bool(args.strict)
 
     if args.multires:
         config["do_multires"] = True
