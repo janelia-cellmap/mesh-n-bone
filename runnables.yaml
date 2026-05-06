@@ -69,7 +69,7 @@ runnables:
           - flag: --use-fixed-edge-simplification
             name: Allow blockwise simplification (preserve chunk-boundary edges)
             type: boolean
-            default: false
+            default: true
             description: >-
               Simplify each block independently while preserving edges along
               chunk boundaries, so seams stay aligned. Faster and uses less
