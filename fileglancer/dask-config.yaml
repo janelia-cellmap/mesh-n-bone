@@ -1,0 +1,32 @@
+jobqueue:
+  lsf:
+    ncpus: 8
+    processes: 8
+    cores: 8
+    memory: 120GB
+    mem: 120000000000
+    walltime: 01:00
+    use-stdin: true
+    log-directory: job-logs
+    name: mesh-n-bone
+
+    # project is overwritten at runtime by run_meshify.py from the form's
+    # "LSF project" field. The placeholder here is just a marker.
+    project: your_project_name
+
+distributed:
+  scheduler:
+    work-stealing: true
+
+  worker:
+    memory:
+      target: 0.0
+      spill: 0.0
+      pause: 0.0
+      terminate: 0.0
+
+  admin:
+    log-format: '[%(asctime)s] %(levelname)s %(message)s'
+    tick:
+      interval: 20ms
+      limit: 3h

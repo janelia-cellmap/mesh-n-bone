@@ -126,13 +126,12 @@ def _build_run_config(args):
     return config
 
 
-_REPO_ROOT = Path(__file__).resolve().parent.parent
-_LSF_TEMPLATE = _REPO_ROOT / "lsf-config" / "dask-config.yaml"
+_DASK_TEMPLATE = Path(__file__).resolve().parent / "dask-config.yaml"
 
 
 def _build_dask_config(args):
-    """Reuse the in-repo lsf-config/dask-config.yaml, substituting -P."""
-    config = yaml.safe_load(_LSF_TEMPLATE.read_text())
+    """Reuse fileglancer/dask-config.yaml, substituting the LSF project."""
+    config = yaml.safe_load(_DASK_TEMPLATE.read_text())
     config["jobqueue"]["lsf"]["project"] = args.lsf_project
     return config
 

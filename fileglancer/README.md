@@ -43,14 +43,26 @@ The wrapper mirrors your normal:
 bsub -n 2 -P cellmap mesh-n-bone meshify lsf-config -n 144
 ```
 
-Fileglancer's outer LSF job acts as the driver (Resources tab: 2 cpus / 4 GB). The driver reads [`../lsf-config/dask-config.yaml`](../lsf-config/dask-config.yaml) — same file you use today — substitutes the `project:` field with your `LSF project` form input, and runs `mesh-n-bone meshify` with `--num-workers`. dask-jobqueue spawns the worker LSF jobs.
+Fileglancer's outer LSF job acts as the driver (Resources tab: 2 cpus / 4 GB). The driver reads [`dask-config.yaml`](dask-config.yaml) **from this directory** (not the production `lsf-config/`), substitutes the `project:` field with your `LSF project` form input, and runs `mesh-n-bone meshify` with `--num-workers`. dask-jobqueue spawns the worker LSF jobs.
 
 So the only LSF-related fields in the form are:
 
 - **Compute → Dask workers** (default `144`) — total worker processes
 - **Compute → LSF project** — charge group for the worker jobs (`cellmap`, etc.)
 
-If you want to change cores/memory/walltime per child job, edit `lsf-config/dask-config.yaml` (just like you do today). No need to re-expose those in the UI.
+If you want to change per-child-job cores/memory/walltime for the Fileglancer flow, edit [`dask-config.yaml`](dask-config.yaml) here. The production CLI still uses [`../lsf-config/dask-config.yaml`](../lsf-config/dask-config.yaml) and is not affected.
+
+Current `fileglancer/dask-config.yaml` per-child-job settings:
+
+| Field | Value |
+|---|---|
+| `ncpus` | 8 |
+| `processes` | 8 |
+| `cores` | 8 |
+| `memory` | 120 GB (15 GB × 8) |
+| `walltime` | 01:00 |
+
+So `--num-workers 144` with `processes: 8` fans out to 18 child LSF jobs.
 
 ### Driver job's own charge group
 
