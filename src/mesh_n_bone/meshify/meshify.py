@@ -1032,6 +1032,12 @@ class Meshify:
             # removed every vertex of every per-block PLY. Bail out before
             # deduplicate_chunk_boundaries, which can't handle empty verts.
             if len(mesh.vertices) == 0:
+                logger.warning(
+                    "Mesh %s: skipping — concatenated %d per-block PLY(s) "
+                    "produced zero vertices (likely a sliver clipped away by "
+                    "fixed-edge simplification).",
+                    mesh_id, len(mesh_files),
+                )
                 shutil.rmtree(f"{self.dirname}/{mesh_id}", ignore_errors=True)
                 return
             chunk_size = (
@@ -1066,6 +1072,11 @@ class Meshify:
         # an ROI cut leaves nothing behind. pymeshlab refuses an empty
         # vertex matrix, so skip the segment entirely.
         if len(mesh.vertices) == 0:
+            logger.warning(
+                "Mesh %s: skipping — boundary dedup/merge_vertices left "
+                "zero vertices.",
+                mesh_id,
+            )
             shutil.rmtree(f"{self.dirname}/{mesh_id}", ignore_errors=True)
             return
 
