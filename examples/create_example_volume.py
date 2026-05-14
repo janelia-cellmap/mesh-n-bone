@@ -51,24 +51,28 @@ def box_coords(box):
     return np.ogrid[z.start:z.stop, y.start:y.stop, x.start:x.stop]
 
 
-sphere_box = object_box((128, 64, 64), 50)
+# Objects are positioned so each one straddles the y=128 and x=128 center
+# planes (z=128 was already crossed by all three). That way the neuroglancer
+# cross-section panels at the volume center show pieces of each object.
+
+sphere_box = object_box((128, 96, 96), 50)
 zz, yy, xx = box_coords(sphere_box)
 sphere = vol[sphere_box]
-sphere[(zz - 128) ** 2 + (yy - 64) ** 2 + (xx - 64) ** 2 <= 50**2] = 1
+sphere[(zz - 128) ** 2 + (yy - 96) ** 2 + (xx - 96) ** 2 <= 50**2] = 1
 
-torus_box = object_box((128, 192, 192), (60, 60, 20))
+torus_box = object_box((128, 160, 128), (60, 60, 20))
 zz, yy, xx = box_coords(torus_box)
 dist_to_ring = (
-    np.sqrt((yy - 192) ** 2 + (zz - 128) ** 2) - 40
-) ** 2 + (xx - 192) ** 2
+    np.sqrt((yy - 160) ** 2 + (zz - 128) ** 2) - 40
+) ** 2 + (xx - 128) ** 2
 torus = vol[torus_box]
 torus[dist_to_ring <= 20**2] = 2
 
-blob_box = object_box((128, 192, 64), 48)
+blob_box = object_box((128, 160, 96), 48)
 zz, yy, xx = box_coords(blob_box)
 dz = zz - 128
-dy = yy - 192
-dx = xx - 64
+dy = yy - 160
+dx = xx - 96
 r = np.sqrt(dx**2 + dy**2 + dz**2)
 azimuth = np.arctan2(dy, dx)
 polar = np.arctan2(dz, np.sqrt(dx**2 + dy**2))
