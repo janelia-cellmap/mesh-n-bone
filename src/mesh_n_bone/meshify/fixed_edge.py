@@ -465,8 +465,14 @@ def simplify_mesh(
             aggressiveness=aggressiveness,
             verbose=False,
         )
-    m2 = trimesh.Trimesh(vertices=v_out, faces=f_out, process=False)
-    return repair_cleanup(m2)
+    m2 = repair_cleanup(trimesh.Trimesh(vertices=v_out, faces=f_out, process=False))
+    # On tiny inputs, the decimator + degenerate-face cleanup can collapse
+    # the mesh to nothing. Don't throw away real geometry — fall back to
+    # the boundary-clipped pre-simplification mesh so it survives to the
+    # assembly stage.
+    if len(m2.faces) == 0 and len(F) > 0:
+        return mesh
+    return m2
 
 
 def detect_seam_vertices(mesh, angle_degrees, verbose=False):

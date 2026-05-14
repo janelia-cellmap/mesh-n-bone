@@ -216,7 +216,6 @@ def _get_chunked_mesh_worker(block, tmpdirname, config):
     mesher.mesh(segmentation_block, close=False)
     for id in mesher.ids():
         mesh = mesher.get_mesh(id)
-        os.makedirs(f"{tmpdirname}/{id}", exist_ok=True)
 
         if config["use_fixed_edge_simplification"] and config["do_simplification"]:
             mesh_tri = trimesh.Trimesh(vertices=mesh.vertices, faces=mesh.faces)
@@ -249,6 +248,11 @@ def _get_chunked_mesh_worker(block, tmpdirname, config):
                 verbose=False,
                 fix_edges=True,
             )
+            # Segments living entirely in this block's padding zone end up
+            # empty after boundary clipping. Skip writing — they'll be
+            # produced by the adjacent block whose core contains them.
+            if len(mesh_tri_simplified.vertices) == 0:
+                continue
             half_pad_offset = block_offset + 0.5 * np.array(output_voxel_size)
             mesh_tri_simplified.vertices += half_pad_offset[::-1] + ds_shift[::-1]
 
@@ -258,10 +262,14 @@ def _get_chunked_mesh_worker(block, tmpdirname, config):
                 normals=None,
             )
 
+            os.makedirs(f"{tmpdirname}/{id}", exist_ok=True)
             with open(f"{tmpdirname}/{id}/block_{block.index}.ply", "wb") as fp:
                 fp.write(mesh_simplified.to_ply())
         else:
+            if len(mesh.vertices) == 0:
+                continue
             mesh.vertices += block_offset[::-1] + ds_shift[::-1]
+            os.makedirs(f"{tmpdirname}/{id}", exist_ok=True)
             with open(f"{tmpdirname}/{id}/block_{block.index}.ply", "wb") as fp:
                 fp.write(mesh.to_ply())
 
@@ -409,23 +417,32 @@ class Meshify:
         segment_properties_id_column: str = "Object ID",
         coordinate_units: str = "nm",
         voxel_size_nm: list = None,
+        retry_on_oom: bool = True,
+        memory_retry_max: int = 3,
     ):
         filename, dataset_name = split_dataset_path(input_path)
         self.segmentation_array = open_dataset(filename, dataset_name)
-        self.output_directory = output_directory
-        self.input_path = input_path
         self._dataset_path = (
             getattr(self.segmentation_array, "_dataset_path", None)
             or (_path_join(filename, dataset_name) if dataset_name else filename)
         )
-        self._swap_axes = _detect_zarr_driver(self._dataset_path) == "n5"
+        self.output_directory = output_directory
+        self.input_path = input_path
+        # Both N5 and neuroglancer precomputed store voxels in XYZ order
+        # with no per-axis labels, so we need to swap to ZYX at read time.
+        driver = _detect_zarr_driver(self._dataset_path)
+        self._swap_axes = driver in ("n5", "neuroglancer_precomputed")
 
         # Get true (possibly non-integer) voxel size from the underlying data
         self.true_voxel_size = np.array(read_raw_voxel_size(self.segmentation_array))
 
         # Check if voxel_size is just defaults (1,1,1) and
-        # try OME-NGFF multiscales metadata from the parent zarr group
-        ome_voxel_size, ome_offset, ome_units = _read_ome_ngff_transform(input_path)
+        # try OME-NGFF multiscales metadata from the parent zarr group.
+        # Skip for precomputed (no OME metadata).
+        if driver == "neuroglancer_precomputed":
+            ome_voxel_size, ome_offset, ome_units = None, None, None
+        else:
+            ome_voxel_size, ome_offset, ome_units = _read_ome_ngff_transform(input_path)
 
         if ome_units is not None and coordinate_units == "nm":
             coordinate_units = ome_units
@@ -552,6 +569,8 @@ class Meshify:
         self.segment_properties_columns = segment_properties_columns
         self.segment_properties_id_column = segment_properties_id_column
         self.coordinate_units = coordinate_units
+        self.retry_on_oom = retry_on_oom
+        self.memory_retry_max = memory_retry_max
 
     def _default_block_shape_pixels(self, target_mb=128):
         """Choose a default block shape as a chunk-aligned multiple.
@@ -680,13 +699,24 @@ class Meshify:
         )
 
         worker_config = self._get_worker_config()
-        b = db.from_sequence(blocks, npartitions=self.num_workers * 10).map(
-            _get_chunked_mesh_worker, dirname, worker_config
+        effective_workers = dask_util.effective_num_workers(
+            self.num_workers, len(blocks), logger, "generate chunked meshes",
         )
 
-        with dask_util.start_dask(self.num_workers, "generate chunked meshes", logger):
-            with Timing_Messager("Generating chunked meshes", logger):
-                b.compute()
+        def _run(workers, config):
+            bag = db.from_sequence(blocks, npartitions=workers * 10).map(
+                _get_chunked_mesh_worker, dirname, worker_config
+            )
+            with dask_util.start_dask(
+                workers, "generate chunked meshes", logger, config=config,
+            ):
+                with Timing_Messager("Generating chunked meshes", logger):
+                    bag.compute()
+
+        dask_util.run_with_oom_retry(
+            _run, effective_workers, "generate chunked meshes", logger,
+            max_retries=self.memory_retry_max, retry_on_oom=self.retry_on_oom,
+        )
 
     @staticmethod
     def simplify_and_smooth_mesh(
@@ -958,6 +988,13 @@ class Meshify:
         """
         if not os.path.exists(f"{self.dirname}/{mesh_id}"):
             return
+        # Echo the segment id to worker stderr so it lands in the LSF
+        # worker .err file. If the worker is later killed (e.g. by OOM),
+        # the last mesh_id logged by that worker identifies what it was
+        # processing — grep job-logs/LSFCluster-*.err for "assemble
+        # mesh_id=".
+        import sys
+        print(f"assemble mesh_id={mesh_id}", file=sys.stderr, flush=True)
 
         mesh_files = [
             f for f in os.listdir(f"{self.dirname}/{mesh_id}") if f.endswith(".ply")
@@ -991,6 +1028,12 @@ class Meshify:
                 raise Exception(f"{mesh_id} failed, with error: {e}")
             del block_meshes
             mesh = mesh.consolidate()
+            # A segment can end up empty here when fixed-edge clipping
+            # removed every vertex of every per-block PLY. Bail out before
+            # deduplicate_chunk_boundaries, which can't handle empty verts.
+            if len(mesh.vertices) == 0:
+                shutil.rmtree(f"{self.dirname}/{mesh_id}", ignore_errors=True)
+                return
             chunk_size = (
                 self.read_write_block_shape_pixels * self.base_voxel_size_funlib
             )
@@ -1017,6 +1060,14 @@ class Meshify:
         # open — skip hole-closing and watertight validity checks.
         check_validity = self.check_mesh_validity and not self.has_custom_roi
         hole_size = 0 if self.has_custom_roi else 30
+
+        # A segment can end up with zero vertices when its entire surface
+        # sat on a chunk boundary that fixed-edge clipping removed, or when
+        # an ROI cut leaves nothing behind. pymeshlab refuses an empty
+        # vertex matrix, so skip the segment entirely.
+        if len(mesh.vertices) == 0:
+            shutil.rmtree(f"{self.dirname}/{mesh_id}", ignore_errors=True)
+            return
 
         if check_validity or self.has_custom_roi:
             try:
@@ -1119,14 +1170,27 @@ class Meshify:
         # only reads PLY files, not the segmentation volume.
         saved_array = self.segmentation_array
         self.segmentation_array = None
-        try:
-            b = db.from_sequence(
+        effective_workers = dask_util.effective_num_workers(
+            self.num_workers, len(mesh_ids), logger, "assemble meshes",
+        )
+
+        def _run(workers, config):
+            bag = db.from_sequence(
                 mesh_ids,
-                npartitions=dask_util.guesstimate_npartitions(mesh_ids, self.num_workers),
+                npartitions=dask_util.guesstimate_npartitions(mesh_ids, workers),
             ).map(self._assemble_mesh)
-            with dask_util.start_dask(self.num_workers, "assemble meshes", logger):
+            with dask_util.start_dask(
+                workers, "assemble meshes", logger, config=config,
+            ):
                 with Timing_Messager("Assembling meshes", logger):
-                    b.compute()
+                    bag.compute()
+
+        try:
+            dask_util.run_with_oom_retry(
+                _run, effective_workers, "assemble meshes", logger,
+                max_retries=self.memory_retry_max,
+                retry_on_oom=self.retry_on_oom,
+            )
         finally:
             self.segmentation_array = saved_array
         if self.do_legacy_neuroglancer:
@@ -1252,18 +1316,30 @@ class Meshify:
 
         logger.info(f"Generating neuroglancer multires for {len(mesh_ids)} meshes with {self.num_lods} LODs")
 
-        with dask_util.start_dask(self.num_workers, "multires creation", logger):
-            with Timing_Messager("Generating multires meshes", logger):
-                generate_all_neuroglancer_multires_meshes(
-                    self.output_directory,
-                    self.num_workers,
-                    mesh_ids,
-                    lods,
-                    mesh_ext,
-                    np.array(file_sizes, dtype=float),
-                    self.lod_0_box_size,
-                    target_faces_per_lod0_chunk=self.target_faces_per_lod0_chunk,
-                )
+        effective_workers = dask_util.effective_num_workers(
+            self.num_workers, len(mesh_ids), logger, "multires creation",
+        )
+
+        def _run(workers, config):
+            with dask_util.start_dask(
+                workers, "multires creation", logger, config=config,
+            ):
+                with Timing_Messager("Generating multires meshes", logger):
+                    generate_all_neuroglancer_multires_meshes(
+                        self.output_directory,
+                        workers,
+                        mesh_ids,
+                        lods,
+                        mesh_ext,
+                        np.array(file_sizes, dtype=float),
+                        self.lod_0_box_size,
+                        target_faces_per_lod0_chunk=self.target_faces_per_lod0_chunk,
+                    )
+
+        dask_util.run_with_oom_retry(
+            _run, effective_workers, "multires creation", logger,
+            max_retries=self.memory_retry_max, retry_on_oom=self.retry_on_oom,
+        )
 
         with Timing_Messager("Writing info and segment properties files", logger):
             multires_path = f"{self.output_directory}/multires"
@@ -1318,18 +1394,31 @@ class Meshify:
         if len(lods) > 1:
             logger.info(f"Decimating meshes for LODs 1-{len(lods)-1} "
                         f"(factor={self.decimation_factor}, aggressiveness={self.decimation_aggressiveness})")
-            with dask_util.start_dask(self.num_workers, "decimation", logger):
-                with Timing_Messager("Generating decimated meshes", logger):
-                    generate_decimated_meshes(
-                        s0_dir,
-                        self.output_directory,
-                        lods,
-                        mesh_ids,
-                        mesh_ext,
-                        self.decimation_factor,
-                        self.decimation_aggressiveness,
-                        self.num_workers,
-                    )
+            effective_workers = dask_util.effective_num_workers(
+                self.num_workers, len(mesh_ids), logger, "decimation",
+            )
+
+            def _run(workers, config):
+                with dask_util.start_dask(
+                    workers, "decimation", logger, config=config,
+                ):
+                    with Timing_Messager("Generating decimated meshes", logger):
+                        generate_decimated_meshes(
+                            s0_dir,
+                            self.output_directory,
+                            lods,
+                            mesh_ids,
+                            mesh_ext,
+                            self.decimation_factor,
+                            self.decimation_aggressiveness,
+                            workers,
+                        )
+
+            dask_util.run_with_oom_retry(
+                _run, effective_workers, "decimation", logger,
+                max_retries=self.memory_retry_max,
+                retry_on_oom=self.retry_on_oom,
+            )
 
     def _generate_multires_downsample(self, mesh_lods_dir, lods):
         """Strategy: downsample volume at each LOD, re-mesh."""

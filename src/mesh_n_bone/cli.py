@@ -105,15 +105,23 @@ def cmd_meshify(args):
         optional ``roi``.
     """
     from mesh_n_bone.meshify.meshify import Meshify
-    from mesh_n_bone.util.logging import tee_streams
+    from mesh_n_bone.util.logging import tee_streams, print_with_datetime
 
+    log = logging.getLogger("mesh_n_bone.cli")
     execution_directory, logpath, run_config = _get_run_properties(args)
     if args.roi:
         run_config["roi"] = _parse_roi_arg(args.roi)
     with tee_streams(logpath):
         os.chdir(execution_directory)
-        meshify = Meshify(**run_config)
-        meshify.get_meshes()
+        try:
+            meshify = Meshify(**run_config)
+            meshify.get_meshes()
+        except BaseException as e:
+            print_with_datetime(
+                f"meshify FAILED: {type(e).__name__}: {e}", log,
+            )
+            raise
+        print_with_datetime("meshify SUCCEEDED", log)
 
 
 def cmd_multires(args):
@@ -146,13 +154,21 @@ def cmd_skeletonize(args):
         CLI arguments including ``config_path`` and ``num_workers``.
     """
     from mesh_n_bone.skeletonize.skeletonize import Skeletonize
-    from mesh_n_bone.util.logging import tee_streams
+    from mesh_n_bone.util.logging import tee_streams, print_with_datetime
 
+    log = logging.getLogger("mesh_n_bone.cli")
     execution_directory, logpath, run_config = _get_run_properties(args)
     with tee_streams(logpath):
         os.chdir(execution_directory)
-        skeletonize = Skeletonize(**run_config)
-        skeletonize.get_skeletons()
+        try:
+            skeletonize = Skeletonize(**run_config)
+            skeletonize.get_skeletons()
+        except BaseException as e:
+            print_with_datetime(
+                f"skeletonize FAILED: {type(e).__name__}: {e}", log,
+            )
+            raise
+        print_with_datetime("skeletonize SUCCEEDED", log)
 
 
 def cmd_skeletonize_single(args):
@@ -200,13 +216,21 @@ def cmd_analyze(args):
         CLI arguments including ``config_path`` and ``num_workers``.
     """
     from mesh_n_bone.analyze.analyze import AnalyzeMeshes
-    from mesh_n_bone.util.logging import tee_streams
+    from mesh_n_bone.util.logging import tee_streams, print_with_datetime
 
+    log = logging.getLogger("mesh_n_bone.cli")
     execution_directory, logpath, run_config = _get_run_properties(args)
     with tee_streams(logpath):
         os.chdir(execution_directory)
-        analyze = AnalyzeMeshes(**run_config)
-        analyze.analyze()
+        try:
+            analyze = AnalyzeMeshes(**run_config)
+            analyze.analyze()
+        except BaseException as e:
+            print_with_datetime(
+                f"analyze FAILED: {type(e).__name__}: {e}", log,
+            )
+            raise
+        print_with_datetime("analyze SUCCEEDED", log)
 
 
 def main():
