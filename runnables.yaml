@@ -18,8 +18,13 @@ runnables:
         name: Input segmentation
         type: directory
         description: >-
-          Path to a Zarr/N5 dataset (e.g. /nrs/.../seg.zarr/s0). Can also be a
-          path to an OME-Zarr multiscales group; the first dataset will be used.
+          Path to a Zarr / N5 / neuroglancer-precomputed segmentation source.
+          Local paths, http(s)://, gs://, and s3:// are all supported; the
+          format is auto-detected by content. For multiscales sources
+          (OME-Zarr multiscales group, precomputed `info` with multiple scales),
+          the highest-resolution scale is used by default; to use a coarser
+          scale, point at a specific array (e.g. `.../seg.zarr/s2`) or, for
+          precomputed, append the scale `key` from the `info` file.
         required: true
 
       - flag: --output

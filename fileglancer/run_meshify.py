@@ -41,7 +41,15 @@ def _build_arg_parser():
         description="Fileglancer wrapper that runs mesh-n-bone meshify."
     )
 
-    parser.add_argument("--input", required=True, help="Path to .zarr/.n5 dataset")
+    parser.add_argument(
+        "--input",
+        required=True,
+        help=(
+            "Path to a .zarr / .n5 / neuroglancer-precomputed segmentation "
+            "source. Local, http(s)://, gs://, and s3:// are all supported; "
+            "format is auto-detected by content."
+        ),
+    )
     parser.add_argument("--output", required=True, help="Output directory")
 
     parser.add_argument("--num-workers", type=int, default=4)
