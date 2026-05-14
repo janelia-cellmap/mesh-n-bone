@@ -33,7 +33,7 @@ See [examples/](examples/) for the full walkthrough.
 
 ## Features
 
-- **Meshify** — Generate meshes from `.zarr` / `.n5` segmentation volumes via marching cubes, with blockwise processing, chunk assembly, simplification, and optional on-the-fly downsampling
+- **Meshify** — Generate meshes from `.zarr`, `.n5`, or [neuroglancer precomputed](https://github.com/google/neuroglancer/blob/master/src/neuroglancer/datasource/precomputed/volume.md) segmentation volumes (auto-detected; local, `http(s)://`, `gs://`, or `s3://`) via marching cubes, with blockwise processing, chunk assembly, simplification, and optional on-the-fly downsampling
 - **To-Neuroglancer** — Convert single-scale meshes into neuroglancer multiresolution Draco-compressed meshes with automatic LOD decimation
 - **Skeletonize** — Extract skeletons from meshes using CGAL mean curvature flow, with pruning, simplification, and metrics
 - **Analyze** — Compute mesh metrics: volume, surface area, curvature, thickness, principal inertia, oriented bounds
@@ -129,7 +129,36 @@ roi:                             # Restrict processing to this subregion
                                  # Can also be passed via CLI: --roi z0,y0,x0,z1,y1,x1
 ```
 
-`input_path` may be a local path or an HTTP(S) URL (HTTP(S) is read-only). In either case the path can point directly at an array even when no parent directory ends in `.zarr` or `.n5`, for example `/data/crop04_AIPv2/seg/s0` or `https://host/files/crop04_AIPv2/seg/s0`. If the path points at an OME-Zarr multiscales group rather than an array, meshify opens the first dataset listed in the group metadata.
+`input_path` accepts any of `.zarr`, `.n5`, or neuroglancer precomputed sources, from any of these locations:
+
+- A local filesystem path (e.g. `/data/seg.zarr/s0`)
+- `http(s)://...`
+- `gs://bucket/path`
+- `s3://bucket/path`
+
+The format is auto-detected by probing for the relevant marker file (`info` → precomputed, `zarr.json` → zarr v3, `.zarray` → zarr v2, `attributes.json` → N5), so a path like `gs://neuroglancer-janelia-flyem-hemibrain/v1.0/segmentation` opens correctly with no extra prefix.
+
+If no specific scale is provided, the highest-resolution scale is used by default — for OME-Zarr multiscales groups (root or subgroup) that's the first dataset listed in the metadata; for precomputed, scale index 0 from the `info` file. To use a different scale, either name the array directly (`.../seg.zarr/s2`) or, for precomputed, append the scale `key` from the `info` file (e.g. `gs://neuroglancer-janelia-flyem-hemibrain/v1.0/segmentation/16.0x16.0x16.0`).
+
+Example using the public hemibrain segmentation at native res:
+
+```yaml
+input_path: gs://neuroglancer-janelia-flyem-hemibrain/v1.0/segmentation/8.0x8.0x8.0
+output_directory: /path/to/output
+roi:
+  begin: [155744, 155744, 155744]   # ZYX, nm
+  end:   [163744, 163744, 163744]   # 1000 voxels × 8 nm per side
+check_mesh_validity: false          # ROIs cut at the boundary
+use_fixed_edge_simplification: true
+do_multires: true
+num_lods: 4
+```
+
+### Worker auto-cap and OOM retry
+
+When a phase has fewer tasks than the requested `-n` workers (e.g. one block in a tiny ROI), meshify caps the cluster size for that phase to the task count so idle LSF/SLURM slots aren't requested. You'll see a one-line `Capping workers ...` log message.
+
+If a worker dies from out-of-memory (typically a single huge segment hitting the per-worker memory cap), meshify automatically halves `processes`-per-slot in the in-memory dask config (so each remaining worker gets 2× memory while LSF slot count and CPU budget stay fixed) and retries the phase. Defaults: 3 retries, opt out with `retry_on_oom: false`, change retry count with `memory_retry_max: N`. Each retry logs a `WARNING` with the dead worker's address; the per-task `mesh_id` is also printed to worker stderr so you can grep `job-logs/LSFCluster-*.err` to identify the segment that caused the OOM.
 
 #### `to-neuroglancer` — Convert existing meshes to neuroglancer multiresolution format
 

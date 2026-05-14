@@ -38,11 +38,18 @@ class Timing_Messager(ContextDecorator):
         self._start_time = time.time()
         return self
 
-    def __exit__(self, *exc):
-        print_with_datetime(
-            f"{self._base_message} completed in {time.time()-self._start_time}!",
-            self._logger,
-        )
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        elapsed = time.time() - self._start_time
+        if exc_type is None:
+            print_with_datetime(
+                f"{self._base_message} completed in {elapsed}!",
+                self._logger,
+            )
+        else:
+            print_with_datetime(
+                f"{self._base_message} FAILED after {elapsed}s ({exc_type.__name__})",
+                self._logger,
+            )
         return False
 
 

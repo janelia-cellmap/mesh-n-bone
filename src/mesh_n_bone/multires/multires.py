@@ -419,6 +419,8 @@ def run_multires(config_path, num_workers, roi=None):
     aggressiveness = optional_decimation_settings["aggressiveness"]
     delete_decimated_meshes_flag = optional_decimation_settings["delete_decimated_meshes"]
     target_faces_per_lod0_chunk = optional_decimation_settings["target_faces_per_lod0_chunk"]
+    retry_on_oom = optional_decimation_settings.get("retry_on_oom", True)
+    memory_retry_max = optional_decimation_settings.get("memory_retry_max", 3)
 
     segment_properties_csv = optional_properties_settings["segment_properties_csv"]
     segment_properties_columns = optional_properties_settings["segment_properties_columns"]
@@ -485,22 +487,40 @@ def run_multires(config_path, num_workers, roi=None):
                 mesh_ids = kept_ids
                 file_sizes = kept_sizes
 
-            if not skip_decimation:
-                with dask_util.start_dask(num_workers, "decimation", logger):
-                    with Timing_Messager("Generating decimated meshes", logger):
-                        generate_decimated_meshes(
-                            input_path, output_path, lods, mesh_ids, mesh_ext,
-                            decimation_factor, aggressiveness, num_workers,
-                        )
+            effective_workers = dask_util.effective_num_workers(
+                num_workers, len(mesh_ids), logger, "multires",
+            )
 
-            with dask_util.start_dask(num_workers, "multires creation", logger):
-                with Timing_Messager("Generating multires meshes", logger):
-                    generate_all_neuroglancer_multires_meshes(
-                        output_path, num_workers, mesh_ids, lods, mesh_ext,
-                        np.array(file_sizes), lod_0_box_size,
-                        vertex_quantization_bits=16,
-                        target_faces_per_lod0_chunk=target_faces_per_lod0_chunk,
-                    )
+            if not skip_decimation:
+                def _run_decimation(workers, config):
+                    with dask_util.start_dask(
+                        workers, "decimation", logger, config=config,
+                    ):
+                        with Timing_Messager("Generating decimated meshes", logger):
+                            generate_decimated_meshes(
+                                input_path, output_path, lods, mesh_ids, mesh_ext,
+                                decimation_factor, aggressiveness, workers,
+                            )
+                dask_util.run_with_oom_retry(
+                    _run_decimation, effective_workers, "decimation", logger,
+                    max_retries=memory_retry_max, retry_on_oom=retry_on_oom,
+                )
+
+            def _run_multires(workers, config):
+                with dask_util.start_dask(
+                    workers, "multires creation", logger, config=config,
+                ):
+                    with Timing_Messager("Generating multires meshes", logger):
+                        generate_all_neuroglancer_multires_meshes(
+                            output_path, workers, mesh_ids, lods, mesh_ext,
+                            np.array(file_sizes), lod_0_box_size,
+                            vertex_quantization_bits=16,
+                            target_faces_per_lod0_chunk=target_faces_per_lod0_chunk,
+                        )
+            dask_util.run_with_oom_retry(
+                _run_multires, effective_workers, "multires creation", logger,
+                max_retries=memory_retry_max, retry_on_oom=retry_on_oom,
+            )
 
             with Timing_Messager("Writing info and segment properties files", logger):
                 multires_output_path = f"{output_path}/multires"
@@ -516,11 +536,11 @@ def run_multires(config_path, num_workers, roi=None):
 
             if not skip_decimation and delete_decimated_meshes_flag:
                 with dask_util.start_dask(
-                    num_workers, "delete decimated meshes", logger
+                    effective_workers, "delete decimated meshes", logger
                 ):
                     with Timing_Messager("Deleting decimated meshes", logger):
                         delete_decimated_mesh_files(
-                            output_path, lods, mesh_ids, num_workers,
+                            output_path, lods, mesh_ids, effective_workers,
                         )
                         os.system(f"rm -rf {output_path}/mesh_lods")
 

@@ -194,6 +194,137 @@ def setup_execution_directory(config_path, logger):
     return execution_dir
 
 
+def _load_dask_config():
+    """Read ``dask-config.yaml`` from the cwd into a plain dict."""
+    with open("dask-config.yaml") as f:
+        return yaml.load(f, Loader=SafeLoader)
+
+
+def run_with_oom_retry(
+    work_fn,
+    num_workers,
+    phase_name,
+    logger,
+    max_retries=3,
+    retry_on_oom=True,
+):
+    """Run a dask phase with optional retry on worker out-of-memory crashes.
+
+    The phase's work happens inside *work_fn*, which is called as
+    ``work_fn(num_workers, config)``. *work_fn* is responsible for
+    starting its own dask cluster via
+    :func:`start_dask(num_workers, ..., config=config)` and doing the
+    compute inside that context.
+
+    On a ``distributed.scheduler.KilledWorker`` (the typical dask
+    symptom of a worker SIGKILL'd by the OS OOM-killer or LSF mem
+    limit), we halve ``processes`` per slot in the in-memory dask
+    config and halve *num_workers* to match — doubling the memory
+    available to each worker while keeping the LSF slot count
+    (and CPU budget) constant. Then we retry the phase, up to
+    *max_retries* times.
+
+    Parameters
+    ----------
+    work_fn : callable
+        ``work_fn(num_workers: int, config: dict | None) -> Any``.
+    num_workers : int
+        Initial worker count.
+    phase_name : str
+        Label used in log lines (e.g. ``"assemble meshes"``).
+    logger : logging.Logger
+        Where retry messages are logged.
+    max_retries : int
+        Maximum number of OOM-triggered retries.  ``0`` disables retry.
+    retry_on_oom : bool
+        Set to ``False`` to skip the retry wrapper entirely (acts as a
+        passthrough). Useful for synchronous (``num_workers==1``) runs.
+    """
+    if not retry_on_oom or max_retries < 1 or num_workers <= 1:
+        return work_fn(num_workers, None)
+
+    try:
+        from distributed.scheduler import KilledWorker
+    except ImportError:
+        return work_fn(num_workers, None)
+
+    config = _load_dask_config()
+    cluster_type = next(iter(config.get("jobqueue", {})), None)
+    if cluster_type not in ("lsf", "slurm", "sge"):
+        # Local/in-process clusters don't have a processes/slot lever;
+        # skip retry wrapping there.
+        return work_fn(num_workers, config)
+
+    workers = num_workers
+    for attempt in range(max_retries + 1):
+        try:
+            return work_fn(workers, config)
+        except KilledWorker as e:
+            processes = int(config["jobqueue"][cluster_type].get("processes", 1) or 1)
+            if attempt >= max_retries:
+                logger.error(
+                    "Phase '%s' hit worker OOM and exhausted %d retries "
+                    "(processes/slot=%d). Increase per-slot memory in "
+                    "dask-config.yaml or skip oversized segments with "
+                    "max_num_blocks.",
+                    phase_name, max_retries, processes,
+                )
+                raise
+            if processes <= 1:
+                logger.error(
+                    "Phase '%s' hit worker OOM with processes/slot already at "
+                    "1 — cannot halve further. Increase memory per slot "
+                    "directly, or skip oversized segments via max_num_blocks.",
+                    phase_name,
+                )
+                raise
+            new_processes = max(1, processes // 2)
+            new_workers = max(1, workers // 2)
+            last_worker = getattr(e, "last_worker", None)
+            logger.warning(
+                "Phase '%s' worker OOM (retry %d/%d). Halving "
+                "processes/slot %d→%d and workers %d→%d to give each worker "
+                "more memory; LSF slot count and CPU budget unchanged. "
+                "To find the segment that crashed: grep "
+                "job-logs/LSFCluster-*.err for the last 'mesh_id=...' line "
+                "from the killed worker at %s.",
+                phase_name, attempt + 1, max_retries,
+                processes, new_processes, workers, new_workers,
+                last_worker or "(unknown address)",
+            )
+            config["jobqueue"][cluster_type]["processes"] = new_processes
+            workers = new_workers
+
+
+def effective_num_workers(requested, num_tasks, logger=None, phase_name=None):
+    """Cap requested workers to the actual task count for a phase.
+
+    Spinning up more workers than there are tasks just wastes cluster slots
+    (especially on LSF/SLURM where each worker is its own job). Returns
+    ``max(1, min(requested, num_tasks))``. When capping happens, a single
+    info line is logged so the user knows why fewer workers were started.
+
+    Parameters
+    ----------
+    requested : int
+        Worker count the user asked for (typically ``self.num_workers``).
+    num_tasks : int
+        Number of independent tasks the phase will run.
+    logger : logging.Logger, optional
+        Where to log the cap message. No log if omitted.
+    phase_name : str, optional
+        Short phase name for the log line (e.g. ``"assemble meshes"``).
+    """
+    effective = max(1, min(int(requested), max(1, int(num_tasks))))
+    if effective < requested and logger is not None:
+        label = f" for {phase_name}" if phase_name else ""
+        logger.info(
+            "Capping workers%s to %d (matches task count); requested %d.",
+            label, effective, requested,
+        )
+    return effective
+
+
 def guesstimate_npartitions(elements, num_workers, scaling=10):
     """Estimate a reasonable number of Dask-bag partitions.
 

@@ -8,6 +8,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse, urlunparse
 from urllib.request import Request, urlopen
 
+import numpy as np
 from funlib.geometry import Coordinate
 
 from mesh_n_bone.util.cellmap_array import CellMapArray
@@ -15,16 +16,40 @@ from mesh_n_bone.util.cellmap_array import CellMapArray
 logger = logging.getLogger(__name__)
 
 
+_REMOTE_SCHEMES = {"http", "https", "gs", "s3"}
+
+
 def _is_http_url(path):
     """Return True if *path* is an HTTP(S) URL."""
     return urlparse(str(path)).scheme in {"http", "https"}
+
+
+def _is_remote_url(path):
+    """Return True if *path* is an HTTP(S), GS, or S3 URL.
+
+    These are paths whose components must be manipulated with
+    posix/url semantics rather than ``os.path``.
+    """
+    return urlparse(str(path)).scheme in _REMOTE_SCHEMES
+
+
+def _strip_precomputed_prefix(path):
+    """Drop a leading ``precomputed://`` from *path* if present.
+
+    The neuroglancer URL prefix is accepted for backward compatibility
+    and to allow copy-paste from neuroglancer, but it is no longer
+    required — the format is auto-detected by content probing.
+    """
+    if isinstance(path, str) and path.startswith("precomputed://"):
+        return path[len("precomputed://"):]
+    return path
 
 
 def _path_join(base, path):
     """Join local filesystem paths or append URL path components."""
     if not path:
         return base
-    if _is_http_url(base):
+    if _is_remote_url(base):
         parsed = urlparse(base)
         joined_path = posixpath.join(parsed.path.rstrip("/"), str(path).lstrip("/"))
         return urlunparse(parsed._replace(path=joined_path))
@@ -33,7 +58,7 @@ def _path_join(base, path):
 
 def _path_dirname(path):
     """Return the parent path for local filesystem paths or URLs."""
-    if _is_http_url(path):
+    if _is_remote_url(path):
         parsed = urlparse(path)
         dirname = posixpath.dirname(parsed.path.rstrip("/"))
         return urlunparse(parsed._replace(path=dirname or "/"))
@@ -42,9 +67,61 @@ def _path_dirname(path):
 
 def _path_basename(path):
     """Return the final path component for local filesystem paths or URLs."""
-    if _is_http_url(path):
+    if _is_remote_url(path):
         return posixpath.basename(urlparse(path).path.rstrip("/"))
     return os.path.basename(path)
+
+
+def kvstore_for_path(path):
+    """Build a TensorStore kvstore spec for *path* (any supported scheme).
+
+    Returns ``(kvstore_dict, normalized_path)`` where ``normalized_path``
+    is the dataset path that should be supplied to the tensorstore
+    driver's ``kvstore.path`` (relative to the kvstore root).
+
+    Supported schemes: ``gs``, ``s3``, ``http``, ``https``, ``file``,
+    plus a bare local filesystem path.
+    """
+    inner = _strip_precomputed_prefix(path)
+    parsed = urlparse(inner)
+    scheme = parsed.scheme.lower()
+    if scheme == "gs":
+        return (
+            {"driver": "gcs", "bucket": parsed.netloc},
+            parsed.path.lstrip("/"),
+        )
+    if scheme == "s3":
+        return (
+            {"driver": "s3", "bucket": parsed.netloc},
+            parsed.path.lstrip("/"),
+        )
+    if scheme in ("http", "https"):
+        return (
+            {"driver": "http", "base_url": f"{scheme}://{parsed.netloc}"},
+            parsed.path.lstrip("/"),
+        )
+    if scheme == "file":
+        return ({"driver": "file"}, parsed.path)
+    if scheme == "":
+        # Bare local filesystem path
+        return ({"driver": "file"}, os.path.abspath(inner))
+    raise ValueError(f"Unsupported URL scheme: {scheme!r} in {path!r}")
+
+
+def _url_to_public_https(path):
+    """Translate ``gs://`` / ``s3://`` URLs to a public HTTPS URL.
+
+    Used for metadata probes (``info``, ``.zarray``, etc.) so we can
+    use a single ``urlopen`` for any remote scheme. Buckets that
+    require authentication will fail the probe, which is the right
+    signal — the subsequent tensorstore open would also need auth.
+    """
+    parsed = urlparse(path)
+    if parsed.scheme == "gs":
+        return f"https://storage.googleapis.com/{parsed.netloc}{parsed.path}"
+    if parsed.scheme == "s3":
+        return f"https://{parsed.netloc}.s3.amazonaws.com{parsed.path}"
+    return path
 
 
 class ArrayMetadata:
@@ -67,7 +144,11 @@ class ArrayMetadata:
 
 
 def _read_json_file(path):
-    """Read a JSON file from a local path or HTTP(S) URL.
+    """Read a JSON file from a local path or a remote URL.
+
+    Supported schemes: ``http``, ``https``, ``gs``, ``s3``. ``gs://``
+    and ``s3://`` are fetched via their public HTTPS endpoints, so
+    private buckets that require auth will return ``None``.
 
     Parameters
     ----------
@@ -81,8 +162,9 @@ def _read_json_file(path):
         not valid JSON.
     """
     try:
-        if _is_http_url(path):
-            request = Request(path, headers={"Accept": "application/json"})
+        if _is_remote_url(path):
+            url = _url_to_public_https(path)
+            request = Request(url, headers={"Accept": "application/json"})
             with urlopen(request, timeout=10) as f:
                 return json.load(f)
         else:
@@ -183,21 +265,49 @@ def open_dataset(filename, ds_name, mode="r"):
         _detect_zarr_driver,
         open_ds_tensorstore,
     )
+    from mesh_n_bone.util.precomputed_io import (
+        is_precomputed_path,
+        precomputed_array_metadata,
+    )
 
     logger.debug("opening dataset %s in %s", ds_name, filename)
     full_path = _path_join(filename, ds_name) if ds_name else filename
+
+    # Precomputed: either explicit prefix or content-detected (info marker).
+    if (
+        is_precomputed_path(full_path)
+        or _detect_zarr_driver(full_path) == "neuroglancer_precomputed"
+    ):
+        meta = precomputed_array_metadata(full_path)
+        data = ArrayMetadata(
+            shape=tuple(meta["shape"]),
+            dtype=np.dtype(meta["dtype"]),
+            chunks=tuple(meta["chunks"]),
+            attrs={},
+            parent_attrs=None,
+            dataset_name=None,
+        )
+        return CellMapArray(
+            data,
+            Coordinate(int(round(v)) for v in meta["voxel_size"]),
+            Coordinate(int(round(v)) for v in meta["offset"]),
+            dataset_path=full_path,
+        )
 
     attrs = _read_attrs(full_path)
     parent_attrs = None
     metadata_dataset_name = None
     selected_dataset_path = None
-    if not ds_name:
-        selected_dataset_path = _first_multiscales_dataset_path(attrs)
-        if selected_dataset_path:
-            parent_attrs = attrs
-            metadata_dataset_name = selected_dataset_path
-            full_path = _path_join(full_path, selected_dataset_path)
-            attrs = _read_attrs(full_path)
+    # Auto-traverse into a multiscales group regardless of whether it sits
+    # at the container root or at a subpath. The OME-Zarr spec lists
+    # datasets from highest to lowest resolution, so the first entry is
+    # what we want by default.
+    selected_dataset_path = _first_multiscales_dataset_path(attrs)
+    if selected_dataset_path:
+        parent_attrs = attrs
+        metadata_dataset_name = selected_dataset_path
+        full_path = _path_join(full_path, selected_dataset_path)
+        attrs = _read_attrs(full_path)
 
     try:
         filetype = _detect_zarr_driver(full_path)

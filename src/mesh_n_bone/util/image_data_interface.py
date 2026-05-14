@@ -11,33 +11,72 @@ from funlib.geometry import Coordinate, Roi
 
 from mesh_n_bone.util.zarr_io import (
     _is_http_url,
+    _is_remote_url,
     _path_join,
     _read_json_file,
+    _strip_precomputed_prefix,
+    kvstore_for_path,
+)
+from mesh_n_bone.util.precomputed_io import (
+    is_precomputed_path,
+    open_precomputed_tensorstore,
 )
 
 logger = logging.getLogger(__name__)
 
 
 def _detect_zarr_driver(dataset_path):
-    """Detect whether a dataset is zarr v2, v3, or N5 format.
+    """Detect the tensorstore driver for *dataset_path* by content probing.
+
+    Tries marker files in order: precomputed ``info``, zarr v3
+    ``zarr.json``, zarr v2 ``.zarray``, N5 ``attributes.json``. The
+    optional ``precomputed://`` URL prefix is stripped before probing
+    (it's accepted for backward compatibility but no longer required;
+    the format is inferred from content, like neuroglancer).
+
+    Falls back to a ``.n5`` / ``.zarr`` filename heuristic for the
+    rare case where no marker file is reachable (e.g. when running
+    against private buckets with no anonymous access).
 
     Parameters
     ----------
     dataset_path : str
-        Full filesystem path or HTTP(S) URL to the dataset.
+        Local filesystem path or remote URL (``gs://``, ``s3://``,
+        ``http(s)://``, optionally with a ``precomputed://`` prefix).
 
     Returns
     -------
     str
-        ``"zarr"`` for v2, ``"zarr3"`` for v3, ``"n5"`` for N5.
+        ``"zarr"``, ``"zarr3"``, ``"n5"``, or ``"neuroglancer_precomputed"``.
     """
-    if dataset_path.rfind(".n5") > dataset_path.rfind(".zarr"):
-        return "n5"
-    if _read_json_file(_path_join(dataset_path, "zarr.json")) is not None:
+    explicit_precomputed = is_precomputed_path(dataset_path)
+    if explicit_precomputed:
+        return "neuroglancer_precomputed"
+
+    canonical = _strip_precomputed_prefix(dataset_path)
+
+    # Precomputed: ``info`` lives at the dataset root. Try the path
+    # itself first, then its parent (covers paths like
+    # ``.../segmentation/8.0x8.0x8.0`` where the trailing segment is a
+    # scale key rather than a real subdirectory).
+    if _read_json_file(_path_join(canonical, "info")) is not None:
+        return "neuroglancer_precomputed"
+    from mesh_n_bone.util.zarr_io import _path_dirname
+    parent = _path_dirname(canonical)
+    if parent and parent != canonical:
+        if _read_json_file(_path_join(parent, "info")) is not None:
+            return "neuroglancer_precomputed"
+
+    if _read_json_file(_path_join(canonical, "zarr.json")) is not None:
         return "zarr3"
-    if _read_json_file(_path_join(dataset_path, ".zarray")) is not None:
+    if _read_json_file(_path_join(canonical, ".zarray")) is not None:
         return "zarr"
-    if _read_json_file(_path_join(dataset_path, "attributes.json")) is not None:
+    if _read_json_file(_path_join(canonical, "attributes.json")) is not None:
+        return "n5"
+
+    # No marker reachable (likely private bucket without anonymous
+    # access). Fall back to filename hints.
+    if canonical.rfind(".n5") > canonical.rfind(".zarr"):
         return "n5"
     return "zarr"
 
@@ -58,18 +97,18 @@ def open_ds_tensorstore(dataset_path, mode="r", filetype=None):
         Opened dataset handle.
     """
     filetype = filetype or _detect_zarr_driver(dataset_path)
-    if _is_http_url(dataset_path):
+    if filetype == "neuroglancer_precomputed":
         if mode != "r":
-            raise ValueError("HTTP(S) TensorStore datasets are read-only")
-        kvstore = {
-            "driver": "http",
-            "base_url": dataset_path,
-        }
-    else:
-        kvstore = {
-            "driver": "file",
-            "path": os.path.abspath(dataset_path),
-        }
+            raise ValueError("neuroglancer precomputed datasets are read-only")
+        return open_precomputed_tensorstore(dataset_path)
+
+    canonical = _strip_precomputed_prefix(dataset_path)
+    if _is_remote_url(canonical) and mode != "r":
+        raise ValueError("Remote TensorStore datasets are read-only")
+
+    kvstore, kv_path = kvstore_for_path(canonical)
+    if kv_path:
+        kvstore["path"] = kv_path.rstrip("/") + "/"
 
     spec = {
         "driver": filetype,
