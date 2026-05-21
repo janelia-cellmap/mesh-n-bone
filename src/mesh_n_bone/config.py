@@ -77,7 +77,19 @@ def read_multires_config(config_path):
         if "segment_properties_id_column" not in optional_properties_settings:
             optional_properties_settings["segment_properties_id_column"] = "Object ID"
 
-        return required_settings, optional_decimation_settings, optional_properties_settings
+        sharding_settings = config.get("sharding_settings", {}) or {}
+        sharding_settings.setdefault("sharded", False)
+        sharding_settings.setdefault("preshift_bits", None)
+        sharding_settings.setdefault("minishard_bits", None)
+        sharding_settings.setdefault("shard_bits", None)
+        sharding_settings.setdefault("delete_unsharded_files", True)
+
+        return (
+            required_settings,
+            optional_decimation_settings,
+            optional_properties_settings,
+            sharding_settings,
+        )
 
 
 def read_generic_config(config_path):

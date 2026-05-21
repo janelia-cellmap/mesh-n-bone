@@ -66,7 +66,7 @@ class TestMultiresConfig:
         with open(os.path.join(config_dir, "run-config.yaml"), "w") as f:
             yaml.dump(config, f)
 
-        required, optional, _ = read_multires_config(config_dir)
+        required, optional, _, _ = read_multires_config(config_dir)
         assert required["num_lods"] == 3
         np.testing.assert_array_equal(optional["box_size"], [100.0, 100.0, 100.0])
 
@@ -86,7 +86,7 @@ class TestMultiresConfig:
         with open(os.path.join(config_dir, "run-config.yaml"), "w") as f:
             yaml.dump(config, f)
 
-        _, optional, _ = read_multires_config(config_dir)
+        _, optional, _, _ = read_multires_config(config_dir)
         np.testing.assert_array_equal(optional["box_size"], [20.0, 40.0, 60.0])
 
     def test_box_size_scalar_broadcasts_to_3d(self, tmp_output_dir):
@@ -105,5 +105,5 @@ class TestMultiresConfig:
         with open(os.path.join(config_dir, "run-config.yaml"), "w") as f:
             yaml.dump(config, f)
 
-        _, optional, _ = read_multires_config(config_dir)
+        _, optional, _, _ = read_multires_config(config_dir)
         np.testing.assert_array_equal(optional["box_size"], [50.0, 50.0, 50.0])

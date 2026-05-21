@@ -34,7 +34,7 @@ See [examples/](examples/) for the full walkthrough.
 ## Features
 
 - **Meshify** — Generate meshes from `.zarr`, `.n5`, or [neuroglancer precomputed](https://github.com/google/neuroglancer/blob/master/src/neuroglancer/datasource/precomputed/volume.md) segmentation volumes (auto-detected; local, `http(s)://`, `gs://`, or `s3://`) via marching cubes, with blockwise processing, chunk assembly, simplification, and optional on-the-fly downsampling
-- **To-Neuroglancer** — Convert single-scale meshes into neuroglancer multiresolution Draco-compressed meshes with automatic LOD decimation
+- **To-Neuroglancer** — Convert single-scale meshes into neuroglancer multiresolution Draco-compressed meshes with automatic LOD decimation, optionally [sharded](https://github.com/google/neuroglancer/blob/master/src/datasource/precomputed/sharded.md) so thousands of meshes load with a handful of HTTP range requests instead of per-segment file fetches
 - **Skeletonize** — Extract skeletons from meshes using CGAL mean curvature flow, with pruning, simplification, and metrics
 - **Analyze** — Compute mesh metrics: volume, surface area, curvature, thickness, principal inertia, oriented bounds
 
@@ -109,6 +109,14 @@ num_lods: 3                      # Number of levels of detail (default: 3)
 multires_strategy: decimate      # LOD strategy: decimate or downsample (default: decimate)
 decimation_factor: 4             # Face reduction factor per LOD (default: 4)
 delete_decimated_meshes: true    # Remove intermediate LOD mesh files (default: true)
+
+# ── Sharded output (recommended for thousands of meshes) ──
+sharded: true                    # Pack all meshes into a few <n>.shard files
+                                 # instead of two files per segment (default: false)
+# shard_bits: 4                  # Optional overrides — defaults are auto-sized
+# minishard_bits: 6              # from the segment count via choose_shard_params.
+# preshift_bits: 0
+delete_unsharded_files: true     # Remove per-segment files after packing (default: true)
 
 # ── Coordinate system ──
 # Voxel size is read automatically from the dataset metadata (OME-NGFF or
@@ -190,6 +198,13 @@ optional_properties_settings:
   segment_properties_csv: /path/to/properties.csv  # CSV with per-segment metadata
   segment_properties_columns: [col1, col2]         # Which columns to include (default: all)
   segment_properties_id_column: "Object ID"        # CSV column with segment IDs
+
+sharding_settings:
+  sharded: true                                    # Pack output into <n>.shard files (default: false)
+  # shard_bits: 4                                  # Optional overrides — auto-sized by default
+  # minishard_bits: 6
+  # preshift_bits: 0
+  delete_unsharded_files: true                     # Remove per-segment files after packing (default: true)
 ```
 
 `box_size` can be a scalar (applied to all axes) or a 3-element list for per-axis control, which prevents degenerate triangles on elongated meshes.
@@ -339,3 +354,7 @@ tests/                      # Unit and integration tests
 ## Acknowledgments
 
 Thanks to [Luca Marconato](https://github.com/LucaMarconato) for the pixi configuration that informed macOS support and the neuroglancer serving approach ([#6](https://github.com/janelia-cellmap/mesh-n-bone/pull/6)).
+
+## License
+
+mesh-n-bone is distributed under the GNU General Public License v3.0 or later (GPL-3.0-or-later). See [LICENSE](LICENSE) for the full text.

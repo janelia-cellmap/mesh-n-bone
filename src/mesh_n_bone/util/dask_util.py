@@ -168,8 +168,8 @@ def setup_execution_directory(config_path, logger):
     """Create a timestamped copy of a configuration directory for execution.
 
     The new directory name is ``<config_path>-<YYYYmmdd.HHMMSS>``. The
-    ``run-config.yaml`` inside is made read-only to prevent accidental
-    modification during a run.
+    ``run-config.yaml`` and ``dask-config.yaml`` inside are made
+    read-only to prevent accidental modification during a run.
 
     Parameters
     ----------
@@ -188,7 +188,10 @@ def setup_execution_directory(config_path, logger):
     execution_dir = f"{config_path}-{timestamp}"
     execution_dir = os.path.abspath(execution_dir)
     shutil.copytree(config_path, execution_dir, symlinks=True)
-    os.chmod(f"{execution_dir}/run-config.yaml", 0o444)
+    for name in ("run-config.yaml", "dask-config.yaml"):
+        path = f"{execution_dir}/{name}"
+        if os.path.exists(path):
+            os.chmod(path, 0o444)
     print_with_datetime(f"Setup working directory as {execution_dir}.", logger)
 
     return execution_dir

@@ -279,7 +279,7 @@ class TestMultiresRoiFilter:
         with open(os.path.join(config_dir, "run-config.yaml"), "w") as f:
             yaml.dump(config, f)
 
-        _, optional, _ = read_multires_config(config_dir)
+        _, optional, _, _ = read_multires_config(config_dir)
         assert optional["roi"] is not None
         assert optional["roi"]["begin"] == [10, 20, 30]
         assert optional["roi"]["end"] == [100, 200, 300]
@@ -300,7 +300,7 @@ class TestMultiresRoiFilter:
         with open(os.path.join(config_dir, "run-config.yaml"), "w") as f:
             yaml.dump(config, f)
 
-        _, optional, _ = read_multires_config(config_dir)
+        _, optional, _, _ = read_multires_config(config_dir)
         assert optional["roi"] is None
 
 

@@ -1,13 +1,13 @@
 [project]
 name = "mesh-n-bone"
-version = "0.2.0"
+version = "0.3.0"
 description = "Unified tool for mesh generation, multiresolution mesh creation, skeletonization, and analysis."
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [
   { name = "David Ackerman", email = "ackermand@janelia.hhmi.org" },
 ]
-license = "BSD-3-Clause"
+license = "GPL-3.0-or-later"
 license-files = ["LICENSE"]
 keywords = ["mesh", "neuroglancer", "skeletonization", "multiresolution", "segmentation", "neuroscience"]
 classifiers = [
