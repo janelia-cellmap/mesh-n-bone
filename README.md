@@ -97,10 +97,16 @@ downsample_method: mode          # Downsampling method: mode, mode_suppress_zero
 
 # ── Simplification & smoothing ──
 do_simplification: true          # Simplify meshes after assembly (default: true)
-target_reduction: 0.99           # Fraction of faces to remove (default: 0.99)
+target_reduction: 0.99           # Total fraction of faces to remove (default: 0.99)
 n_smoothing_iter: 10             # Taubin smoothing iterations (default: 10)
 check_mesh_validity: false       # Require watertight meshes (default: true; disable for ROI)
-use_fixed_edge_simplification: true  # Preserve chunk boundary edges during simplification (default: false)
+# When use_fixed_edge_simplification is true, simplification runs in TWO STAGES:
+#   1. per-chunk pass, with block-boundary vertices pinned so they survive assembly
+#   2. global pass on the assembled mesh, finishing off the remaining reduction
+# stage_1_reduction_fraction sets how much of target_reduction happens in stage 1.
+# When false, a single standard simplification pass runs after assembly.
+use_fixed_edge_simplification: true  # (default: false)
+stage_1_reduction_fraction: 0.5      # Share of target_reduction in the per-chunk stage (default: 0.5)
 do_analysis: false               # Compute mesh metrics CSV (default: true)
 
 # ── Multiresolution output ──
