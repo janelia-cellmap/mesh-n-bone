@@ -100,6 +100,14 @@ do_simplification: true          # Simplify meshes after assembly (default: true
 target_reduction: 0.99           # Total fraction of faces to remove (default: 0.99)
 n_smoothing_iter: 10             # Taubin smoothing iterations (default: 10)
 check_mesh_validity: false       # Require watertight meshes (default: true; disable for ROI)
+# When smooth_before_simplify is true (default), Taubin smoothing runs on the
+# DENSE assembled mesh first, then quadric decimation collapses the smooth
+# surface to target_reduction. Empirically ~2x lower RMS deviation from the
+# underlying continuous surface at the same final face count compared to
+# the reverse order, because Taubin can fully average out the voxel staircase
+# only when it has every nearby vertex available as a neighbor. Set false for
+# the legacy decimate-then-smooth ordering.
+smooth_before_simplify: true     # (default: true)
 # When use_fixed_edge_simplification is true, simplification runs in TWO STAGES:
 #   1. per-chunk pass, with block-boundary vertices pinned so they survive assembly
 #   2. global pass on the assembled mesh, finishing off the remaining reduction
