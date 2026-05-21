@@ -339,3 +339,7 @@ tests/                      # Unit and integration tests
 ## Acknowledgments
 
 Thanks to [Luca Marconato](https://github.com/LucaMarconato) for the pixi configuration that informed macOS support and the neuroglancer serving approach ([#6](https://github.com/janelia-cellmap/mesh-n-bone/pull/6)).
+
+## License
+
+mesh-n-bone is distributed under the GNU General Public License v3.0 or later (GPL-3.0-or-later). See [LICENSE](LICENSE) for the full text.
