@@ -211,9 +211,17 @@ def pack_meshes_to_shards(
         return []
 
     bag = db.from_sequence(shard_items, npartitions=min(len(shard_items), max(1, num_workers)))
-    futures = bag.map(
+    bag = bag.map(
         lambda item: pack_one_shard(item[0], item[1], multires_dir, output_dir, spec_dict)
-    ).persist()
+    )
+
+    if num_workers == 1:
+        # Synchronous scheduler — no distributed Client exists (see
+        # `dask_util.start_dask`), so use `.compute()` rather than the
+        # `persist()`+`wait()` Client-based path.
+        return list(bag.compute())
+
+    futures = bag.persist()
     [completed, _] = wait(futures)
     failed = [f for f in completed if f.exception() is not None]
     paths = [f.result() for f in completed if f.exception() is None]

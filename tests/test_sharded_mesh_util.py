@@ -233,6 +233,24 @@ class TestInfoFile:
 
 
 class TestPackMeshesToShards:
+    def test_synchronous_single_worker(self, tmp_output_dir):
+        """`num_workers=1` runs without a distributed Client (synchronous
+        scheduler). pack_meshes_to_shards must take a separate compute()
+        path because persist()/wait() require a Client.
+        """
+        import dask
+
+        multires = os.path.join(tmp_output_dir, "multires")
+        _stage_fake_meshes(multires, [1, 2, 3, 4, 5])
+        spec = sharded_mesh_util.make_sharding_spec(0, 2, 1)
+        with dask.config.set(scheduler="synchronous"):
+            paths = sharded_mesh_util.pack_meshes_to_shards(
+                multires, [1, 2, 3, 4, 5], spec, num_workers=1,
+            )
+        assert paths and all(p.endswith(".shard") for p in paths)
+        for p in paths:
+            assert os.path.exists(p) and os.path.getsize(p) > 0
+
     def test_dask_path_matches_direct(self, tmp_output_dir):
         """The dask orchestrator should write byte-identical shards to the
         direct per-shard call."""
