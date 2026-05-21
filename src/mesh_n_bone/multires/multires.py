@@ -405,9 +405,12 @@ def run_multires(config_path, num_workers, roi=None):
         region will be processed.
     """
     submission_directory = os.getcwd()
-    required_settings, optional_decimation_settings, optional_properties_settings = (
-        read_multires_config(config_path)
-    )
+    (
+        required_settings,
+        optional_decimation_settings,
+        optional_properties_settings,
+        sharding_settings,
+    ) = read_multires_config(config_path)
 
     input_path = required_settings["input_path"]
     output_path = required_settings["output_path"]
@@ -522,17 +525,61 @@ def run_multires(config_path, num_workers, roi=None):
                 max_retries=memory_retry_max, retry_on_oom=retry_on_oom,
             )
 
-            with Timing_Messager("Writing info and segment properties files", logger):
-                multires_output_path = f"{output_path}/multires"
+            multires_output_path = f"{output_path}/multires"
+            with Timing_Messager("Writing segment properties file", logger):
+                # Write segment_properties before sharding so it can still scan
+                # the per-segment `.index` files; they get removed once shards
+                # are packed.
                 neuroglancer.write_segment_properties_file(
                     multires_output_path,
                     csv_path=segment_properties_csv,
                     csv_columns=segment_properties_columns,
                     csv_id_column=segment_properties_id_column,
                 )
-                neuroglancer.write_info_file(
-                    multires_output_path, vertex_quantization_bits=16,
+
+            if sharding_settings["sharded"]:
+                from mesh_n_bone.util import sharded_mesh_util
+
+                params = sharded_mesh_util.choose_shard_params(len(mesh_ids))
+                for key in ("preshift_bits", "minishard_bits", "shard_bits"):
+                    override = sharding_settings.get(key)
+                    if override is not None:
+                        params[key] = int(override)
+                spec = sharded_mesh_util.make_sharding_spec(**params)
+
+                def _pack(workers, config):
+                    with dask_util.start_dask(
+                        workers, "shard packing", logger, config=config,
+                    ):
+                        with Timing_Messager(
+                            f"Packing meshes into sharded format ({params})", logger
+                        ):
+                            sharded_mesh_util.pack_meshes_to_shards(
+                                multires_output_path, mesh_ids, spec, workers,
+                            )
+
+                dask_util.run_with_oom_retry(
+                    _pack, effective_workers, "shard packing", logger,
+                    max_retries=memory_retry_max, retry_on_oom=retry_on_oom,
                 )
+
+                with Timing_Messager("Writing sharded info file", logger):
+                    sharded_mesh_util.write_sharded_info_file(
+                        multires_output_path, spec, vertex_quantization_bits=16,
+                    )
+
+                if sharding_settings["delete_unsharded_files"]:
+                    with Timing_Messager(
+                        "Deleting unsharded per-segment files", logger
+                    ):
+                        sharded_mesh_util.delete_unsharded_segment_files(
+                            multires_output_path, mesh_ids,
+                        )
+            else:
+                with Timing_Messager("Writing info file", logger):
+                    neuroglancer.write_info_file(
+                        multires_output_path, vertex_quantization_bits=16,
+                    )
 
             if not skip_decimation and delete_decimated_meshes_flag:
                 with dask_util.start_dask(

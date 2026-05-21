@@ -419,6 +419,11 @@ class Meshify:
         voxel_size_nm: list = None,
         retry_on_oom: bool = True,
         memory_retry_max: int = 3,
+        sharded: bool = False,
+        shard_bits: int | None = None,
+        minishard_bits: int | None = None,
+        preshift_bits: int | None = None,
+        delete_unsharded_files: bool = True,
     ):
         filename, dataset_name = split_dataset_path(input_path)
         self.segmentation_array = open_dataset(filename, dataset_name)
@@ -568,6 +573,11 @@ class Meshify:
         self.segment_properties_csv = segment_properties_csv
         self.segment_properties_columns = segment_properties_columns
         self.segment_properties_id_column = segment_properties_id_column
+        self.sharded = sharded
+        self.shard_bits = shard_bits
+        self.minishard_bits = minishard_bits
+        self.preshift_bits = preshift_bits
+        self.delete_unsharded_files = delete_unsharded_files
         self.coordinate_units = coordinate_units
         self.retry_on_oom = retry_on_oom
         self.memory_retry_max = memory_retry_max
@@ -1352,15 +1362,61 @@ class Meshify:
             max_retries=self.memory_retry_max, retry_on_oom=self.retry_on_oom,
         )
 
-        with Timing_Messager("Writing info and segment properties files", logger):
-            multires_path = f"{self.output_directory}/multires"
+        multires_path = f"{self.output_directory}/multires"
+        with Timing_Messager("Writing segment properties file", logger):
+            # Always write segment_properties before sharding (it scans
+            # `.index` files, which are removed once shards are packed).
             neuroglancer.write_segment_properties_file(
                 multires_path,
                 csv_path=self.segment_properties_csv,
                 csv_columns=self.segment_properties_columns,
                 csv_id_column=self.segment_properties_id_column,
             )
-            neuroglancer.write_info_file(multires_path)
+
+        if self.sharded:
+            from mesh_n_bone.util import sharded_mesh_util
+
+            params = sharded_mesh_util.choose_shard_params(len(mesh_ids))
+            for key, override in (
+                ("preshift_bits", self.preshift_bits),
+                ("minishard_bits", self.minishard_bits),
+                ("shard_bits", self.shard_bits),
+            ):
+                if override is not None:
+                    params[key] = int(override)
+            spec = sharded_mesh_util.make_sharding_spec(**params)
+
+            def _pack(workers, config):
+                with dask_util.start_dask(
+                    workers, "shard packing", logger, config=config,
+                ):
+                    with Timing_Messager(
+                        f"Packing meshes into sharded format ({params})", logger
+                    ):
+                        sharded_mesh_util.pack_meshes_to_shards(
+                            multires_path, mesh_ids, spec, workers,
+                        )
+
+            dask_util.run_with_oom_retry(
+                _pack, effective_workers, "shard packing", logger,
+                max_retries=self.memory_retry_max, retry_on_oom=self.retry_on_oom,
+            )
+
+            with Timing_Messager("Writing sharded info file", logger):
+                sharded_mesh_util.write_sharded_info_file(
+                    multires_path, spec, vertex_quantization_bits=16,
+                )
+
+            if self.delete_unsharded_files:
+                with Timing_Messager(
+                    "Deleting unsharded per-segment files", logger
+                ):
+                    sharded_mesh_util.delete_unsharded_segment_files(
+                        multires_path, mesh_ids,
+                    )
+        else:
+            with Timing_Messager("Writing info file", logger):
+                neuroglancer.write_info_file(multires_path)
 
         if self.delete_decimated_meshes:
             with Timing_Messager("Cleaning up intermediate mesh files", logger):

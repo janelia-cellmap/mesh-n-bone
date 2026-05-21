@@ -367,6 +367,122 @@ class TestFullMultiresPipeline:
         assert "1" in sp["inline"]["ids"]
 
 
+class TestShardedPipeline:
+    """End-to-end check: full unsharded multires output → pack into shards →
+    read back through the Neuroglancer spec and DracoPy-decode every
+    non-empty fragment. If any byte offset, hash, or layout assumption is
+    wrong, decoding will fail."""
+
+    def _build_multires(self, multires_mesh_dir, lods=(0, 1)):
+        from mesh_n_bone.util.neuroglancer import write_segment_properties_file
+        generate_neuroglancer_multires_mesh(
+            id=1,
+            num_subtask_workers=1,
+            output_path=multires_mesh_dir,
+            lods=list(lods),
+            original_ext=".ply",
+        )
+        multires_dir = os.path.join(multires_mesh_dir, "multires")
+        # Write segment_properties BEFORE sharding (it scans .index files).
+        write_segment_properties_file(multires_dir)
+        return multires_dir
+
+    def test_sharded_round_trip(self, multires_mesh_dir):
+        """Pack and verify that minishard index → manifest → fragments line up."""
+        import DracoPy
+        from mesh_n_bone.util import sharded_mesh_util
+
+        multires_dir = self._build_multires(multires_mesh_dir)
+        ids = [1]
+
+        # Snapshot pre-pack files for ground truth.
+        with open(os.path.join(multires_dir, "1.index"), "rb") as f:
+            expected_manifest = f.read()
+        with open(os.path.join(multires_dir, "1"), "rb") as f:
+            expected_fragments = f.read()
+
+        spec = sharded_mesh_util.make_sharding_spec(0, 1, 0)
+        grouping = sharded_mesh_util.group_segment_ids_by_shard(spec, ids)
+        for sn, sids in grouping.items():
+            sharded_mesh_util.pack_one_shard(
+                sn, sids, multires_dir, multires_dir, spec.to_dict(),
+            )
+        sharded_mesh_util.write_sharded_info_file(multires_dir, spec)
+        sharded_mesh_util.delete_unsharded_segment_files(multires_dir, ids)
+
+        # info JSON should announce the sharding block.
+        with open(os.path.join(multires_dir, "info")) as f:
+            info = json.load(f)
+        assert info["sharding"]["@type"] == "neuroglancer_uint64_sharded_v1"
+
+        # Unsharded files should be gone.
+        assert not os.path.exists(os.path.join(multires_dir, "1"))
+        assert not os.path.exists(os.path.join(multires_dir, "1.index"))
+
+        # Read the shard exactly the way Neuroglancer would.
+        spec.hashfn = sharded_mesh_util._murmur3_x86_128_unsigned
+        loc = spec.compute_shard_location(1)
+        with open(
+            os.path.join(multires_dir, f"{loc.shard_number}.shard"), "rb"
+        ) as f:
+            shard = f.read()
+        fixed_index_len = int(spec.index_length())
+        fixed = np.frombuffer(
+            shard[:fixed_index_len], dtype=np.uint64
+        ).reshape(-1, 2)
+        msi_s = int(fixed[int(loc.minishard_number), 0])
+        msi_e = int(fixed[int(loc.minishard_number), 1])
+        msi = (
+            np.frombuffer(
+                shard[fixed_index_len + msi_s : fixed_index_len + msi_e],
+                dtype=np.uint64,
+            )
+            .reshape(3, -1).T.copy()
+        )
+        for i in range(1, msi.shape[0]):
+            msi[i, 0] += msi[i - 1, 0]
+            msi[i, 1] += msi[i - 1, 1] + msi[i - 1, 2]
+        msi[:, 1] += fixed_index_len
+        row = next(r for r in msi if int(r[0]) == 1)
+        offset, size = int(row[1]), int(row[2])
+
+        # Manifest matches the original `.index` exactly.
+        assert shard[offset : offset + size] == expected_manifest
+        # Fragments live immediately before the manifest.
+        assert shard[offset - len(expected_fragments) : offset] == expected_fragments
+
+        # Decode every non-empty Draco fragment for at least the first LOD.
+        # If the byte slice for a LOD is even one byte off, DracoPy will raise.
+        g = expected_manifest
+        chunk_shape = np.frombuffer(g[:12], dtype="<f4"); g = g[12:]
+        grid_origin = np.frombuffer(g[:12], dtype="<f4"); g = g[12:]
+        (num_lods,) = struct.unpack("<I", g[:4]); g = g[4:]
+        g = g[4 * num_lods :]
+        g = g[12 * num_lods :]
+        num_frags = np.frombuffer(g[: 4 * num_lods], dtype="<u4"); g = g[4 * num_lods:]
+        sizes_per_lod = []
+        for n in num_frags:
+            n = int(n)
+            g = g[4 * 3 * n :]
+            sizes_per_lod.append(np.frombuffer(g[: 4 * n], dtype="<u4"))
+            g = g[4 * n :]
+
+        total_decoded = 0
+        cursor = offset - sum(int(s.sum()) for s in sizes_per_lod)
+        for lod_sizes in sizes_per_lod:
+            sub = 0
+            block = shard[cursor : cursor + int(lod_sizes.sum())]
+            for sz in lod_sizes:
+                sz = int(sz)
+                if sz == 0:
+                    continue
+                DracoPy.decode(block[sub : sub + sz])  # raises on bad bytes
+                total_decoded += 1
+                sub += sz
+            cursor += int(lod_sizes.sum())
+        assert total_decoded > 0, "expected at least one decoded fragment"
+
+
 class TestLodTruncation:
     """Test that LOD truncation correctly includes all valid LODs.
 
