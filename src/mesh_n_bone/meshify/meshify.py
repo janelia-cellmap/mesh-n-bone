@@ -327,8 +327,12 @@ class Meshify:
     do_singleres_multires_neuroglancer : bool
         Write single-resolution meshes wrapped in multires metadata.
     use_fixed_edge_simplification : bool
-        Use boundary-preserving simplification that pins block-edge
-        vertices during the per-chunk stage.
+        When ``True``, simplification runs in two stages: a per-chunk
+        pass with block-boundary vertices pinned (so they survive
+        assembly), followed by a global pass on the assembled mesh. The
+        split between the two stages is controlled by
+        ``stage_1_reduction_fraction``. When ``False``, a single
+        standard simplification pass runs after assembly.
     fixed_edge_merge_weld_epsilon : float
         Vertex-merge tolerance for fixed-edge simplification.
     fixed_edge_seam_angle_deg : float
