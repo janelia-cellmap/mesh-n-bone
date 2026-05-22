@@ -1,8 +1,88 @@
 """Tests for meshify module components."""
 
+import os
 import numpy as np
 import pytest
 import trimesh
+
+
+class TestNormalizeTargetIds:
+    """target_ids accepts None, int, list, or CSV path."""
+
+    def test_none_returns_none(self):
+        from mesh_n_bone.meshify.meshify import _normalize_target_ids
+        assert _normalize_target_ids(None) is None
+
+    def test_int_wrapped(self):
+        from mesh_n_bone.meshify.meshify import _normalize_target_ids
+        assert _normalize_target_ids(12345) == frozenset([12345])
+
+    def test_list_converted(self):
+        from mesh_n_bone.meshify.meshify import _normalize_target_ids
+        assert _normalize_target_ids([1, 2, 3]) == frozenset([1, 2, 3])
+
+    def test_csv_with_id_column(self, tmp_output_dir):
+        from mesh_n_bone.meshify.meshify import _normalize_target_ids
+        path = os.path.join(tmp_output_dir, "ids.csv")
+        with open(path, "w") as f:
+            f.write("id\n10\n20\n30\n")
+        assert _normalize_target_ids(path) == frozenset([10, 20, 30])
+
+    def test_csv_with_object_id_column(self, tmp_output_dir):
+        from mesh_n_bone.meshify.meshify import _normalize_target_ids
+        path = os.path.join(tmp_output_dir, "ids.csv")
+        with open(path, "w") as f:
+            f.write("Object ID,other_col\n10,foo\n20,bar\n")
+        assert _normalize_target_ids(path) == frozenset([10, 20])
+
+    def test_csv_headerless_first_column(self, tmp_output_dir):
+        from mesh_n_bone.meshify.meshify import _normalize_target_ids
+        path = os.path.join(tmp_output_dir, "ids.csv")
+        # Pandas treats the first row as a header by default; with no
+        # known id-column name, our normalize falls back to first column.
+        with open(path, "w") as f:
+            f.write("seg\n100\n200\n")
+        assert _normalize_target_ids(path) == frozenset([100, 200])
+
+
+class TestTargetIdsWorker:
+    """Block-worker behavior when target_ids is set."""
+
+    def _config(self, **overrides):
+        """Minimal worker config (only the keys this test path reads)."""
+        base = {
+            "downsample_factor": None,
+            "downsample_method": "nearest",
+            "use_fixed_edge_simplification": False,
+            "do_simplification": False,
+            "target_reduction": 0.99,
+            "stage_1_reduction_fraction": 0.5,
+            "read_write_block_shape_pixels": [16, 16, 16],
+            "default_aggressiveness": 0.3,
+            "target_ids": None,
+        }
+        base.update(overrides)
+        return base
+
+    def test_mask_except_keeps_only_targets(self):
+        """fastremap.mask_except behaves the way the worker expects it to."""
+        import fastremap
+        vol = np.array([0, 1, 2, 3, 1, 5, 1], dtype=np.uint64)
+        out = fastremap.mask_except(vol, [1, 3], in_place=False)
+        np.testing.assert_array_equal(out, [0, 1, 0, 3, 1, 0, 1])
+
+    def test_renumber_round_trips(self):
+        """The remap dict the worker builds round-trips correctly."""
+        import fastremap
+        keep = [42, 7, 1000]
+        remap = {old: new for new, old in enumerate(sorted(keep), start=1)}
+        inv_remap = {new: old for old, new in remap.items()}
+        vol = np.array([0, 42, 7, 1000, 42, 0], dtype=np.uint64)
+        small = fastremap.remap(vol, remap, preserve_missing_labels=True).astype(np.uint16)
+        np.testing.assert_array_equal(small, [0, 2, 1, 3, 2, 0])
+        # And inverse
+        for new, old in inv_remap.items():
+            assert remap[old] == new
 
 
 class TestStagedReductions:
