@@ -62,6 +62,71 @@ class TestMeshifyFromZarr:
             assert len(mesh.faces) > 0
             assert mesh.volume > 0
 
+    def test_target_ids_filters_output(self, tmp_output_dir):
+        """`target_ids=[1]` should produce ONLY mesh 1, even though
+        the volume also has object 2."""
+        vol = np.zeros((32, 32, 32), dtype=np.uint64)
+        vol[2:14, 2:14, 2:14] = 1
+        vol[18:30, 18:30, 18:30] = 2
+
+        input_path = _create_zarr_volume(tmp_output_dir, vol)
+        output_dir = os.path.join(tmp_output_dir, "output")
+
+        m = Meshify(
+            input_path=input_path,
+            output_directory=output_dir,
+            num_workers=1,
+            do_analysis=False,
+            check_mesh_validity=False,
+            do_simplification=False,
+            n_smoothing_iter=0,
+            remove_smallest_components=False,
+            target_ids=[1],
+        )
+        m.get_meshes()
+
+        mesh_dir = os.path.join(output_dir, "meshes")
+        meshes = sorted(os.listdir(mesh_dir))
+        assert meshes == ["1.ply"], (
+            f"target_ids=[1] should produce only 1.ply, got {meshes}"
+        )
+        mesh = trimesh.load(os.path.join(mesh_dir, "1.ply"))
+        # Volume should match object 1 (12^3 voxels × 8^3 nm³/voxel)
+        np.testing.assert_allclose(mesh.volume, 12**3 * 8**3, rtol=0.1)
+
+    def test_target_ids_csv_input(self, tmp_output_dir):
+        """`target_ids` set to a CSV file path should load the ids from
+        the file and meshify exactly those."""
+        vol = np.zeros((32, 32, 32), dtype=np.uint64)
+        vol[2:10, 2:10, 2:10] = 1
+        vol[12:20, 12:20, 12:20] = 2
+        vol[22:30, 22:30, 22:30] = 3
+
+        input_path = _create_zarr_volume(tmp_output_dir, vol)
+        output_dir = os.path.join(tmp_output_dir, "output")
+
+        ids_csv = os.path.join(tmp_output_dir, "ids.csv")
+        with open(ids_csv, "w") as f:
+            f.write("id\n1\n3\n")
+
+        m = Meshify(
+            input_path=input_path,
+            output_directory=output_dir,
+            num_workers=1,
+            do_analysis=False,
+            check_mesh_validity=False,
+            do_simplification=False,
+            n_smoothing_iter=0,
+            remove_smallest_components=False,
+            target_ids=ids_csv,
+        )
+        m.get_meshes()
+
+        meshes = sorted(os.listdir(os.path.join(output_dir, "meshes")))
+        assert meshes == ["1.ply", "3.ply"], (
+            f"CSV [1,3] should produce 1.ply + 3.ply only, got {meshes}"
+        )
+
     def test_cross_chunk_object_is_watertight(self, tmp_output_dir):
         """An object spanning multiple chunks should assemble into a watertight mesh."""
         vol = np.zeros((32, 32, 32), dtype=np.uint64)

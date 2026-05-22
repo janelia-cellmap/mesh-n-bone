@@ -149,6 +149,16 @@ roi:                             # Restrict processing to this subregion
   end: [500, 600, 700]           # End coordinates in dataset world units (ZYX)
                                  # Boundary edges are preserved during simplification.
                                  # Can also be passed via CLI: --roi z0,y0,x0,z1,y1,x1
+
+# ── Specific segment ids only (optional) ──
+# When set, only the listed ids are meshified — every other voxel is
+# zeroed before marching cubes via fastremap.mask_except, so zmesh does
+# no work on unwanted objects. Blocks containing none of the targets
+# are skipped entirely.
+target_ids: [12345, 67890]                # YAML list of ids, OR
+# target_ids: /path/to/ids.csv            # CSV file (first col, or "id"/"Object ID" col)
+# target_ids: 12345                       # Single id
+                                          # CLI: --ids 12345,67890  OR  --ids /path.csv
 ```
 
 `input_path` accepts any of `.zarr`, `.n5`, or neuroglancer precomputed sources, from any of these locations:

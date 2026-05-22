@@ -61,6 +61,21 @@ def _get_run_properties(args):
     return execution_directory, logpath, run_config
 
 
+def _parse_ids_arg(value):
+    """Parse a ``--ids`` argument.
+
+    Accepts either a comma-separated list of integer ids
+    (``--ids 12345,67890``) or a path to a CSV file whose first column
+    (or column named ``id``/``ID``/``Object ID``/``object_id``) holds
+    the ids. Returns the value to pass to ``Meshify(target_ids=...)``
+    (a list[int] or a string path — both are handled by Meshify's
+    normalize logic).
+    """
+    if "," in value or value.strip().isdigit():
+        return [int(p) for p in value.split(",") if p.strip()]
+    return value  # treat as a file path; Meshify will read it
+
+
 def _parse_roi_arg(roi_str):
     """Parse a ``--roi`` argument into a dict with ``begin`` and ``end`` keys.
 
@@ -111,6 +126,8 @@ def cmd_meshify(args):
     execution_directory, logpath, run_config = _get_run_properties(args)
     if args.roi:
         run_config["roi"] = _parse_roi_arg(args.roi)
+    if args.ids:
+        run_config["target_ids"] = _parse_ids_arg(args.ids)
     with tee_streams(logpath):
         os.chdir(execution_directory)
         try:
@@ -261,6 +278,16 @@ def main():
         type=str,
         default=None,
         help="ROI to process (ZYX): begin_z,begin_y,begin_x,end_z,end_y,end_x",
+    )
+    p_meshify.add_argument(
+        "--ids",
+        type=str,
+        default=None,
+        help=(
+            "Only meshify the given segment IDs. Accepts either a "
+            "comma-separated list (e.g. --ids 12345,67890) or a path to "
+            "a CSV file with one ID per row."
+        ),
     )
     p_meshify.set_defaults(func=cmd_meshify)
 
