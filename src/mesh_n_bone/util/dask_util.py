@@ -96,6 +96,14 @@ def start_dask(num_workers, msg, logger, config=None):
         with open("dask-config.yaml") as f:
             config = yaml.load(f, Loader=SafeLoader)
 
+    # Pin every common thread-pool source to a single thread per worker.
+    # OMP/MKL/OPENBLAS/NUMEXPR cover numpy/scipy/BLAS; TBB covers pymeshlab
+    # and meshlab's internal C++ filters (Taubin smoothing, vertex merge,
+    # etc.) which ignore the OMP family. Without TBB_NUM_THREADS each
+    # process can spawn ~N_CPU TBB workers during stage-2 simplification,
+    # which together with the dozens of dask workers stacked on a single
+    # LSF host trivially overwhelms the node (observed load avg >1000 on
+    # a 96-core box with 60 workers prior to this change).
     job_script_prologue = [
         "export NUMEXPR_MAX_THREADS=1",
         "export NUMEXPR_NUM_THREADS=1",
@@ -104,6 +112,9 @@ def start_dask(num_workers, msg, logger, config=None):
         "export OPENBLAS_NUM_THREADS=1",
         "export OPENMP_NUM_THREADS=1",
         "export OMP_NUM_THREADS=1",
+        "export TBB_NUM_THREADS=1",
+        # Some Intel runtimes have a separate KMP threadcount knob.
+        "export KMP_NUM_THREADS=1",
     ]
 
     cluster_type = next(iter(config["jobqueue"]))

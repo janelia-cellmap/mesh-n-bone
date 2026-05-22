@@ -25,6 +25,31 @@ from mesh_n_bone.util.precomputed_io import (
 logger = logging.getLogger(__name__)
 
 
+def _capped_tensorstore_context_spec():
+    """Tensorstore Context spec that limits internal thread pools.
+
+    Tensorstore defaults every concurrency resource (HTTP fetch pools,
+    data-copy / decompression pool, file I/O pool) to a high number,
+    typically N_CPU. In a dask-worker process — where dask itself
+    already runs us in a 1-thread-per-worker model — those default
+    pools combine with the dozens of worker processes stacked on a
+    single LSF host to produce thousands of runnable threads and
+    nodes-over-100%-load complaints from cluster admins. Cap each
+    pool to a small fixed limit so per-process thread count is bounded.
+    """
+    return {
+        # In-memory copying + decompression (e.g. gzip/blosc for zarr/n5).
+        "data_copy_concurrency": {"limit": 1},
+        # Local file I/O (irrelevant for remote sources but caps anyway).
+        "file_io_concurrency": {"limit": 1},
+        # GCS / S3 / generic HTTP fetch pools — allow 2 so a fetch can
+        # be in flight while the previous chunk is being decompressed.
+        "gcs_request_concurrency": {"limit": 2},
+        "s3_request_concurrency": {"limit": 2},
+        "http_request_concurrency": {"limit": 2},
+    }
+
+
 def _detect_zarr_driver(dataset_path):
     """Detect the tensorstore driver for *dataset_path* by content probing.
 
@@ -113,6 +138,7 @@ def open_ds_tensorstore(dataset_path, mode="r", filetype=None):
     spec = {
         "driver": filetype,
         "kvstore": kvstore,
+        "context": _capped_tensorstore_context_spec(),
     }
     if mode == "r":
         dataset_future = ts.open(spec, read=True, write=False)
