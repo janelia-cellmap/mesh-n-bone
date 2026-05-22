@@ -158,38 +158,42 @@ _thread_local_ts = {}
 def _estimate_block_target_mb_from_dask_config(
     config_path="dask-config.yaml",
     fallback_mb=128,
-    processing_amplification=16,
+    processing_amplification=6,
 ):
     """Pick a per-block memory budget by working backward from worker RAM.
 
     Reads ``dask-config.yaml`` and divides per-worker memory by an
-    amplification factor that approximates "peak working memory ÷
-    voxel-array memory" for a block (block input + tensorstore
-    decompression buffer + zmesh internal tables + per-chunk
-    simplification scratch + Python/library baseline). 16 is
-    deliberately conservative so a dense block can't OOM the worker
-    even at peak.
+    amplification factor approximating "peak working memory ÷ voxel-array
+    memory" for a block.
 
-    Returns *fallback_mb* if the dask config is missing/unparseable —
-    keeping behavior identical to pre-auto-tune on local/test runs.
+    The default amplification (6) is set from an empirical RSS-peak
+    measurement across uint64 block sizes 32 MB → 512 MB at sparse (10
+    segments) and dense (1000 segments) densities. After subtracting the
+    fixed ~114 MB Python + zmesh + pymeshlab + trimesh import baseline,
+    the asymptotic amplification was ~0.1× on sparse blocks and
+    ~1.1–1.3× on dense blocks — i.e., per-task peak working memory grows
+    almost exactly with the voxel array on dense data and not at all on
+    sparse data. ``6`` leaves a ~4.5× safety margin over the empirical
+    worst case for unforeseen dense / degenerate cases.
 
-    For the user's typical LSF config (180 GB / 12 processes = 15 GB
-    per worker), this yields ~937 MB per block. For a 60 GB-per-worker
-    box it'd give ~3.75 GB; there is no extra ceiling cap because
-    the amplification factor already encodes "leave headroom" — adding
-    a cap on top hides the math and makes the result harder to reason
-    about.
+    For the user's typical LSF config (180 GB / 12 processes = 15 GB per
+    worker) this yields ~2.5 GB per block; for a 60 GB-per-worker box
+    it'd give ~10 GB. No cap — the amplification factor already encodes
+    "leave headroom" and a cap on top would hide the math.
+
+    Returns *fallback_mb* if the dask config is missing/unparseable.
 
     Parameters
     ----------
     config_path : str
         Path to dask-config.yaml. Default reads from cwd.
     fallback_mb : int
-        Returned when the dask config is missing or unparseable.
+        Returned when the dask config is missing or unparseable. Also
+        the floor on the auto-tuned result so tiny workers don't get
+        pathologically small blocks.
     processing_amplification : int
-        "Block peak RAM ÷ block voxel array" multiplier. zmesh + stage-1
-        simplification typically uses ~6-10x; we use 16 to leave room
-        for dense degenerate cases.
+        "Block peak RAM ÷ block voxel array" multiplier. Empirical
+        asymptote is ~1.3×; the 6× default is 4.5× safety margin.
     """
     try:
         from dask.utils import parse_bytes

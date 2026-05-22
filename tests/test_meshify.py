@@ -99,25 +99,25 @@ class TestEstimateBlockTargetMb:
         path = os.path.join(tmp_output_dir, "dask-config.yaml")
         with open(path, "w") as f:
             f.write("jobqueue:\n  lsf:\n    memory: 180GB\n    processes: 12\n")
-        # 180 GB / 12 = 15 GB per worker; amplification=16 -> ~937.5 MB.
+        # 180 GB / 12 = 15 GB per worker; amplification=6 -> ~2500 MB.
         result = _estimate_block_target_mb_from_dask_config(path)
-        assert 900 < result < 1000
+        assert 2400 < result < 2600
 
     def test_huge_worker_is_unbounded(self, tmp_output_dir):
         from mesh_n_bone.meshify.meshify import _estimate_block_target_mb_from_dask_config
         path = os.path.join(tmp_output_dir, "dask-config.yaml")
-        # 60 GB worker (no cap_mb anymore) -> ~3750 MB.
+        # 60 GB worker, no ceiling -> ~10000 MB.
         with open(path, "w") as f:
             f.write("jobqueue:\n  local:\n    memory: 60GB\n    processes: 1\n")
         result = _estimate_block_target_mb_from_dask_config(path)
-        assert 3500 < result < 4000
+        assert 9000 < result < 11000
 
     def test_small_worker_keeps_fallback(self, tmp_output_dir):
         from mesh_n_bone.meshify.meshify import _estimate_block_target_mb_from_dask_config
         path = os.path.join(tmp_output_dir, "dask-config.yaml")
-        # 1 GB worker memory / 16 = 62.5 MB, smaller than the floor.
+        # 256 MB worker / 6 ~= 43 MB, smaller than the floor.
         with open(path, "w") as f:
-            f.write("jobqueue:\n  local:\n    memory: 1GB\n    processes: 1\n")
+            f.write("jobqueue:\n  local:\n    memory: 256MB\n    processes: 1\n")
         result = _estimate_block_target_mb_from_dask_config(path, fallback_mb=128)
         assert result == 128
 
