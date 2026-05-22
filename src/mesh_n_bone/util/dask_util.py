@@ -501,6 +501,79 @@ try:
                 block_rois[index:] = []
         return block_rois
 
+    def count_blocks(roi, block_size_world):
+        """Number of blocks needed to tile *roi* with *block_size_world*.
+
+        Cheap, geometry-only — no I/O, no Roi-list materialization.
+
+        Parameters
+        ----------
+        roi : funlib.geometry.Roi
+            Region of interest.
+        block_size_world : sequence of int
+            Block extent in the same units as ``roi`` (world / nm).
+
+        Returns
+        -------
+        int
+            Number of blocks (product of ceil(shape / block_size)).
+        """
+        bs = tuple(block_size_world)
+        return int(
+            np.prod([np.ceil(roi.shape[i] / bs[i]) for i in range(len(bs))])
+        )
+
+    def block_from_index(
+        index,
+        roi_begin,
+        roi_end,
+        block_size_world,
+        padding=None,
+    ):
+        """Materialize a single block's ``DaskBlock`` from its sequential index.
+
+        Inverts the index-assignment order used by :func:`create_blocks`
+        (innermost loop is axis 0, outermost is axis 2). Workers call
+        this with just the index plus a small pickleable config — the
+        driver never has to build a list of all block objects.
+
+        Parameters
+        ----------
+        index : int
+            Sequential block index, ``0 <= index < count_blocks(...)``.
+        roi_begin, roi_end : sequence of int
+            ROI extent in world coordinates (same units as
+            *block_size_world*).
+        block_size_world : sequence of int
+            Block extent in world units.
+        padding : sequence of int or None
+            Symmetric padding to grow the block ROI by, matching the
+            ``padding`` argument of :func:`create_blocks`.
+
+        Returns
+        -------
+        DaskBlock
+            Block with ``index`` and ``roi`` populated.
+        """
+        from funlib.geometry import Coordinate
+        bs = tuple(block_size_world)
+        rb = tuple(roi_begin)
+        re = tuple(roi_end)
+        shape = tuple(re[i] - rb[i] for i in range(3))
+        n0 = int(np.ceil(shape[0] / bs[0]))
+        n1 = int(np.ceil(shape[1] / bs[1]))
+        # Match create_blocks: outer loop dim_2, then dim_1, then dim_0.
+        i2, rem = divmod(index, n0 * n1)
+        i1, i0 = divmod(rem, n0)
+        start = Coordinate(rb[0] + i0 * bs[0], rb[1] + i1 * bs[1], rb[2] + i2 * bs[2])
+        block_roi = Roi(start, Coordinate(bs))
+        if padding:
+            from funlib.geometry import Coordinate
+            # Coordinate.grow requires a Coordinate, not a tuple — wrap.
+            pad = padding if isinstance(padding, Coordinate) else Coordinate(padding)
+            block_roi = block_roi.grow(pad, pad)
+        return DaskBlock(index, block_roi)
+
 except ImportError:
     # funlib not available - block-based processing won't work
     # but multires pipeline doesn't need it

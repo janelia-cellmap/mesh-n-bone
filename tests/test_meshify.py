@@ -85,6 +85,88 @@ class TestTargetIdsWorker:
             assert remap[old] == new
 
 
+class TestEstimateBlockTargetMb:
+    """`_estimate_block_target_mb_from_dask_config` reads dask-config.yaml
+    and returns a per-block memory budget derived from per-worker RAM."""
+
+    def test_fallback_when_no_config(self, tmp_output_dir):
+        from mesh_n_bone.meshify.meshify import _estimate_block_target_mb_from_dask_config
+        missing = os.path.join(tmp_output_dir, "missing-dask-config.yaml")
+        assert _estimate_block_target_mb_from_dask_config(missing, fallback_mb=128) == 128
+
+    def test_real_lsf_config(self, tmp_output_dir):
+        from mesh_n_bone.meshify.meshify import _estimate_block_target_mb_from_dask_config
+        path = os.path.join(tmp_output_dir, "dask-config.yaml")
+        with open(path, "w") as f:
+            f.write("jobqueue:\n  lsf:\n    memory: 180GB\n    processes: 12\n")
+        # 180 GB / 12 = 15 GB per worker; with amplification=8 -> 1875 MB,
+        # capped to 1024 MB.
+        result = _estimate_block_target_mb_from_dask_config(path, cap_mb=1024)
+        assert result == 1024
+
+    def test_small_worker_keeps_fallback(self, tmp_output_dir):
+        from mesh_n_bone.meshify.meshify import _estimate_block_target_mb_from_dask_config
+        path = os.path.join(tmp_output_dir, "dask-config.yaml")
+        # 1 GB worker memory / 8 = 125 MB, smaller than the floor.
+        with open(path, "w") as f:
+            f.write("jobqueue:\n  local:\n    memory: 1GB\n    processes: 1\n")
+        # Floored at fallback_mb to keep block size sane.
+        result = _estimate_block_target_mb_from_dask_config(
+            path, fallback_mb=128, cap_mb=1024
+        )
+        assert result == 128
+
+    def test_malformed_config_falls_back(self, tmp_output_dir):
+        from mesh_n_bone.meshify.meshify import _estimate_block_target_mb_from_dask_config
+        path = os.path.join(tmp_output_dir, "dask-config.yaml")
+        with open(path, "w") as f:
+            f.write("not-jobqueue:\n  foo: bar\n")
+        assert _estimate_block_target_mb_from_dask_config(path, fallback_mb=128) == 128
+
+
+class TestBlockFromIndex:
+    """`block_from_index` should produce the same DaskBlocks as
+    `create_blocks` would, indexed by integer."""
+
+    def test_index_parity_with_eager_create_blocks(self):
+        from mesh_n_bone.util.dask_util import (
+            block_from_index, count_blocks, create_blocks,
+        )
+        from funlib.geometry import Coordinate, Roi
+        from types import SimpleNamespace
+
+        roi = Roi((0, 0, 0), (96, 64, 128))
+        block_size_world = Coordinate(32, 32, 32)
+        ds = SimpleNamespace(
+            chunk_shape=block_size_world,
+            voxel_size=Coordinate(1, 1, 1),
+        )
+        eager = create_blocks(roi, ds)
+        n_eager = len(eager)
+        n_lazy = count_blocks(roi, block_size_world)
+        assert n_eager == n_lazy
+        for i in range(n_eager):
+            lazy = block_from_index(
+                i, roi.get_begin(), roi.get_end(), block_size_world,
+            )
+            assert lazy.index == eager[i].index == i
+            assert tuple(lazy.roi.get_begin()) == tuple(eager[i].roi.get_begin()), (
+                f"index {i}: {lazy.roi.get_begin()} != {eager[i].roi.get_begin()}"
+            )
+            assert tuple(lazy.roi.get_end()) == tuple(eager[i].roi.get_end())
+
+    def test_padding_round_trip(self):
+        from mesh_n_bone.util.dask_util import block_from_index
+        from funlib.geometry import Coordinate
+
+        b = block_from_index(
+            0, (0, 0, 0), (32, 32, 32), (32, 32, 32), padding=Coordinate(4, 4, 4)
+        )
+        # padding=(4,4,4) grows the (0,0,0)+(32,32,32) block by 4 on each side
+        assert tuple(b.roi.get_begin()) == (-4, -4, -4)
+        assert tuple(b.roi.get_shape()) == (40, 40, 40)
+
+
 class TestStagedReductions:
     def test_staged_reductions_sum(self):
         from mesh_n_bone.meshify.meshify import staged_reductions

@@ -155,6 +155,57 @@ def staged_reductions(target_reduction_total, frac1, frac2):
 _thread_local_ts = {}
 
 
+def _estimate_block_target_mb_from_dask_config(
+    config_path="dask-config.yaml",
+    fallback_mb=128,
+    cap_mb=1024,
+    processing_amplification=8,
+):
+    """Pick a per-block memory budget based on per-worker RAM.
+
+    Reads ``dask-config.yaml`` from the current directory, extracts
+    per-worker memory (``memory / processes`` for the configured cluster
+    type), and returns a fraction of it sized to leave headroom for
+    processing (MC working memory + stage-1 simplification scratch).
+
+    Returns *fallback_mb* if the config can't be found or parsed —
+    keeping the heuristic safely conservative on machines without a
+    dask config (e.g. local single-process runs).
+
+    Parameters
+    ----------
+    config_path : str
+        Path to dask-config.yaml. Default reads from cwd.
+    fallback_mb : int
+        Returned when the dask config is missing or unparseable.
+    cap_mb : int
+        Upper bound. Even on huge-memory workers we don't want any
+        single block too big — one slow block tails the whole run, and
+        peak working memory still has to fit.
+    processing_amplification : int
+        Heuristic multiplier for "block peak RAM / block voxel array."
+        zmesh + stage-1 simplification typically uses ~5-8x the voxel
+        array; 8 is conservative.
+    """
+    try:
+        from dask.utils import parse_bytes
+        import yaml
+        with open(config_path) as f:
+            cfg = yaml.safe_load(f)
+        jq = cfg.get("jobqueue", {}) or {}
+        if not jq:
+            return fallback_mb
+        # Take the first (only) configured cluster type.
+        _, settings = next(iter(jq.items()))
+        mem_bytes = parse_bytes(str(settings["memory"]))
+        processes = int(settings.get("processes") or 1)
+        per_worker_mb = (mem_bytes / processes) / 1e6
+        target = per_worker_mb / processing_amplification
+        return float(min(cap_mb, max(fallback_mb, target)))
+    except (FileNotFoundError, KeyError, TypeError, ValueError):
+        return fallback_mb
+
+
 def _normalize_target_ids(value):
     """Coerce a target_ids spec to a frozenset[int] or None.
 
@@ -181,21 +232,34 @@ def _normalize_target_ids(value):
     return frozenset(int(i) for i in value)
 
 
-def _get_chunked_mesh_worker(block, tmpdirname, config):
+def _get_chunked_mesh_worker(block_index, tmpdirname, config):
     """Run marching cubes on a single block and write per-segment PLYs.
 
     This is a module-level function so only lightweight *config* dict
     (scalars, tuples, strings) is serialised to workers — no zarr arrays.
+    Receives only the block's sequential index; the block's ROI is
+    materialized inside the worker via
+    :func:`mesh_n_bone.util.dask_util.block_from_index`, so the driver
+    never has to hold a list of millions of block objects.
 
     Parameters
     ----------
-    block : DaskBlock
-        Block specification with ROI and index.
+    block_index : int
+        Sequential block index produced by ``db.range(num_blocks)``.
     tmpdirname : str
         Temporary directory for writing per-segment block meshes.
     config : dict
-        Worker config from ``Meshify._get_worker_config()``.
+        Worker config from ``Meshify._get_worker_config()``. Must
+        include ``block_roi_begin``, ``block_roi_end``,
+        ``block_size_world`` and ``block_padding``.
     """
+    block = dask_util.block_from_index(
+        block_index,
+        config["block_roi_begin"],
+        config["block_roi_end"],
+        config["block_size_world"],
+        padding=config.get("block_padding"),
+    )
     dataset_path = config["dataset_path"]
     if dataset_path not in _thread_local_ts:
         _thread_local_ts[dataset_path] = open_ds_tensorstore(dataset_path)
@@ -658,24 +722,36 @@ class Meshify:
         self.retry_on_oom = retry_on_oom
         self.memory_retry_max = memory_retry_max
 
-    def _default_block_shape_pixels(self, target_mb=128):
+    def _default_block_shape_pixels(self, target_mb=None):
         """Choose a default block shape as a chunk-aligned multiple.
 
         Picks the largest integer multiple of the dataset's chunk shape
-        whose memory footprint stays at or below ``target_mb``.  Larger
+        whose memory footprint stays at or below ``target_mb``. Larger
         blocks reduce the number of block boundaries (and therefore
-        frozen boundary vertices during fixed-edge simplification).
+        frozen boundary vertices during fixed-edge simplification),
+        and shrink dask graph scheduling overhead.
+
+        When ``target_mb`` is ``None`` (the default) we estimate a
+        sensible value from the dask-config.yaml in the current
+        directory: per-worker RAM divided by an empirical processing
+        amplification factor (~8x, covering MC working memory + stage-1
+        simplification scratch + headroom for Python/libs). Capped at
+        1 GB so a single slow block doesn't tail the whole run. Falls
+        back to 128 MB if no dask-config can be parsed.
 
         Parameters
         ----------
-        target_mb : int or float
-            Target memory budget per block in megabytes.
+        target_mb : int, float, or None
+            Target memory budget per block in megabytes. ``None``
+            triggers auto-tuning from the dask-config.
 
         Returns
         -------
         numpy.ndarray
             Block shape in voxels, as a multiple of the chunk shape.
         """
+        if target_mb is None:
+            target_mb = _estimate_block_target_mb_from_dask_config()
         chunk = np.array(self.segmentation_array.chunk_shape)
         itemsize = self.segmentation_array.dtype.itemsize
         chunk_bytes = int(np.prod(chunk)) * itemsize
@@ -777,31 +853,46 @@ class Meshify:
     def get_chunked_meshes(self, dirname):
         """Generate per-block meshes for the entire ROI using Dask.
 
+        Driver enumerates blocks lazily by index — only the count is
+        computed up front (O(1)), and each worker materializes its own
+        block ROI from the index. This avoids building a list of
+        millions of block objects on the driver for large volumes, and
+        shrinks per-task graph payload from a Roi-carrying object down
+        to a single int.
+
         Parameters
         ----------
         dirname : str
             Directory where per-segment block mesh PLYs are written.
         """
-        blocks = dask_util.create_blocks(
-            self.roi,
-            self.segmentation_array,
-            self.read_write_block_shape_pixels.copy(),
-            padding=self.output_voxel_size_funlib,
+        block_size_world = (
+            self.read_write_block_shape_pixels * self.output_voxel_size_funlib
         )
+        num_blocks = dask_util.count_blocks(self.roi, block_size_world)
 
         worker_config = self._get_worker_config()
+        # Pass enough info to reconstruct each block's ROI in the worker.
+        worker_config["block_roi_begin"] = tuple(self.roi.get_begin())
+        worker_config["block_roi_end"] = tuple(self.roi.get_end())
+        worker_config["block_size_world"] = tuple(int(v) for v in block_size_world)
+        worker_config["block_padding"] = tuple(self.output_voxel_size_funlib)
+
         effective_workers = dask_util.effective_num_workers(
-            self.num_workers, len(blocks), logger, "generate chunked meshes",
+            self.num_workers, num_blocks, logger, "generate chunked meshes",
         )
 
         def _run(workers, config):
-            bag = db.from_sequence(blocks, npartitions=workers * 10).map(
+            # db.range chokes when npartitions > n; cap at the block count.
+            npartitions = max(1, min(num_blocks, workers * 10))
+            bag = db.range(num_blocks, npartitions=npartitions).map(
                 _get_chunked_mesh_worker, dirname, worker_config
             )
             with dask_util.start_dask(
                 workers, "generate chunked meshes", logger, config=config,
             ):
-                with Timing_Messager("Generating chunked meshes", logger):
+                with Timing_Messager(
+                    f"Generating chunked meshes ({num_blocks} blocks)", logger,
+                ):
                     bag.compute()
 
         dask_util.run_with_oom_retry(
