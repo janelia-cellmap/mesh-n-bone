@@ -107,6 +107,56 @@ class TestWatertightnessAfterSimplification:
         # Without simplification, face count should be similar
         assert len(result.faces) >= len(mesh.faces) * 0.9
 
+    def test_both_orderings_produce_valid_meshes(self, watertight_sphere_mesh):
+        """smooth_before_simplify=True (default) and =False (legacy) must
+        both yield a valid, simplified mesh. Default ordering is the
+        smooth-first path now."""
+        mesh = watertight_sphere_mesh
+        kwargs = dict(
+            target_reduction=0.9,
+            n_smoothing_iter=5,
+            remove_smallest_components=True,
+            aggressiveness=0.3,
+            do_simplification=True,
+            check_mesh_validity=True,
+        )
+        smooth_first = Meshify.simplify_and_smooth_mesh(
+            mesh.copy(), smooth_before_simplify=True, **kwargs
+        )
+        decimate_first = Meshify.simplify_and_smooth_mesh(
+            mesh.copy(), smooth_before_simplify=False, **kwargs
+        )
+
+        assert Meshify.is_mesh_valid(smooth_first)
+        assert Meshify.is_mesh_valid(decimate_first)
+        # Both should hit roughly the same final face count (within an
+        # order of magnitude). The exact count isn't pinned because QEM
+        # operates on slightly different inputs in each path.
+        assert 0.1 < len(smooth_first.faces) / len(decimate_first.faces) < 10
+
+    def test_default_is_smooth_first(self, watertight_sphere_mesh):
+        """The default ordering when no kwarg is passed must be smooth-first."""
+        mesh = watertight_sphere_mesh
+        default = Meshify.simplify_and_smooth_mesh(
+            mesh.copy(),
+            target_reduction=0.9,
+            n_smoothing_iter=5,
+            do_simplification=True,
+            check_mesh_validity=True,
+        )
+        smooth_first = Meshify.simplify_and_smooth_mesh(
+            mesh.copy(),
+            target_reduction=0.9,
+            n_smoothing_iter=5,
+            do_simplification=True,
+            check_mesh_validity=True,
+            smooth_before_simplify=True,
+        )
+        # Identical pipeline modulo a fresh `mesh.copy()` should yield
+        # identical outputs.
+        np.testing.assert_allclose(default.vertices, smooth_first.vertices, rtol=1e-5)
+        np.testing.assert_array_equal(default.faces, smooth_first.faces)
+
     def test_smoothing_preserves_approximate_volume(self, watertight_sphere_mesh):
         """Smoothing should not drastically change the volume."""
         mesh = watertight_sphere_mesh
