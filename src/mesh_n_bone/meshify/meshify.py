@@ -891,8 +891,9 @@ class Meshify:
         )
 
         def _run(workers, config):
-            # db.range chokes when npartitions > n; cap at the block count.
-            npartitions = max(1, min(num_blocks, workers * 10))
+            # Use the rounded estimator here rather than workers * 10 directly:
+            # dask.bag.range puts all remainder elements in the final partition.
+            npartitions = dask_util.guesstimate_npartitions(num_blocks, workers)
             bag = db.range(num_blocks, npartitions=npartitions).map(
                 _get_chunked_mesh_worker, dirname, worker_config
             )

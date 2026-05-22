@@ -42,11 +42,12 @@ def _capped_tensorstore_context_spec():
         "data_copy_concurrency": {"limit": 1},
         # Local file I/O (irrelevant for remote sources but caps anyway).
         "file_io_concurrency": {"limit": 1},
-        # GCS / S3 / generic HTTP fetch pools — allow 2 so a fetch can
-        # be in flight while the previous chunk is being decompressed.
-        "gcs_request_concurrency": {"limit": 2},
-        "s3_request_concurrency": {"limit": 2},
-        "http_request_concurrency": {"limit": 2},
+        # Remote fetch pools. Keep these at one per worker process; Dask
+        # supplies the process-level parallelism, and large remote reads
+        # otherwise multiply into thousands of simultaneous requests.
+        "gcs_request_concurrency": {"limit": 1},
+        "s3_request_concurrency": {"limit": 1},
+        "http_request_concurrency": {"limit": 1},
     }
 
 
@@ -147,7 +148,7 @@ def open_ds_tensorstore(dataset_path, mode="r", filetype=None):
     return dataset_future.result()
 
 
-def read_with_retries(dataset, valid_slices, max_retries=10, timeout=5):
+def read_with_retries(dataset, valid_slices, max_retries=10, timeout=60):
     """Read from TensorStore with exponential backoff on timeout.
 
     Parameters
@@ -182,7 +183,7 @@ def read_with_retries(dataset, valid_slices, max_retries=10, timeout=5):
 
 
 def to_ndarray_tensorstore(dataset, roi, voxel_size, offset, swap_axes=False,
-                           fill_value=0, max_retries=10, timeout=5):
+                           fill_value=0, max_retries=10, timeout=60):
     """Read a region of a TensorStore dataset as a numpy array.
 
     Handles padding when the ROI extends beyond dataset bounds.

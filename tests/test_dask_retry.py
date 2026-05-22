@@ -68,6 +68,26 @@ class TestEffectiveNumWorkers:
         assert any("5" in r.message for r in caplog.records)
 
 
+class TestGuesstimateNPartitions:
+    def test_avoids_dask_range_huge_final_partition(self):
+        elements = 217620
+        workers = 576
+
+        direct_partitions = min(elements, workers * 10)
+        direct_size = elements // direct_partitions
+        direct_last_size = elements - (direct_partitions - 1) * direct_size
+        assert direct_last_size == 4537
+
+        partitions = dask_util.guesstimate_npartitions(elements, workers)
+        size = elements // partitions
+        last_size = elements - (partitions - 1) * size
+
+        assert partitions == 5881
+        assert size == 37
+        assert last_size == 60
+        assert last_size <= size * 2
+
+
 class TestRunWithOomRetry:
     def test_passthrough_when_disabled(self):
         calls = []
