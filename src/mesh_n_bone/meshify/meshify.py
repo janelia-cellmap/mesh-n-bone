@@ -158,19 +158,27 @@ _thread_local_ts = {}
 def _estimate_block_target_mb_from_dask_config(
     config_path="dask-config.yaml",
     fallback_mb=128,
-    cap_mb=1024,
-    processing_amplification=8,
+    processing_amplification=16,
 ):
-    """Pick a per-block memory budget based on per-worker RAM.
+    """Pick a per-block memory budget by working backward from worker RAM.
 
-    Reads ``dask-config.yaml`` from the current directory, extracts
-    per-worker memory (``memory / processes`` for the configured cluster
-    type), and returns a fraction of it sized to leave headroom for
-    processing (MC working memory + stage-1 simplification scratch).
+    Reads ``dask-config.yaml`` and divides per-worker memory by an
+    amplification factor that approximates "peak working memory ÷
+    voxel-array memory" for a block (block input + tensorstore
+    decompression buffer + zmesh internal tables + per-chunk
+    simplification scratch + Python/library baseline). 16 is
+    deliberately conservative so a dense block can't OOM the worker
+    even at peak.
 
-    Returns *fallback_mb* if the config can't be found or parsed —
-    keeping the heuristic safely conservative on machines without a
-    dask config (e.g. local single-process runs).
+    Returns *fallback_mb* if the dask config is missing/unparseable —
+    keeping behavior identical to pre-auto-tune on local/test runs.
+
+    For the user's typical LSF config (180 GB / 12 processes = 15 GB
+    per worker), this yields ~937 MB per block. For a 60 GB-per-worker
+    box it'd give ~3.75 GB; there is no extra ceiling cap because
+    the amplification factor already encodes "leave headroom" — adding
+    a cap on top hides the math and makes the result harder to reason
+    about.
 
     Parameters
     ----------
@@ -178,14 +186,10 @@ def _estimate_block_target_mb_from_dask_config(
         Path to dask-config.yaml. Default reads from cwd.
     fallback_mb : int
         Returned when the dask config is missing or unparseable.
-    cap_mb : int
-        Upper bound. Even on huge-memory workers we don't want any
-        single block too big — one slow block tails the whole run, and
-        peak working memory still has to fit.
     processing_amplification : int
-        Heuristic multiplier for "block peak RAM / block voxel array."
-        zmesh + stage-1 simplification typically uses ~5-8x the voxel
-        array; 8 is conservative.
+        "Block peak RAM ÷ block voxel array" multiplier. zmesh + stage-1
+        simplification typically uses ~6-10x; we use 16 to leave room
+        for dense degenerate cases.
     """
     try:
         from dask.utils import parse_bytes
@@ -201,7 +205,8 @@ def _estimate_block_target_mb_from_dask_config(
         processes = int(settings.get("processes") or 1)
         per_worker_mb = (mem_bytes / processes) / 1e6
         target = per_worker_mb / processing_amplification
-        return float(min(cap_mb, max(fallback_mb, target)))
+        # Floor so tiny workers don't get pathologically small blocks.
+        return float(max(fallback_mb, target))
     except (FileNotFoundError, KeyError, TypeError, ValueError):
         return fallback_mb
 
