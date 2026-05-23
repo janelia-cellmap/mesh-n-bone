@@ -1,5 +1,7 @@
 """Mesh generation from segmentation volumes using zmesh and dask."""
 
+from dataclasses import asdict, dataclass
+import copy
 from funlib.geometry import Roi, Coordinate
 import numpy as np
 import os
@@ -153,6 +155,292 @@ def staged_reductions(target_reduction_total, frac1, frac2):
 
 # Thread-local tensorstore handle cache so each worker opens once
 _thread_local_ts = {}
+
+
+@dataclass(frozen=True)
+class AssemblyMeshEstimate:
+    """Estimated assembly cost for one final segment mesh."""
+
+    mesh_id: str
+    num_files: int
+    ply_bytes: int
+    vertex_count: int
+    face_count: int
+    raw_mesh_bytes: int
+    estimated_peak_bytes: int
+
+
+@dataclass(frozen=True)
+class AssemblyWave:
+    """One assembly pass using a single Dask process-per-job setting."""
+
+    processes: int
+    workers: int
+    batches: list[list[str]]
+    max_estimated_peak_bytes: int
+    total_ply_bytes: int
+    config: dict | None
+
+
+def _read_ply_header_counts(path, max_header_bytes=64 * 1024):
+    """Return ``(vertices, faces)`` from a PLY header without reading geometry."""
+    header = bytearray()
+    marker = b"end_header"
+    with open(path, "rb") as f:
+        while marker not in header and len(header) < max_header_bytes:
+            chunk = f.read(1024)
+            if not chunk:
+                break
+            header.extend(chunk)
+
+    end = header.find(marker)
+    if end < 0:
+        raise ValueError(f"PLY header terminator not found in {path!r}")
+
+    text = header[:end].decode("ascii", errors="ignore")
+    vertices = None
+    faces = None
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) == 3 and parts[:2] == ["element", "vertex"]:
+            vertices = int(parts[2])
+        elif len(parts) == 3 and parts[:2] == ["element", "face"]:
+            faces = int(parts[2])
+
+    if vertices is None or faces is None:
+        raise ValueError(f"PLY vertex/face counts not found in {path!r}")
+    return vertices, faces
+
+
+def _assembly_memory_amplification(
+    do_simplification=True,
+    smooth_before_simplify=True,
+    check_mesh_validity=True,
+    has_custom_roi=False,
+):
+    """Choose a conservative peak-RSS multiplier for assembled mesh arrays."""
+    if do_simplification:
+        # A 658 MiB / 31M-face chunked PLY sample measured 16.6 GiB peak
+        # RSS for decimate-then-smooth assembly without validity repair.
+        # That is ~22x over raw float64/int32 mesh arrays after the fixed
+        # baseline, so keep a little headroom above the observed case.
+        amplification = 32 if smooth_before_simplify else 24
+    else:
+        # Even without simplification, concatenate/consolidate/boundary
+        # dedup can briefly duplicate several full-size mesh arrays.
+        amplification = 20
+    if check_mesh_validity or has_custom_roi:
+        amplification += 4
+    return amplification
+
+
+def _estimate_assembly_peak_bytes(
+    ply_bytes,
+    vertex_count,
+    face_count,
+    amplification,
+    baseline_bytes=1 << 30,
+):
+    """Estimate peak RSS for one mesh assembly from chunk PLY totals."""
+    raw_mesh_bytes = vertex_count * 3 * 8 + face_count * 3 * 4
+    # Header parsing can fail for malformed or future PLY variants. In that
+    # case, file size is still a useful lower bound on in-memory geometry.
+    effective_mesh_bytes = max(raw_mesh_bytes, int(ply_bytes * 1.1))
+    return raw_mesh_bytes, int(baseline_bytes + amplification * effective_mesh_bytes)
+
+
+def _scan_assembly_mesh_estimates(dirname, amplification):
+    """Scan chunked mesh PLYs and estimate assembly memory per segment id."""
+    estimates = []
+    for mesh_id in sorted(os.listdir(dirname)):
+        mesh_dir = os.path.join(dirname, mesh_id)
+        if not os.path.isdir(mesh_dir):
+            continue
+
+        num_files = 0
+        ply_bytes = 0
+        vertex_count = 0
+        face_count = 0
+        for name in os.listdir(mesh_dir):
+            if not name.endswith(".ply"):
+                continue
+            num_files += 1
+            path = os.path.join(mesh_dir, name)
+            try:
+                ply_bytes += os.path.getsize(path)
+                vertices, faces = _read_ply_header_counts(path)
+            except (OSError, ValueError) as e:
+                logger.debug("Could not read PLY header for %s: %s", path, e)
+                continue
+            vertex_count += vertices
+            face_count += faces
+
+        if num_files == 0:
+            continue
+        raw_mesh_bytes, estimated_peak_bytes = _estimate_assembly_peak_bytes(
+            ply_bytes, vertex_count, face_count, amplification,
+        )
+        estimates.append(
+            AssemblyMeshEstimate(
+                mesh_id=str(mesh_id),
+                num_files=num_files,
+                ply_bytes=int(ply_bytes),
+                vertex_count=int(vertex_count),
+                face_count=int(face_count),
+                raw_mesh_bytes=int(raw_mesh_bytes),
+                estimated_peak_bytes=int(estimated_peak_bytes),
+            )
+        )
+    return estimates
+
+
+def _jobqueue_settings(config):
+    """Return ``(cluster_type, settings)`` for a dask-jobqueue config."""
+    if not config:
+        return None, None
+    jobqueue = config.get("jobqueue", {}) or {}
+    if not jobqueue:
+        return None, None
+    cluster_type, settings = next(iter(jobqueue.items()))
+    return cluster_type, settings
+
+
+def _job_memory_bytes(settings):
+    """Parse job memory bytes from a dask-jobqueue settings dict."""
+    if not settings or "memory" not in settings:
+        return None
+    from dask.utils import parse_bytes
+    return int(parse_bytes(str(settings["memory"])))
+
+
+def _recommended_assembly_processes(
+    estimated_peak_bytes,
+    job_memory_bytes,
+    base_processes,
+    memory_fraction=0.60,
+):
+    """Pick processes/job so one estimated assembly fits per process."""
+    base_processes = max(1, int(base_processes))
+    if not job_memory_bytes or estimated_peak_bytes <= 0:
+        return base_processes
+    usable_job_bytes = int(job_memory_bytes * memory_fraction)
+    processes = usable_job_bytes // int(estimated_peak_bytes)
+    return max(1, min(base_processes, int(processes)))
+
+
+def _assembly_config_for_processes(config, cluster_type, processes):
+    """Copy a Dask config and set processes/cores for one-thread workers."""
+    if config is None or cluster_type is None:
+        return None
+    adjusted = copy.deepcopy(config)
+    dask_util.set_jobqueue_processes(adjusted, cluster_type, processes)
+    return adjusted
+
+
+def _balanced_assembly_batches(estimates, max_batches):
+    """Greedily balance mesh ids into batches by estimated processing weight."""
+    import heapq
+
+    if not estimates:
+        return []
+    max_batches = max(1, min(int(max_batches), len(estimates)))
+    heap = [(0, i, []) for i in range(max_batches)]
+    weights_by_id = {}
+    for estimate in estimates:
+        weights_by_id[estimate.mesh_id] = max(
+            estimate.estimated_peak_bytes, estimate.ply_bytes, 1,
+        )
+    for estimate in sorted(
+        estimates, key=lambda e: weights_by_id[e.mesh_id], reverse=True,
+    ):
+        weight, index, mesh_ids = heapq.heappop(heap)
+        mesh_ids = mesh_ids + [estimate.mesh_id]
+        heapq.heappush(
+            heap, (weight + weights_by_id[estimate.mesh_id], index, mesh_ids)
+        )
+
+    batches = [mesh_ids for weight, index, mesh_ids in heap if mesh_ids]
+    batches.sort(
+        key=lambda ids: sum(weights_by_id[mesh_id] for mesh_id in ids),
+        reverse=True,
+    )
+    return batches
+
+
+def _plan_assembly_waves(
+    estimates,
+    requested_workers,
+    config=None,
+    batches_per_worker=4,
+    memory_fraction=0.60,
+):
+    """Group mesh ids into assembly waves with memory-aware Dask configs."""
+    if not estimates:
+        return []
+
+    cluster_type, settings = _jobqueue_settings(config)
+    base_processes = int((settings or {}).get("processes", 1) or 1)
+    job_memory = _job_memory_bytes(settings)
+
+    estimates_by_processes = {}
+    for estimate in estimates:
+        processes = _recommended_assembly_processes(
+            estimate.estimated_peak_bytes,
+            job_memory,
+            base_processes,
+            memory_fraction=memory_fraction,
+        )
+        estimates_by_processes.setdefault(processes, []).append(estimate)
+
+    waves = []
+    requested_workers = max(1, int(requested_workers))
+    for processes in sorted(estimates_by_processes):
+        wave_estimates = estimates_by_processes[processes]
+        nominal_workers = max(
+            1, requested_workers * int(processes) // max(1, base_processes)
+        )
+        max_batches = max(1, nominal_workers * int(batches_per_worker))
+        batches = _balanced_assembly_batches(wave_estimates, max_batches)
+        # Keep enough workers to fill one job when processes > task count.
+        workers = min(nominal_workers, max(len(batches), int(processes)))
+        waves.append(
+            AssemblyWave(
+                processes=int(processes),
+                workers=int(max(1, workers)),
+                batches=batches,
+                max_estimated_peak_bytes=max(
+                    e.estimated_peak_bytes for e in wave_estimates
+                ),
+                total_ply_bytes=sum(e.ply_bytes for e in wave_estimates),
+                config=_assembly_config_for_processes(
+                    config, cluster_type, int(processes)
+                ),
+            )
+        )
+    return waves
+
+
+def _write_assembly_memory_plan(output_directory, estimates, waves):
+    """Write a small JSON record explaining the assembly scheduling plan."""
+    plan = {
+        "mesh_estimates": [asdict(e) for e in estimates],
+        "waves": [
+            {
+                "processes": wave.processes,
+                "workers": wave.workers,
+                "num_batches": len(wave.batches),
+                "num_meshes": sum(len(batch) for batch in wave.batches),
+                "max_estimated_peak_bytes": wave.max_estimated_peak_bytes,
+                "total_ply_bytes": wave.total_ply_bytes,
+                "batches": wave.batches,
+            }
+            for wave in waves
+        ],
+    }
+    plan_dir = os.path.join(output_directory, "assembly_metadata")
+    os.makedirs(plan_dir, exist_ok=True)
+    with open(os.path.join(plan_dir, "assembly_memory_plan.json"), "w") as f:
+        json.dump(plan, f, indent=2)
 
 
 def _estimate_block_target_mb_from_dask_config(
@@ -1379,6 +1667,11 @@ class Meshify:
             _ = mesh.export(f"{self.output_directory}/meshes/{mesh_id}.ply")
         shutil.rmtree(f"{self.dirname}/{mesh_id}")
 
+    def _assemble_mesh_batch(self, mesh_ids):
+        """Assemble a memory-balanced batch of segment ids sequentially."""
+        for mesh_id in mesh_ids:
+            self._assemble_mesh(mesh_id)
+
     def assemble_meshes(self, dirname):
         """Assemble all per-segment block meshes and write final outputs.
 
@@ -1394,32 +1687,80 @@ class Meshify:
 
         os.makedirs(f"{self.output_directory}/meshes/", exist_ok=True)
         self.dirname = dirname
-        mesh_ids = os.listdir(dirname)
+        amplification = _assembly_memory_amplification(
+            do_simplification=self.do_simplification,
+            smooth_before_simplify=self.smooth_before_simplify,
+            check_mesh_validity=self.check_mesh_validity,
+            has_custom_roi=self.has_custom_roi,
+        )
+        estimates = _scan_assembly_mesh_estimates(dirname, amplification)
+        if not estimates:
+            logger.warning("No chunked mesh PLYs found in %s; skipping assembly.", dirname)
+            shutil.rmtree(dirname, ignore_errors=True)
+            return
+
+        assembly_config = None
+        if self.num_workers > 1:
+            try:
+                assembly_config = dask_util._load_dask_config()
+            except (FileNotFoundError, KeyError, TypeError, ValueError) as e:
+                logger.warning(
+                    "Could not load dask-config.yaml for assembly memory "
+                    "planning (%s); using default worker count.",
+                    e,
+                )
+
+        waves = _plan_assembly_waves(
+            estimates, self.num_workers, config=assembly_config,
+        )
+        _write_assembly_memory_plan(self.output_directory, estimates, waves)
+
+        largest = max(estimates, key=lambda e: e.estimated_peak_bytes)
+        logger.info(
+            "Assembly memory estimate: largest mesh_id=%s, chunked_ply=%.1f MiB, "
+            "raw_mesh=%.1f MiB, estimated_peak=%.1f GiB, amplification=%sx.",
+            largest.mesh_id,
+            largest.ply_bytes / 2**20,
+            largest.raw_mesh_bytes / 2**20,
+            largest.estimated_peak_bytes / 2**30,
+            amplification,
+        )
+        for i, wave in enumerate(waves, start=1):
+            logger.info(
+                "Assembly wave %d/%d: processes/job=%d, workers=%d, "
+                "batches=%d, meshes=%d, max_estimated_peak=%.1f GiB.",
+                i, len(waves), wave.processes, wave.workers, len(wave.batches),
+                sum(len(batch) for batch in wave.batches),
+                wave.max_estimated_peak_bytes / 2**30,
+            )
+
         # Drop the zarr-backed array before dask serialises self — assembly
         # only reads PLY files, not the segmentation volume.
         saved_array = self.segmentation_array
         self.segmentation_array = None
-        effective_workers = dask_util.effective_num_workers(
-            self.num_workers, len(mesh_ids), logger, "assemble meshes",
-        )
-
-        def _run(workers, config):
-            bag = db.from_sequence(
-                mesh_ids,
-                npartitions=dask_util.guesstimate_npartitions(mesh_ids, workers),
-            ).map(self._assemble_mesh)
-            with dask_util.start_dask(
-                workers, "assemble meshes", logger, config=config,
-            ):
-                with Timing_Messager("Assembling meshes", logger):
-                    bag.compute()
 
         try:
-            dask_util.run_with_oom_retry(
-                _run, effective_workers, "assemble meshes", logger,
-                max_retries=self.memory_retry_max,
-                retry_on_oom=self.retry_on_oom,
-            )
+            for i, wave in enumerate(waves, start=1):
+                phase_name = f"assemble meshes wave {i}/{len(waves)}"
+
+                def _run(workers, config, wave=wave, phase_name=phase_name):
+                    bag = db.from_sequence(
+                        wave.batches, npartitions=len(wave.batches),
+                    ).map(self._assemble_mesh_batch)
+                    with dask_util.start_dask(
+                        workers, phase_name, logger, config=config,
+                    ):
+                        with Timing_Messager(
+                            f"Assembling meshes ({phase_name})", logger,
+                        ):
+                            bag.compute()
+
+                dask_util.run_with_oom_retry(
+                    _run, wave.workers, phase_name, logger,
+                    max_retries=self.memory_retry_max,
+                    retry_on_oom=self.retry_on_oom,
+                    config=wave.config,
+                )
         finally:
             self.segmentation_array = saved_array
         if self.do_legacy_neuroglancer:
@@ -1531,13 +1872,14 @@ class Meshify:
                     continue
                 name = entry.name
                 root, ext = os.path.splitext(name)
-                if mesh_ext is None:
-                    mesh_ext = ext
                 try:
-                    mesh_ids.append(int(root))
-                    file_sizes.append(entry.stat(follow_symlinks=False).st_size)
+                    mesh_id = int(root)
                 except ValueError:
                     continue
+                if mesh_ext is None:
+                    mesh_ext = ext
+                mesh_ids.append(mesh_id)
+                file_sizes.append(entry.stat(follow_symlinks=False).st_size)
 
         if not mesh_ids:
             logger.warning("No meshes found at s0, skipping multires generation")

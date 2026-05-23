@@ -1,4 +1,5 @@
 from contextlib import contextmanager, nullcontext
+import copy
 import os
 import dask
 from dask.distributed import Client, wait
@@ -214,6 +215,18 @@ def _load_dask_config():
         return yaml.load(f, Loader=SafeLoader)
 
 
+def set_jobqueue_processes(config, cluster_type, processes):
+    """Set worker processes in a jobqueue config, keeping one thread/process."""
+    processes = max(1, int(processes))
+    settings = config["jobqueue"][cluster_type]
+    settings["processes"] = processes
+    if "cores" in settings:
+        # dask-jobqueue derives threads per worker from cores/processes.
+        # Keep that ratio at one so a memory-heavy worker process does not
+        # execute multiple mesh assemblies concurrently.
+        settings["cores"] = processes
+
+
 def run_with_oom_retry(
     work_fn,
     num_workers,
@@ -221,6 +234,7 @@ def run_with_oom_retry(
     logger,
     max_retries=3,
     retry_on_oom=True,
+    config=None,
 ):
     """Run a dask phase with optional retry on worker out-of-memory crashes.
 
@@ -234,9 +248,8 @@ def run_with_oom_retry(
     symptom of a worker SIGKILL'd by the OS OOM-killer or LSF mem
     limit), we halve ``processes`` per slot in the in-memory dask
     config and halve *num_workers* to match — doubling the memory
-    available to each worker while keeping the LSF slot count
-    (and CPU budget) constant. Then we retry the phase, up to
-    *max_retries* times.
+    available to each worker while keeping one dask thread per process.
+    Then we retry the phase, up to *max_retries* times.
 
     Parameters
     ----------
@@ -253,20 +266,36 @@ def run_with_oom_retry(
     retry_on_oom : bool
         Set to ``False`` to skip the retry wrapper entirely (acts as a
         passthrough). Useful for synchronous (``num_workers==1``) runs.
+    config : dict, optional
+        Dask config to use instead of loading ``dask-config.yaml``. The
+        config is deep-copied before mutation so callers can reuse their
+        base config across phases.
     """
-    if not retry_on_oom or max_retries < 1 or num_workers <= 1:
-        return work_fn(num_workers, None)
+    if config is not None:
+        config = copy.deepcopy(config)
+
+    if not retry_on_oom or max_retries < 1:
+        return work_fn(num_workers, config)
 
     try:
         from distributed.scheduler import KilledWorker
     except ImportError:
-        return work_fn(num_workers, None)
+        return work_fn(num_workers, config)
 
-    config = _load_dask_config()
+    if config is None:
+        if num_workers <= 1:
+            return work_fn(num_workers, None)
+        config = _load_dask_config()
     cluster_type = next(iter(config.get("jobqueue", {})), None)
     if cluster_type not in ("lsf", "slurm", "sge"):
         # Local/in-process clusters don't have a processes/slot lever;
         # skip retry wrapping there.
+        return work_fn(num_workers, config)
+
+    starting_processes = int(
+        config["jobqueue"][cluster_type].get("processes", 1) or 1
+    )
+    if num_workers <= 1 and starting_processes <= 1:
         return work_fn(num_workers, config)
 
     workers = num_workers
@@ -298,7 +327,7 @@ def run_with_oom_retry(
             logger.warning(
                 "Phase '%s' worker OOM (retry %d/%d). Halving "
                 "processes/slot %d→%d and workers %d→%d to give each worker "
-                "more memory; LSF slot count and CPU budget unchanged. "
+                "more memory while keeping one dask thread per process. "
                 "To find the segment that crashed: grep "
                 "job-logs/LSFCluster-*.err for the last 'mesh_id=...' line "
                 "from the killed worker at %s.",
@@ -306,7 +335,7 @@ def run_with_oom_retry(
                 processes, new_processes, workers, new_workers,
                 last_worker or "(unknown address)",
             )
-            config["jobqueue"][cluster_type]["processes"] = new_processes
+            set_jobqueue_processes(config, cluster_type, new_processes)
             workers = new_workers
 
 

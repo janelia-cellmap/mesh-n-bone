@@ -121,7 +121,11 @@ class TestRunWithOomRetry:
     ):
         attempts = []
         def work(workers, cfg):
-            attempts.append((workers, cfg["jobqueue"]["lsf"]["processes"]))
+            attempts.append((
+                workers,
+                cfg["jobqueue"]["lsf"]["processes"],
+                cfg["jobqueue"]["lsf"]["cores"],
+            ))
             if len(attempts) < 3:
                 raise _FakeKilledWorker(
                     "Attempted to run task on N workers",
@@ -138,11 +142,38 @@ class TestRunWithOomRetry:
         # First try: 576 workers, processes=12
         # Retry 1:   288, 6
         # Retry 2:   144, 3
-        assert attempts == [(576, 12), (288, 6), (144, 3)]
+        assert attempts == [(576, 12, 12), (288, 6, 6), (144, 3, 3)]
         # Each retry produces a clearly-flagged warning
         warnings = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
         assert any("retry 1/3" in m for m in warnings)
         assert any("retry 2/3" in m for m in warnings)
+
+    def test_uses_supplied_config(self, fake_distributed):
+        calls = []
+        cfg = {
+            "jobqueue": {
+                "lsf": {
+                    "ncpus": 12,
+                    "processes": 6,
+                    "cores": 6,
+                    "memory": "180GB",
+                }
+            }
+        }
+
+        def work(workers, cfg):
+            calls.append((workers, cfg["jobqueue"]["lsf"]["processes"]))
+            return "ok"
+
+        result = dask_util.run_with_oom_retry(
+            work, num_workers=12, phase_name="assemble",
+            logger=logging.getLogger("test"),
+            max_retries=3,
+            config=cfg,
+        )
+        assert result == "ok"
+        assert calls == [(12, 6)]
+        assert cfg["jobqueue"]["lsf"]["processes"] == 6
 
     def test_gives_up_after_max_retries(
         self, fake_distributed, fake_dask_config,

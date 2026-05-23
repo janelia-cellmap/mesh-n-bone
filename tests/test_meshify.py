@@ -129,6 +129,116 @@ class TestEstimateBlockTargetMb:
         assert _estimate_block_target_mb_from_dask_config(path, fallback_mb=128) == 128
 
 
+class TestAssemblyMemoryPlanning:
+    def _write_binary_ply(self, path, vertices, faces):
+        header = (
+            "ply\n"
+            "format binary_little_endian 1.0\n"
+            f"element vertex {vertices}\n"
+            "property float x\n"
+            "property float y\n"
+            "property float z\n"
+            f"element face {faces}\n"
+            "property list int int vertex_indices\n"
+            "end_header\n"
+        ).encode("ascii")
+        body = b"\0" * (vertices * 3 * 4 + faces * 4 * 4)
+        with open(path, "wb") as f:
+            f.write(header + body)
+
+    def test_scans_ply_headers_for_mesh_estimates(self, tmp_output_dir):
+        from mesh_n_bone.meshify.meshify import _scan_assembly_mesh_estimates
+
+        mesh_dir = os.path.join(tmp_output_dir, "tmp_chunked", "42")
+        os.makedirs(mesh_dir)
+        self._write_binary_ply(os.path.join(mesh_dir, "block_0.ply"), 10, 20)
+        self._write_binary_ply(os.path.join(mesh_dir, "block_1.ply"), 2, 4)
+
+        estimates = _scan_assembly_mesh_estimates(
+            os.path.join(tmp_output_dir, "tmp_chunked"),
+            amplification=16,
+        )
+        assert len(estimates) == 1
+        estimate = estimates[0]
+        assert estimate.mesh_id == "42"
+        assert estimate.num_files == 2
+        assert estimate.vertex_count == 12
+        assert estimate.face_count == 24
+        assert estimate.raw_mesh_bytes == 12 * 3 * 8 + 24 * 3 * 4
+        assert estimate.estimated_peak_bytes > estimate.raw_mesh_bytes
+
+    def test_balanced_batches_leave_giant_mesh_alone(self):
+        from mesh_n_bone.meshify.meshify import (
+            AssemblyMeshEstimate,
+            _balanced_assembly_batches,
+        )
+
+        estimates = [
+            AssemblyMeshEstimate("giant", 1, 1000, 0, 0, 0, 1000),
+            *[
+                AssemblyMeshEstimate(f"small-{i}", 1, 1, 0, 0, 0, 1)
+                for i in range(20)
+            ],
+        ]
+        batches = _balanced_assembly_batches(estimates, max_batches=4)
+        giant_batches = [batch for batch in batches if "giant" in batch]
+        assert giant_batches == [["giant"]]
+        assert sum(len(batch) for batch in batches) == len(estimates)
+
+    def test_assembly_amplification_constants_cover_heavy_paths(self):
+        from mesh_n_bone.meshify.meshify import _assembly_memory_amplification
+
+        assert _assembly_memory_amplification(
+            do_simplification=True,
+            smooth_before_simplify=False,
+            check_mesh_validity=False,
+            has_custom_roi=False,
+        ) == 24
+        assert _assembly_memory_amplification(
+            do_simplification=True,
+            smooth_before_simplify=True,
+            check_mesh_validity=True,
+            has_custom_roi=False,
+        ) == 36
+        assert _assembly_memory_amplification(
+            do_simplification=False,
+            smooth_before_simplify=False,
+            check_mesh_validity=False,
+            has_custom_roi=False,
+        ) == 20
+
+    def test_plan_assembly_waves_lowers_processes_for_large_mesh(self):
+        from mesh_n_bone.meshify.meshify import (
+            AssemblyMeshEstimate,
+            _plan_assembly_waves,
+        )
+
+        cfg = {
+            "jobqueue": {
+                "lsf": {
+                    "ncpus": 12,
+                    "processes": 12,
+                    "cores": 12,
+                    "memory": "180GB",
+                }
+            }
+        }
+        gib = 2 ** 30
+        estimates = [
+            AssemblyMeshEstimate("large", 1, 100, 0, 0, 0, 20 * gib),
+            AssemblyMeshEstimate("small", 1, 1, 0, 0, 0, 1 * gib),
+        ]
+
+        waves = _plan_assembly_waves(estimates, requested_workers=576, config=cfg)
+        assert [wave.processes for wave in waves] == [5, 12]
+        large_wave = waves[0]
+        assert large_wave.batches == [["large"]]
+        assert large_wave.workers == 5
+        assert large_wave.config["jobqueue"]["lsf"]["processes"] == 5
+        assert large_wave.config["jobqueue"]["lsf"]["cores"] == 5
+        assert cfg["jobqueue"]["lsf"]["processes"] == 12
+
+
 class TestBlockFromIndex:
     """`block_from_index` should produce the same DaskBlocks as
     `create_blocks` would, indexed by integer."""
