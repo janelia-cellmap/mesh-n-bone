@@ -356,6 +356,31 @@ class TestStagedReductions:
         with pytest.raises(AssertionError):
             staged_reductions(0.99, 0.3, 0.3)
 
+    def test_chunk_reduction_zero_when_fixed_edge_simplification_disabled(self):
+        from mesh_n_bone.meshify.meshify import _chunk_stage_1_reduction
+
+        assert _chunk_stage_1_reduction(
+            {
+                "use_fixed_edge_simplification": False,
+                "target_reduction": 0.933,
+                "stage_1_reduction_fraction": 0.25,
+            }
+        ) == 0.0
+
+    def test_chunk_reduction_uses_stage_split_when_enabled(self):
+        from mesh_n_bone.meshify.meshify import (
+            _chunk_stage_1_reduction,
+            staged_reductions,
+        )
+
+        config = {
+            "use_fixed_edge_simplification": True,
+            "target_reduction": 0.933,
+            "stage_1_reduction_fraction": 0.25,
+        }
+        expected, _ = staged_reductions(0.933, 0.25, 0.75)
+        assert _chunk_stage_1_reduction(config) == expected
+
     def test_assembly_uses_second_stage_reduction(self, tmp_output_dir, monkeypatch):
         from cloudvolume.mesh import Mesh as CloudVolumeMesh
         from mesh_n_bone.meshify.meshify import Meshify, staged_reductions
@@ -427,6 +452,25 @@ class TestStagedReductions:
 
         _, expected_stage_2 = staged_reductions(0.933, 0.25, 0.75)
         assert reductions == [expected_stage_2]
+
+    def test_zero_reduction_skips_chunk_decimator(self, monkeypatch):
+        from mesh_n_bone.meshify import fixed_edge
+
+        mesh = trimesh.creation.icosphere(subdivisions=1, radius=1.0)
+
+        def fail_decimator(*args, **kwargs):
+            raise AssertionError("decimator should not run")
+
+        monkeypatch.setattr(fixed_edge, "pymeshlab_simplify", fail_decimator)
+        out = fixed_edge.simplify_mesh(
+            mesh,
+            target_reduction=0.0,
+            voxel_size=np.array([1, 1, 1]),
+            block_size=None,
+            fix_edges=True,
+        )
+
+        assert len(out.faces) > 0
 
 
 class TestRepairMeshPymeshlab:

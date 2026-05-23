@@ -153,6 +153,23 @@ def staged_reductions(target_reduction_total, frac1, frac2):
     return r1, r2
 
 
+def _chunk_stage_1_reduction(config):
+    """Return the chunk-level reduction for fixed-edge chunk processing.
+
+    ``use_fixed_edge_simplification=False`` means skip chunk-level
+    decimation, but still use the fixed-edge clipping path when global
+    simplification is enabled.
+    """
+    if not config["use_fixed_edge_simplification"]:
+        return 0.0
+    stage_1_reduction, _ = staged_reductions(
+        config["target_reduction"],
+        config["stage_1_reduction_fraction"],
+        1 - config["stage_1_reduction_fraction"],
+    )
+    return stage_1_reduction
+
+
 # Thread-local tensorstore handle cache so each worker opens once
 _thread_local_ts = {}
 
@@ -628,7 +645,7 @@ def _get_chunked_mesh_worker(block_index, tmpdirname, config):
         original_id = inv_remap[int(id)] if inv_remap is not None else int(id)
         mesh = mesher.get_mesh(id)
 
-        if config["use_fixed_edge_simplification"] and config["do_simplification"]:
+        if config["do_simplification"]:
             mesh_tri = trimesh.Trimesh(vertices=mesh.vertices, faces=mesh.faces)
             # Shift by half a voxel so clip planes in
             # remove_boundary_vertices land exactly on the MC crossing
@@ -640,12 +657,6 @@ def _get_chunked_mesh_worker(block_index, tmpdirname, config):
             half_pad = 0.5 * np.array(output_voxel_size)[::-1]
             mesh_tri.vertices -= half_pad
 
-            stage_1_reduction, _ = staged_reductions(
-                config["target_reduction"],
-                config["stage_1_reduction_fraction"],
-                1 - config["stage_1_reduction_fraction"],
-            )
-
             ds = config["downsample_factor"] or 1
             block_size_voxels = np.array(config["read_write_block_shape_pixels"]) // ds
             block_size_world = (block_size_voxels * output_voxel_size)[::-1]
@@ -653,7 +664,7 @@ def _get_chunked_mesh_worker(block_index, tmpdirname, config):
             mesh_tri_simplified = simplify_mesh(
                 mesh_tri,
                 voxel_size=output_voxel_size,
-                target_reduction=stage_1_reduction,
+                target_reduction=_chunk_stage_1_reduction(config),
                 block_size=block_size_world,
                 aggressiveness=config["default_aggressiveness"],
                 verbose=False,
@@ -1551,7 +1562,7 @@ class Meshify:
                 chunk_size=chunk_size[::-1],
                 offset=self.roi.offset[::-1],
             )
-            if self.use_fixed_edge_simplification:
+            if self.do_simplification:
                 # The half-voxel shift places clip planes on the MC
                 # crossing vertices between padding and unpadded voxels.
                 # Both adjacent blocks clip at the same world plane and
