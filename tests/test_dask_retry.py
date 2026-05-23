@@ -108,6 +108,31 @@ class TestSetJobqueueProcesses:
         assert settings["ncpus"] == 12
 
 
+class TestCloseDaskClient:
+    def test_shutdown_assertion_is_warning_not_failure(self, caplog):
+        class Client:
+            def __init__(self):
+                self.closed = False
+
+            def shutdown(self):
+                raise AssertionError("Status.running")
+
+            def close(self):
+                self.closed = True
+
+        client = Client()
+
+        with caplog.at_level(logging.WARNING, logger="test"):
+            dask_util._close_dask_client(
+                client,
+                "assemble meshes",
+                logging.getLogger("test"),
+            )
+
+        assert client.closed
+        assert any("Dask shutdown failed" in r.message for r in caplog.records)
+
+
 class TestRunWithOomRetry:
     def test_passthrough_when_disabled(self):
         calls = []

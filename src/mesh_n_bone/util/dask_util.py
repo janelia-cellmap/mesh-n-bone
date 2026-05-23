@@ -17,6 +17,35 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+def _close_dask_client(client, msg, logger):
+    """Best-effort shutdown for a Dask client/cluster.
+
+    Dask-jobqueue can occasionally report a worker as still running while the
+    cluster is already being torn down. Treat that as cleanup noise so a
+    completed compute stage does not fail the whole pipeline.
+    """
+    if client is None:
+        return
+
+    try:
+        client.shutdown()
+    except Exception as e:
+        logger.warning(
+            "Continuing after Dask shutdown failed for %s: %s",
+            msg,
+            e,
+        )
+
+    try:
+        client.close()
+    except Exception as e:
+        logger.warning(
+            "Continuing after Dask client close failed for %s: %s",
+            msg,
+            e,
+        )
+
+
 def set_local_directory(cluster_type):
     """Configure a writable local-directory for Dask worker spill and temp files.
 
@@ -153,6 +182,7 @@ def start_dask(num_workers, msg, logger, config=None):
 
             cluster = SGECluster()
         cluster.scale(num_workers)
+    client = None
     try:
         with Timing_Messager(
             f"Starting {cluster_type} dask cluster for {msg} with {num_workers} workers",
@@ -172,8 +202,7 @@ def start_dask(num_workers, msg, logger, config=None):
         )
         yield client
     finally:
-        client.shutdown()
-        client.close()
+        _close_dask_client(client, msg, logger)
 
 
 def setup_execution_directory(config_path, logger):
