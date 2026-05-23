@@ -71,7 +71,11 @@ def generate_neuroglancer_multires_mesh(
         vertex_max = None
         lod_vertex_mins = []
         lod_vertex_maxs = []
+        requested_lods = list(lods)
+        requested_lod_count = len(requested_lods)
+        lod_face_counts = []
         previous_num_faces = np.inf
+        lod_truncation_reason = None
         for idx, current_lod in enumerate(lods):
             if current_lod == 0:
                 mesh_path = f"{output_path}/mesh_lods/s{current_lod}/{id}{original_ext}"
@@ -80,11 +84,24 @@ def generate_neuroglancer_multires_mesh(
 
             vertices, faces = mesh_io.mesh_loader(mesh_path)
             if faces is None:
+                lod_truncation_reason = (
+                    f"Segment {id} using {idx}/{requested_lod_count} requested "
+                    f"LODs; dropping LOD {current_lod} and later because "
+                    f"{mesh_path} could not be loaded or has no faces."
+                )
                 break
 
             num_faces = len(faces)
             if num_faces >= previous_num_faces:
+                previous_lod, previous_faces = lod_face_counts[-1]
+                lod_truncation_reason = (
+                    f"Segment {id} using {idx}/{requested_lod_count} requested "
+                    f"LODs; dropping LOD {current_lod} and later because it "
+                    f"has {num_faces} faces, not fewer than LOD "
+                    f"{previous_lod} ({previous_faces} faces)."
+                )
                 break
+            lod_face_counts.append((current_lod, num_faces))
             # LOD-0 bounds drive the chunk grid; union bounds drive
             # the empty-placeholder envelope (which must cover every
             # LOD's actual face footprint, not just LOD 0's).
@@ -113,6 +130,16 @@ def generate_neuroglancer_multires_mesh(
             idx += 1
 
         lods = lods[:idx]
+        if lod_truncation_reason is not None:
+            logger.info(lod_truncation_reason)
+        if not lods:
+            logger.warning(
+                "Segment %s has no valid LOD meshes from requested LODs %s; "
+                "skipping Neuroglancer multires output.",
+                id,
+                requested_lods,
+            )
+            return
 
         auto_lod_0_box_size = lod_0_box_size is None
         if lod_0_box_size is None:
@@ -138,6 +165,7 @@ def generate_neuroglancer_multires_mesh(
         if auto_lod_0_box_size:
             requested_lod_count = len(lods)
             effective_lod_count = requested_lod_count
+            padding_candidates = []
             for candidate_lod_count in range(requested_lod_count, 0, -1):
                 octree_unit = 2 ** (candidate_lod_count - 1)
                 padded_chunks_per_axis = (
@@ -147,17 +175,44 @@ def generate_neuroglancer_multires_mesh(
                 padding_ratio = np.max(
                     padded_chunks_per_axis / num_chunks_per_axis
                 )
+                padding_candidates.append(
+                    (
+                        candidate_lod_count,
+                        padded_chunks_per_axis,
+                        padding_ratio,
+                    )
+                )
                 if padding_ratio <= MAX_AUTO_LOD_GRID_PADDING_RATIO:
                     effective_lod_count = candidate_lod_count
                     break
 
             if effective_lod_count < requested_lod_count:
+                requested_padding = padding_candidates[0]
+                selected_padding = next(
+                    candidate
+                    for candidate in padding_candidates
+                    if candidate[0] == effective_lod_count
+                )
                 logger.info(
-                    "Reducing segment %s from %d to %d LODs for auto chunking "
-                    "to keep the multires grid padding <= %.1fx",
+                    "Reducing segment %s from %d to %d LODs for auto chunking: "
+                    "LOD0 faces=%d, target_faces_per_lod0_chunk=%d, "
+                    "auto_box_size=%s, mesh_extent=%s, lod0_grid=%s. "
+                    "Requested %d LODs would pad the grid to %s (%.2fx); "
+                    "selected %d LODs pads to %s (%.2fx), max_allowed=%.2fx.",
                     id,
                     requested_lod_count,
                     effective_lod_count,
+                    int(lod0_num_faces),
+                    int(target_faces_per_lod0_chunk),
+                    np.asarray(lod_0_box_size).astype(float).tolist(),
+                    np.asarray(mesh_extent).astype(float).tolist(),
+                    np.asarray(num_chunks_per_axis).astype(int).tolist(),
+                    requested_padding[0],
+                    np.asarray(requested_padding[1]).astype(int).tolist(),
+                    float(requested_padding[2]),
+                    selected_padding[0],
+                    np.asarray(selected_padding[1]).astype(int).tolist(),
+                    float(selected_padding[2]),
                     MAX_AUTO_LOD_GRID_PADDING_RATIO,
                 )
                 lods = lods[:effective_lod_count]
