@@ -1600,7 +1600,7 @@ class Meshify:
 
         try:
             if self.use_fixed_edge_simplification and self.do_simplification:
-                stage_2_reduction, _ = staged_reductions(
+                _, stage_2_reduction = staged_reductions(
                     self.target_reduction,
                     self.stage_1_reduction_fraction,
                     self.stage_2_reduction_fraction,

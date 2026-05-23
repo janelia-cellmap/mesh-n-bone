@@ -356,6 +356,78 @@ class TestStagedReductions:
         with pytest.raises(AssertionError):
             staged_reductions(0.99, 0.3, 0.3)
 
+    def test_assembly_uses_second_stage_reduction(self, tmp_output_dir, monkeypatch):
+        from cloudvolume.mesh import Mesh as CloudVolumeMesh
+        from mesh_n_bone.meshify.meshify import Meshify, staged_reductions
+
+        block_dir = os.path.join(tmp_output_dir, "blocks", "1")
+        output_dir = os.path.join(tmp_output_dir, "out")
+        os.makedirs(block_dir)
+        os.makedirs(os.path.join(output_dir, "meshes"))
+
+        vertices = np.array(
+            [
+                [0, 0, 0],
+                [1, 0, 0],
+                [0, 1, 0],
+                [0, 0, 1],
+            ],
+            dtype=np.float32,
+        )
+        faces = np.array(
+            [
+                [0, 1, 2],
+                [0, 1, 3],
+                [0, 2, 3],
+                [1, 2, 3],
+            ],
+            dtype=np.uint32,
+        )
+        mesh = CloudVolumeMesh(vertices, faces, normals=None)
+        with open(os.path.join(block_dir, "block_0.ply"), "wb") as f:
+            f.write(mesh.to_ply())
+
+        reductions = []
+
+        def fake_simplify_and_smooth_mesh(input_mesh, target_reduction, *args, **kwargs):
+            reductions.append(target_reduction)
+            return trimesh.Trimesh(
+                vertices=input_mesh.vertices,
+                faces=input_mesh.faces,
+                process=False,
+            )
+
+        monkeypatch.setattr(
+            Meshify,
+            "simplify_and_smooth_mesh",
+            staticmethod(fake_simplify_and_smooth_mesh),
+        )
+
+        meshify = object.__new__(Meshify)
+        meshify.dirname = os.path.join(tmp_output_dir, "blocks")
+        meshify.output_directory = output_dir
+        meshify.max_num_blocks = 100
+        meshify.check_mesh_validity = False
+        meshify.has_custom_roi = False
+        meshify.remove_smallest_components = False
+        meshify.use_fixed_edge_simplification = True
+        meshify.do_simplification = True
+        meshify.target_reduction = 0.933
+        meshify.stage_1_reduction_fraction = 0.25
+        meshify.stage_2_reduction_fraction = 0.75
+        meshify.n_smoothing_iter = 0
+        meshify.default_aggressiveness = 0.3
+        meshify.smooth_before_simplify = True
+        meshify.true_voxel_size = np.array([1, 1, 1])
+        meshify.output_voxel_size_funlib = np.array([1, 1, 1])
+        meshify.do_legacy_neuroglancer = False
+        meshify.do_singleres_multires_neuroglancer = False
+
+        meshify._assemble_mesh("1")
+
+        _, expected_stage_2 = staged_reductions(0.933, 0.25, 0.75)
+        assert reductions == [expected_stage_2]
+
 
 class TestRepairMeshPymeshlab:
     def test_repair_simple_mesh(self, tiny_cube_mesh):
