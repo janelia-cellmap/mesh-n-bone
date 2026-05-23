@@ -88,6 +88,26 @@ class TestGuesstimateNPartitions:
         assert last_size <= size * 2
 
 
+class TestSetJobqueueProcesses:
+    def test_preserves_lsf_scheduler_cpu_request(self):
+        cfg = {
+            "jobqueue": {
+                "lsf": {
+                    "ncpus": 12,
+                    "processes": 12,
+                    "cores": 12,
+                }
+            }
+        }
+
+        dask_util.set_jobqueue_processes(cfg, "lsf", 5)
+
+        settings = cfg["jobqueue"]["lsf"]
+        assert settings["processes"] == 5
+        assert settings["cores"] == 5
+        assert settings["ncpus"] == 12
+
+
 class TestRunWithOomRetry:
     def test_passthrough_when_disabled(self):
         calls = []
@@ -125,6 +145,7 @@ class TestRunWithOomRetry:
                 workers,
                 cfg["jobqueue"]["lsf"]["processes"],
                 cfg["jobqueue"]["lsf"]["cores"],
+                cfg["jobqueue"]["lsf"]["ncpus"],
             ))
             if len(attempts) < 3:
                 raise _FakeKilledWorker(
@@ -142,7 +163,11 @@ class TestRunWithOomRetry:
         # First try: 576 workers, processes=12
         # Retry 1:   288, 6
         # Retry 2:   144, 3
-        assert attempts == [(576, 12, 12), (288, 6, 6), (144, 3, 3)]
+        assert attempts == [
+            (576, 12, 12, 12),
+            (288, 6, 6, 12),
+            (144, 3, 3, 12),
+        ]
         # Each retry produces a clearly-flagged warning
         warnings = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
         assert any("retry 1/3" in m for m in warnings)

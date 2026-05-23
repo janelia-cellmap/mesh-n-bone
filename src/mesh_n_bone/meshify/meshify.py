@@ -569,7 +569,7 @@ def _get_chunked_mesh_worker(block_index, tmpdirname, config):
     mesher = Mesher(output_voxel_size[::-1])
     segmentation_block = to_ndarray_tensorstore(
         ts_dataset, block.roi, voxel_size, roi_offset,
-        swap_axes=config["swap_axes"], fill_value=0,
+        swap_axes=config["swap_axes"], fill_value=0, source_path=dataset_path,
     )
     if segmentation_block.dtype.byteorder == ">":
         swapped_dtype = segmentation_block.dtype.newbyteorder()

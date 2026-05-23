@@ -25,6 +25,41 @@ from mesh_n_bone.util.precomputed_io import (
 logger = logging.getLogger(__name__)
 
 
+def _read_shape_from_slices(valid_slices):
+    """Return the array shape implied by TensorStore slices."""
+    return tuple(max(0, int(s.stop) - int(s.start)) for s in valid_slices)
+
+
+def _read_size_mib(dataset, valid_slices):
+    """Estimate uncompressed read size in MiB from slices and dtype."""
+    shape = _read_shape_from_slices(valid_slices)
+    try:
+        itemsize = np.dtype(dataset.dtype.numpy_dtype).itemsize
+    except (AttributeError, TypeError):
+        itemsize = np.dtype(dataset.dtype).itemsize
+    return (float(np.prod(shape)) * itemsize) / 2**20
+
+
+def _is_remote_dataset_path(source_path):
+    """Return True if a source path points at remote object storage/HTTP."""
+    if source_path is None:
+        return False
+    return _is_remote_url(_strip_precomputed_prefix(source_path))
+
+
+def _default_read_timeout_seconds(dataset, valid_slices, source_path=None):
+    """Choose a TensorStore read timeout from source locality and read size.
+
+    Small reads keep the old 5 second timeout. Large remote reads get more
+    time so a slow object-store response does not immediately create retry
+    pressure across hundreds of Dask worker processes.
+    """
+    size_mib = _read_size_mib(dataset, valid_slices)
+    if _is_remote_dataset_path(source_path):
+        return min(120.0, max(5.0, size_mib / 16.0))
+    return min(30.0, max(5.0, size_mib / 256.0))
+
+
 def _capped_tensorstore_context_spec():
     """Tensorstore Context spec that limits internal thread pools.
 
@@ -148,7 +183,9 @@ def open_ds_tensorstore(dataset_path, mode="r", filetype=None):
     return dataset_future.result()
 
 
-def read_with_retries(dataset, valid_slices, max_retries=10, timeout=60):
+def read_with_retries(
+    dataset, valid_slices, max_retries=10, timeout=None, source_path=None,
+):
     """Read from TensorStore with exponential backoff on timeout.
 
     Parameters
@@ -159,21 +196,29 @@ def read_with_retries(dataset, valid_slices, max_retries=10, timeout=60):
         Slices to read.
     max_retries : int
         Maximum retry attempts.
-    timeout : float
-        Base timeout in seconds per attempt.
+    timeout : float or None
+        Base timeout in seconds per attempt. ``None`` chooses a default
+        from read size and whether *source_path* is local or remote.
+    source_path : str, optional
+        Dataset path used only to distinguish local reads from remote reads.
 
     Returns
     -------
     numpy.ndarray
         Data read from the dataset.
     """
+    if timeout is None:
+        timeout = _default_read_timeout_seconds(dataset, valid_slices, source_path)
+
     for attempt in range(1, max_retries + 1):
+        attempt_timeout = timeout * attempt
         try:
-            return dataset[valid_slices].read().result(timeout=timeout * attempt)
+            return dataset[valid_slices].read().result(timeout=attempt_timeout)
         except TimeoutError as e:
             logger.error(
                 f"[Attempt {attempt}/{max_retries}] "
-                f"Timeout reading slices={valid_slices!r}: {e}"
+                f"Timeout after {attempt_timeout:.1f}s "
+                f"reading slices={valid_slices!r}: {e}"
             )
             if attempt == max_retries:
                 raise
@@ -183,7 +228,8 @@ def read_with_retries(dataset, valid_slices, max_retries=10, timeout=60):
 
 
 def to_ndarray_tensorstore(dataset, roi, voxel_size, offset, swap_axes=False,
-                           fill_value=0, max_retries=10, timeout=60):
+                           fill_value=0, max_retries=10, timeout=None,
+                           source_path=None):
     """Read a region of a TensorStore dataset as a numpy array.
 
     Handles padding when the ROI extends beyond dataset bounds.
@@ -205,8 +251,11 @@ def to_ndarray_tensorstore(dataset, roi, voxel_size, offset, swap_axes=False,
         Padding value for out-of-bounds regions.
     max_retries : int
         Maximum retry attempts for reading.
-    timeout : float
-        Base timeout in seconds per read attempt.
+    timeout : float or None
+        Base timeout in seconds per read attempt. ``None`` chooses a default
+        from read size and whether *source_path* is local or remote.
+    source_path : str, optional
+        Dataset path used only to distinguish local reads from remote reads.
 
     Returns
     -------
@@ -272,7 +321,9 @@ def to_ndarray_tensorstore(dataset, roi, voxel_size, offset, swap_axes=False,
         )
         return np.full(output_shape, fill_value, dtype=dataset.dtype.numpy_dtype)
 
-    data = read_with_retries(dataset, valid_slices, max_retries, timeout)
+    data = read_with_retries(
+        dataset, valid_slices, max_retries, timeout, source_path=source_path,
+    )
 
     if np.any(np.array(pad_width)):
         data = np.pad(
