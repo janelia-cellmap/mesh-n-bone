@@ -1,4 +1,5 @@
 from contextlib import contextmanager, nullcontext
+import copy
 import os
 import dask
 from dask.distributed import Client, wait
@@ -14,6 +15,35 @@ import numpy as np
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+def _close_dask_client(client, msg, logger):
+    """Best-effort shutdown for a Dask client/cluster.
+
+    Dask-jobqueue can occasionally report a worker as still running while the
+    cluster is already being torn down. Treat that as cleanup noise so a
+    completed compute stage does not fail the whole pipeline.
+    """
+    if client is None:
+        return
+
+    try:
+        client.shutdown()
+    except Exception as e:
+        logger.warning(
+            "Continuing after Dask shutdown failed for %s: %s",
+            msg,
+            e,
+        )
+
+    try:
+        client.close()
+    except Exception as e:
+        logger.warning(
+            "Continuing after Dask client close failed for %s: %s",
+            msg,
+            e,
+        )
 
 
 def set_local_directory(cluster_type):
@@ -96,6 +126,14 @@ def start_dask(num_workers, msg, logger, config=None):
         with open("dask-config.yaml") as f:
             config = yaml.load(f, Loader=SafeLoader)
 
+    # Pin every common thread-pool source to a single thread per worker.
+    # OMP/MKL/OPENBLAS/NUMEXPR cover numpy/scipy/BLAS; TBB covers pymeshlab
+    # and meshlab's internal C++ filters (Taubin smoothing, vertex merge,
+    # etc.) which ignore the OMP family. Without TBB_NUM_THREADS each
+    # process can spawn ~N_CPU TBB workers during stage-2 simplification,
+    # which together with the dozens of dask workers stacked on a single
+    # LSF host trivially overwhelms the node (observed load avg >1000 on
+    # a 96-core box with 60 workers prior to this change).
     job_script_prologue = [
         "export NUMEXPR_MAX_THREADS=1",
         "export NUMEXPR_NUM_THREADS=1",
@@ -104,6 +142,9 @@ def start_dask(num_workers, msg, logger, config=None):
         "export OPENBLAS_NUM_THREADS=1",
         "export OPENMP_NUM_THREADS=1",
         "export OMP_NUM_THREADS=1",
+        "export TBB_NUM_THREADS=1",
+        # Some Intel runtimes have a separate KMP threadcount knob.
+        "export KMP_NUM_THREADS=1",
     ]
 
     cluster_type = next(iter(config["jobqueue"]))
@@ -141,6 +182,7 @@ def start_dask(num_workers, msg, logger, config=None):
 
             cluster = SGECluster()
         cluster.scale(num_workers)
+    client = None
     try:
         with Timing_Messager(
             f"Starting {cluster_type} dask cluster for {msg} with {num_workers} workers",
@@ -160,8 +202,7 @@ def start_dask(num_workers, msg, logger, config=None):
         )
         yield client
     finally:
-        client.shutdown()
-        client.close()
+        _close_dask_client(client, msg, logger)
 
 
 def setup_execution_directory(config_path, logger):
@@ -203,6 +244,18 @@ def _load_dask_config():
         return yaml.load(f, Loader=SafeLoader)
 
 
+def set_jobqueue_processes(config, cluster_type, processes):
+    """Set worker processes in a jobqueue config, keeping one thread/process."""
+    processes = max(1, int(processes))
+    settings = config["jobqueue"][cluster_type]
+    settings["processes"] = processes
+    if "cores" in settings:
+        # dask-jobqueue derives threads per worker from cores/processes.
+        # Keep that ratio at one so a memory-heavy worker process does not
+        # execute multiple mesh assemblies concurrently.
+        settings["cores"] = processes
+
+
 def run_with_oom_retry(
     work_fn,
     num_workers,
@@ -210,6 +263,7 @@ def run_with_oom_retry(
     logger,
     max_retries=3,
     retry_on_oom=True,
+    config=None,
 ):
     """Run a dask phase with optional retry on worker out-of-memory crashes.
 
@@ -223,9 +277,8 @@ def run_with_oom_retry(
     symptom of a worker SIGKILL'd by the OS OOM-killer or LSF mem
     limit), we halve ``processes`` per slot in the in-memory dask
     config and halve *num_workers* to match — doubling the memory
-    available to each worker while keeping the LSF slot count
-    (and CPU budget) constant. Then we retry the phase, up to
-    *max_retries* times.
+    available to each worker while keeping one dask thread per process.
+    Then we retry the phase, up to *max_retries* times.
 
     Parameters
     ----------
@@ -242,20 +295,36 @@ def run_with_oom_retry(
     retry_on_oom : bool
         Set to ``False`` to skip the retry wrapper entirely (acts as a
         passthrough). Useful for synchronous (``num_workers==1``) runs.
+    config : dict, optional
+        Dask config to use instead of loading ``dask-config.yaml``. The
+        config is deep-copied before mutation so callers can reuse their
+        base config across phases.
     """
-    if not retry_on_oom or max_retries < 1 or num_workers <= 1:
-        return work_fn(num_workers, None)
+    if config is not None:
+        config = copy.deepcopy(config)
+
+    if not retry_on_oom or max_retries < 1:
+        return work_fn(num_workers, config)
 
     try:
         from distributed.scheduler import KilledWorker
     except ImportError:
-        return work_fn(num_workers, None)
+        return work_fn(num_workers, config)
 
-    config = _load_dask_config()
+    if config is None:
+        if num_workers <= 1:
+            return work_fn(num_workers, None)
+        config = _load_dask_config()
     cluster_type = next(iter(config.get("jobqueue", {})), None)
     if cluster_type not in ("lsf", "slurm", "sge"):
         # Local/in-process clusters don't have a processes/slot lever;
         # skip retry wrapping there.
+        return work_fn(num_workers, config)
+
+    starting_processes = int(
+        config["jobqueue"][cluster_type].get("processes", 1) or 1
+    )
+    if num_workers <= 1 and starting_processes <= 1:
         return work_fn(num_workers, config)
 
     workers = num_workers
@@ -287,7 +356,7 @@ def run_with_oom_retry(
             logger.warning(
                 "Phase '%s' worker OOM (retry %d/%d). Halving "
                 "processes/slot %d→%d and workers %d→%d to give each worker "
-                "more memory; LSF slot count and CPU budget unchanged. "
+                "more memory while keeping one dask thread per process. "
                 "To find the segment that crashed: grep "
                 "job-logs/LSFCluster-*.err for the last 'mesh_id=...' line "
                 "from the killed worker at %s.",
@@ -295,7 +364,7 @@ def run_with_oom_retry(
                 processes, new_processes, workers, new_workers,
                 last_worker or "(unknown address)",
             )
-            config["jobqueue"][cluster_type]["processes"] = new_processes
+            set_jobqueue_processes(config, cluster_type, new_processes)
             workers = new_workers
 
 
@@ -489,6 +558,79 @@ try:
             if index < len(block_rois):
                 block_rois[index:] = []
         return block_rois
+
+    def count_blocks(roi, block_size_world):
+        """Number of blocks needed to tile *roi* with *block_size_world*.
+
+        Cheap, geometry-only — no I/O, no Roi-list materialization.
+
+        Parameters
+        ----------
+        roi : funlib.geometry.Roi
+            Region of interest.
+        block_size_world : sequence of int
+            Block extent in the same units as ``roi`` (world / nm).
+
+        Returns
+        -------
+        int
+            Number of blocks (product of ceil(shape / block_size)).
+        """
+        bs = tuple(block_size_world)
+        return int(
+            np.prod([np.ceil(roi.shape[i] / bs[i]) for i in range(len(bs))])
+        )
+
+    def block_from_index(
+        index,
+        roi_begin,
+        roi_end,
+        block_size_world,
+        padding=None,
+    ):
+        """Materialize a single block's ``DaskBlock`` from its sequential index.
+
+        Inverts the index-assignment order used by :func:`create_blocks`
+        (innermost loop is axis 0, outermost is axis 2). Workers call
+        this with just the index plus a small pickleable config — the
+        driver never has to build a list of all block objects.
+
+        Parameters
+        ----------
+        index : int
+            Sequential block index, ``0 <= index < count_blocks(...)``.
+        roi_begin, roi_end : sequence of int
+            ROI extent in world coordinates (same units as
+            *block_size_world*).
+        block_size_world : sequence of int
+            Block extent in world units.
+        padding : sequence of int or None
+            Symmetric padding to grow the block ROI by, matching the
+            ``padding`` argument of :func:`create_blocks`.
+
+        Returns
+        -------
+        DaskBlock
+            Block with ``index`` and ``roi`` populated.
+        """
+        from funlib.geometry import Coordinate
+        bs = tuple(block_size_world)
+        rb = tuple(roi_begin)
+        re = tuple(roi_end)
+        shape = tuple(re[i] - rb[i] for i in range(3))
+        n0 = int(np.ceil(shape[0] / bs[0]))
+        n1 = int(np.ceil(shape[1] / bs[1]))
+        # Match create_blocks: outer loop dim_2, then dim_1, then dim_0.
+        i2, rem = divmod(index, n0 * n1)
+        i1, i0 = divmod(rem, n0)
+        start = Coordinate(rb[0] + i0 * bs[0], rb[1] + i1 * bs[1], rb[2] + i2 * bs[2])
+        block_roi = Roi(start, Coordinate(bs))
+        if padding:
+            from funlib.geometry import Coordinate
+            # Coordinate.grow requires a Coordinate, not a tuple — wrap.
+            pad = padding if isinstance(padding, Coordinate) else Coordinate(padding)
+            block_roi = block_roi.grow(pad, pad)
+        return DaskBlock(index, block_roi)
 
 except ImportError:
     # funlib not available - block-based processing won't work

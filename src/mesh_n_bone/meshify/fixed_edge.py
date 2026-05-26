@@ -432,6 +432,8 @@ def simplify_mesh(
     F = mesh.faces
     if len(F) == 0:
         return mesh
+    if target_reduction <= 0:
+        return repair_cleanup(mesh)
 
     target_faces = int(max(12, (1 - target_reduction) * F.shape[0]))
     if fix_edges:

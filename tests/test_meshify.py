@@ -85,6 +85,255 @@ class TestTargetIdsWorker:
             assert remap[old] == new
 
 
+class TestEstimateBlockTargetMb:
+    """`_estimate_block_target_mb_from_dask_config` reads dask-config.yaml
+    and returns a per-block memory budget derived from per-worker RAM."""
+
+    def test_fallback_when_no_config(self, tmp_output_dir):
+        from mesh_n_bone.meshify.meshify import _estimate_block_target_mb_from_dask_config
+        missing = os.path.join(tmp_output_dir, "missing-dask-config.yaml")
+        assert _estimate_block_target_mb_from_dask_config(missing, fallback_mb=128) == 128
+
+    def test_real_lsf_config(self, tmp_output_dir):
+        from mesh_n_bone.meshify.meshify import _estimate_block_target_mb_from_dask_config
+        path = os.path.join(tmp_output_dir, "dask-config.yaml")
+        with open(path, "w") as f:
+            f.write("jobqueue:\n  lsf:\n    memory: 180GB\n    processes: 12\n")
+        # 180 GB / 12 = 15 GB per worker; amplification=6 -> ~2500 MB.
+        result = _estimate_block_target_mb_from_dask_config(path)
+        assert 2400 < result < 2600
+
+    def test_huge_worker_is_unbounded(self, tmp_output_dir):
+        from mesh_n_bone.meshify.meshify import _estimate_block_target_mb_from_dask_config
+        path = os.path.join(tmp_output_dir, "dask-config.yaml")
+        # 60 GB worker, no ceiling -> ~10000 MB.
+        with open(path, "w") as f:
+            f.write("jobqueue:\n  local:\n    memory: 60GB\n    processes: 1\n")
+        result = _estimate_block_target_mb_from_dask_config(path)
+        assert 9000 < result < 11000
+
+    def test_small_worker_keeps_fallback(self, tmp_output_dir):
+        from mesh_n_bone.meshify.meshify import _estimate_block_target_mb_from_dask_config
+        path = os.path.join(tmp_output_dir, "dask-config.yaml")
+        # 256 MB worker / 6 ~= 43 MB, smaller than the floor.
+        with open(path, "w") as f:
+            f.write("jobqueue:\n  local:\n    memory: 256MB\n    processes: 1\n")
+        result = _estimate_block_target_mb_from_dask_config(path, fallback_mb=128)
+        assert result == 128
+
+    def test_malformed_config_falls_back(self, tmp_output_dir):
+        from mesh_n_bone.meshify.meshify import _estimate_block_target_mb_from_dask_config
+        path = os.path.join(tmp_output_dir, "dask-config.yaml")
+        with open(path, "w") as f:
+            f.write("not-jobqueue:\n  foo: bar\n")
+        assert _estimate_block_target_mb_from_dask_config(path, fallback_mb=128) == 128
+
+
+class TestAssemblyMemoryPlanning:
+    def _write_binary_ply(self, path, vertices, faces):
+        header = (
+            "ply\n"
+            "format binary_little_endian 1.0\n"
+            f"element vertex {vertices}\n"
+            "property float x\n"
+            "property float y\n"
+            "property float z\n"
+            f"element face {faces}\n"
+            "property list int int vertex_indices\n"
+            "end_header\n"
+        ).encode("ascii")
+        body = b"\0" * (vertices * 3 * 4 + faces * 4 * 4)
+        with open(path, "wb") as f:
+            f.write(header + body)
+
+    def test_scans_ply_headers_for_mesh_estimates(self, tmp_output_dir):
+        from mesh_n_bone.meshify.meshify import _scan_assembly_mesh_estimates
+
+        mesh_dir = os.path.join(tmp_output_dir, "tmp_chunked", "42")
+        os.makedirs(mesh_dir)
+        self._write_binary_ply(os.path.join(mesh_dir, "block_0.ply"), 10, 20)
+        self._write_binary_ply(os.path.join(mesh_dir, "block_1.ply"), 2, 4)
+
+        estimates = _scan_assembly_mesh_estimates(
+            os.path.join(tmp_output_dir, "tmp_chunked"),
+            amplification=16,
+        )
+        assert len(estimates) == 1
+        estimate = estimates[0]
+        assert estimate.mesh_id == "42"
+        assert estimate.num_files == 2
+        assert estimate.vertex_count == 12
+        assert estimate.face_count == 24
+        assert estimate.raw_mesh_bytes == 12 * 3 * 8 + 24 * 3 * 4
+        assert estimate.estimated_peak_bytes > estimate.raw_mesh_bytes
+
+    def test_balanced_batches_leave_giant_mesh_alone(self):
+        from mesh_n_bone.meshify.meshify import (
+            AssemblyMeshEstimate,
+            _balanced_assembly_batches,
+        )
+
+        estimates = [
+            AssemblyMeshEstimate("giant", 1, 1000, 0, 0, 0, 1000),
+            *[
+                AssemblyMeshEstimate(f"small-{i}", 1, 1, 0, 0, 0, 1)
+                for i in range(20)
+            ],
+        ]
+        batches = _balanced_assembly_batches(estimates, max_batches=4)
+        giant_batches = [batch for batch in batches if "giant" in batch]
+        assert giant_batches == [["giant"]]
+        assert sum(len(batch) for batch in batches) == len(estimates)
+
+    def test_assembly_amplification_constants_cover_heavy_paths(self):
+        from mesh_n_bone.meshify.meshify import _assembly_memory_amplification
+
+        assert _assembly_memory_amplification(
+            do_simplification=True,
+            smooth_before_simplify=False,
+            check_mesh_validity=False,
+            has_custom_roi=False,
+        ) == 24
+        assert _assembly_memory_amplification(
+            do_simplification=True,
+            smooth_before_simplify=True,
+            check_mesh_validity=True,
+            has_custom_roi=False,
+        ) == 36
+        assert _assembly_memory_amplification(
+            do_simplification=False,
+            smooth_before_simplify=False,
+            check_mesh_validity=False,
+            has_custom_roi=False,
+        ) == 20
+
+    def test_plan_assembly_waves_lowers_processes_for_large_mesh(self):
+        from mesh_n_bone.meshify.meshify import (
+            AssemblyMeshEstimate,
+            _plan_assembly_waves,
+        )
+
+        cfg = {
+            "jobqueue": {
+                "lsf": {
+                    "ncpus": 12,
+                    "processes": 12,
+                    "cores": 12,
+                    "memory": "180GB",
+                }
+            }
+        }
+        gib = 2 ** 30
+        estimates = [
+            AssemblyMeshEstimate("large", 1, 100, 0, 0, 0, 20 * gib),
+            AssemblyMeshEstimate("small", 1, 1, 0, 0, 0, 1 * gib),
+        ]
+
+        waves = _plan_assembly_waves(estimates, requested_workers=576, config=cfg)
+        assert [wave.processes for wave in waves] == [5, 12]
+        large_wave = waves[0]
+        assert large_wave.batches == [["large"]]
+        assert large_wave.workers == 5
+        assert large_wave.config["jobqueue"]["lsf"]["processes"] == 5
+        assert large_wave.config["jobqueue"]["lsf"]["cores"] == 5
+        assert large_wave.config["jobqueue"]["lsf"]["ncpus"] == 12
+        assert cfg["jobqueue"]["lsf"]["processes"] == 12
+        assert cfg["jobqueue"]["lsf"]["ncpus"] == 12
+
+
+class TestTensorStoreReadTimeouts:
+    class _FakeDataset:
+        class _FakeDType:
+            numpy_dtype = np.dtype("uint64")
+
+        dtype = _FakeDType()
+
+    def _slices_for_mib(self, mib):
+        voxels = int(mib * 2**20 / np.dtype("uint64").itemsize)
+        return (slice(0, voxels),)
+
+    def test_small_reads_keep_old_five_second_timeout(self):
+        from mesh_n_bone.util.image_data_interface import (
+            _default_read_timeout_seconds,
+        )
+
+        slices = self._slices_for_mib(67)
+        assert _default_read_timeout_seconds(
+            self._FakeDataset(), slices, "/nrs/local.zarr",
+        ) == 5.0
+        assert _default_read_timeout_seconds(
+            self._FakeDataset(), slices, "gs://bucket/volume",
+        ) == 5.0
+
+    def test_remote_timeout_scales_with_read_size(self):
+        from mesh_n_bone.util.image_data_interface import (
+            _default_read_timeout_seconds,
+        )
+
+        slices = self._slices_for_mib(512)
+        assert _default_read_timeout_seconds(
+            self._FakeDataset(), slices, "precomputed://gs://bucket/volume",
+        ) == 32.0
+
+    def test_local_timeout_scales_more_slowly_and_caps(self):
+        from mesh_n_bone.util.image_data_interface import (
+            _default_read_timeout_seconds,
+        )
+
+        slices = self._slices_for_mib(4096)
+        assert _default_read_timeout_seconds(
+            self._FakeDataset(), slices, "/nrs/local.zarr",
+        ) == 16.0
+
+        huge_slices = self._slices_for_mib(16384)
+        assert _default_read_timeout_seconds(
+            self._FakeDataset(), huge_slices, "/nrs/local.zarr",
+        ) == 30.0
+
+
+class TestBlockFromIndex:
+    """`block_from_index` should produce the same DaskBlocks as
+    `create_blocks` would, indexed by integer."""
+
+    def test_index_parity_with_eager_create_blocks(self):
+        from mesh_n_bone.util.dask_util import (
+            block_from_index, count_blocks, create_blocks,
+        )
+        from funlib.geometry import Coordinate, Roi
+        from types import SimpleNamespace
+
+        roi = Roi((0, 0, 0), (96, 64, 128))
+        block_size_world = Coordinate(32, 32, 32)
+        ds = SimpleNamespace(
+            chunk_shape=block_size_world,
+            voxel_size=Coordinate(1, 1, 1),
+        )
+        eager = create_blocks(roi, ds)
+        n_eager = len(eager)
+        n_lazy = count_blocks(roi, block_size_world)
+        assert n_eager == n_lazy
+        for i in range(n_eager):
+            lazy = block_from_index(
+                i, roi.get_begin(), roi.get_end(), block_size_world,
+            )
+            assert lazy.index == eager[i].index == i
+            assert tuple(lazy.roi.get_begin()) == tuple(eager[i].roi.get_begin()), (
+                f"index {i}: {lazy.roi.get_begin()} != {eager[i].roi.get_begin()}"
+            )
+            assert tuple(lazy.roi.get_end()) == tuple(eager[i].roi.get_end())
+
+    def test_padding_round_trip(self):
+        from mesh_n_bone.util.dask_util import block_from_index
+        from funlib.geometry import Coordinate
+
+        b = block_from_index(
+            0, (0, 0, 0), (32, 32, 32), (32, 32, 32), padding=Coordinate(4, 4, 4)
+        )
+        # padding=(4,4,4) grows the (0,0,0)+(32,32,32) block by 4 on each side
+        assert tuple(b.roi.get_begin()) == (-4, -4, -4)
+        assert tuple(b.roi.get_shape()) == (40, 40, 40)
+
+
 class TestStagedReductions:
     def test_staged_reductions_sum(self):
         from mesh_n_bone.meshify.meshify import staged_reductions
@@ -106,6 +355,122 @@ class TestStagedReductions:
 
         with pytest.raises(AssertionError):
             staged_reductions(0.99, 0.3, 0.3)
+
+    def test_chunk_reduction_zero_when_fixed_edge_simplification_disabled(self):
+        from mesh_n_bone.meshify.meshify import _chunk_stage_1_reduction
+
+        assert _chunk_stage_1_reduction(
+            {
+                "use_fixed_edge_simplification": False,
+                "target_reduction": 0.933,
+                "stage_1_reduction_fraction": 0.25,
+            }
+        ) == 0.0
+
+    def test_chunk_reduction_uses_stage_split_when_enabled(self):
+        from mesh_n_bone.meshify.meshify import (
+            _chunk_stage_1_reduction,
+            staged_reductions,
+        )
+
+        config = {
+            "use_fixed_edge_simplification": True,
+            "target_reduction": 0.933,
+            "stage_1_reduction_fraction": 0.25,
+        }
+        expected, _ = staged_reductions(0.933, 0.25, 0.75)
+        assert _chunk_stage_1_reduction(config) == expected
+
+    def test_assembly_uses_second_stage_reduction(self, tmp_output_dir, monkeypatch):
+        from cloudvolume.mesh import Mesh as CloudVolumeMesh
+        from mesh_n_bone.meshify.meshify import Meshify, staged_reductions
+
+        block_dir = os.path.join(tmp_output_dir, "blocks", "1")
+        output_dir = os.path.join(tmp_output_dir, "out")
+        os.makedirs(block_dir)
+        os.makedirs(os.path.join(output_dir, "meshes"))
+
+        vertices = np.array(
+            [
+                [0, 0, 0],
+                [1, 0, 0],
+                [0, 1, 0],
+                [0, 0, 1],
+            ],
+            dtype=np.float32,
+        )
+        faces = np.array(
+            [
+                [0, 1, 2],
+                [0, 1, 3],
+                [0, 2, 3],
+                [1, 2, 3],
+            ],
+            dtype=np.uint32,
+        )
+        mesh = CloudVolumeMesh(vertices, faces, normals=None)
+        with open(os.path.join(block_dir, "block_0.ply"), "wb") as f:
+            f.write(mesh.to_ply())
+
+        reductions = []
+
+        def fake_simplify_and_smooth_mesh(input_mesh, target_reduction, *args, **kwargs):
+            reductions.append(target_reduction)
+            return trimesh.Trimesh(
+                vertices=input_mesh.vertices,
+                faces=input_mesh.faces,
+                process=False,
+            )
+
+        monkeypatch.setattr(
+            Meshify,
+            "simplify_and_smooth_mesh",
+            staticmethod(fake_simplify_and_smooth_mesh),
+        )
+
+        meshify = object.__new__(Meshify)
+        meshify.dirname = os.path.join(tmp_output_dir, "blocks")
+        meshify.output_directory = output_dir
+        meshify.max_num_blocks = 100
+        meshify.check_mesh_validity = False
+        meshify.has_custom_roi = False
+        meshify.remove_smallest_components = False
+        meshify.use_fixed_edge_simplification = True
+        meshify.do_simplification = True
+        meshify.target_reduction = 0.933
+        meshify.stage_1_reduction_fraction = 0.25
+        meshify.stage_2_reduction_fraction = 0.75
+        meshify.n_smoothing_iter = 0
+        meshify.default_aggressiveness = 0.3
+        meshify.smooth_before_simplify = True
+        meshify.true_voxel_size = np.array([1, 1, 1])
+        meshify.output_voxel_size_funlib = np.array([1, 1, 1])
+        meshify.do_legacy_neuroglancer = False
+        meshify.do_singleres_multires_neuroglancer = False
+
+        meshify._assemble_mesh("1")
+
+        _, expected_stage_2 = staged_reductions(0.933, 0.25, 0.75)
+        assert reductions == [expected_stage_2]
+
+    def test_zero_reduction_skips_chunk_decimator(self, monkeypatch):
+        from mesh_n_bone.meshify import fixed_edge
+
+        mesh = trimesh.creation.icosphere(subdivisions=1, radius=1.0)
+
+        def fail_decimator(*args, **kwargs):
+            raise AssertionError("decimator should not run")
+
+        monkeypatch.setattr(fixed_edge, "pymeshlab_simplify", fail_decimator)
+        out = fixed_edge.simplify_mesh(
+            mesh,
+            target_reduction=0.0,
+            voxel_size=np.array([1, 1, 1]),
+            block_size=None,
+            fix_edges=True,
+        )
+
+        assert len(out.faces) > 0
 
 
 class TestRepairMeshPymeshlab:

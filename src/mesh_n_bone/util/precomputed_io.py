@@ -133,6 +133,9 @@ def open_precomputed_tensorstore(path, scale_index=None):
     converts it to ZYX.
     """
     import tensorstore as ts
+    from mesh_n_bone.util.image_data_interface import (
+        _capped_tensorstore_context_spec,
+    )
 
     kvstore, base_path, info, default_scale = parse_precomputed_path(path)
     if scale_index is None:
@@ -145,6 +148,7 @@ def open_precomputed_tensorstore(path, scale_index=None):
         "driver": "neuroglancer_precomputed",
         "kvstore": kvstore_with_path,
         "scale_index": int(scale_index),
+        "context": _capped_tensorstore_context_spec(),
     }
     ds = ts.open(spec, read=True, write=False).result()
 
