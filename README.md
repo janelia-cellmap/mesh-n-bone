@@ -8,7 +8,7 @@ Produces meshes in the [neuroglancer precomputed format](https://github.com/goog
 
 ## Try it in Colab
 
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/janelia-cellmap/mesh-n-bone/blob/improve-efficiency/examples/example.ipynb)
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/janelia-cellmap/mesh-n-bone/blob/master/examples/example.ipynb)
 
 The [example notebook](examples/example.ipynb) runs the full pipeline end-to-end (build a zarr volume, generate meshes, view in neuroglancer) without any local setup.
 
