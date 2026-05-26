@@ -242,10 +242,10 @@ class TestAssemblyMemoryPlanning:
 
 
 class TestTensorStoreReadTimeouts:
-    class _FakeDType:
-        numpy_dtype = np.dtype("uint64")
-
     class _FakeDataset:
+        class _FakeDType:
+            numpy_dtype = np.dtype("uint64")
+
         dtype = _FakeDType()
 
     def _slices_for_mib(self, mib):
