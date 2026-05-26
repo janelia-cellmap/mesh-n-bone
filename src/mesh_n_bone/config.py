@@ -78,7 +78,7 @@ def read_multires_config(config_path):
             optional_properties_settings["segment_properties_id_column"] = "Object ID"
 
         sharding_settings = config.get("sharding_settings", {}) or {}
-        sharding_settings.setdefault("sharded", False)
+        sharding_settings.setdefault("sharded", True)
         sharding_settings.setdefault("preshift_bits", None)
         sharding_settings.setdefault("minishard_bits", None)
         sharding_settings.setdefault("shard_bits", None)

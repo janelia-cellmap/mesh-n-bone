@@ -126,7 +126,7 @@ delete_decimated_meshes: true    # Remove intermediate LOD mesh files (default: 
 
 # ── Sharded output (recommended for thousands of meshes) ──
 sharded: true                    # Pack all meshes into a few <n>.shard files
-                                 # instead of two files per segment (default: false)
+                                 # instead of two files per segment (default: true)
 # shard_bits: 4                  # Optional overrides — defaults are auto-sized
 # minishard_bits: 6              # from the segment count via choose_shard_params.
 # preshift_bits: 0
@@ -224,7 +224,7 @@ optional_properties_settings:
   segment_properties_id_column: "Object ID"        # CSV column with segment IDs
 
 sharding_settings:
-  sharded: true                                    # Pack output into <n>.shard files (default: false)
+  sharded: true                                    # Pack output into <n>.shard files (default: true)
   # shard_bits: 4                                  # Optional overrides — auto-sized by default
   # minishard_bits: 6
   # preshift_bits: 0

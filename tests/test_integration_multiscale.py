@@ -11,13 +11,15 @@ import pytest
 import struct
 
 
-# Common kwargs for all tests
+# Common kwargs for all tests. These tests inspect per-segment unsharded
+# files (`.index`, `.ply`), so opt out of the default sharded packing.
 _BASE_KWARGS = dict(
     num_workers=1,
     do_simplification=False,
     check_mesh_validity=False,
     do_analysis=False,
     n_smoothing_iter=0,
+    sharded=False,
 )
 
 

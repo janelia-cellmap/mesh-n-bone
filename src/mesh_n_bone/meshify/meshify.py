@@ -863,7 +863,7 @@ class Meshify:
         voxel_size_nm: list = None,
         retry_on_oom: bool = True,
         memory_retry_max: int = 3,
-        sharded: bool = False,
+        sharded: bool = True,
         shard_bits: int | None = None,
         minishard_bits: int | None = None,
         preshift_bits: int | None = None,
