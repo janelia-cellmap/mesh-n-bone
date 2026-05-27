@@ -20,7 +20,6 @@ logger = logging.getLogger(__name__)
 
 
 DEFAULT_TARGET_FACES_PER_LOD0_CHUNK = 25_000
-MAX_AUTO_LOD_GRID_PADDING_RATIO = 2.0
 
 
 def generate_neuroglancer_multires_mesh(
@@ -69,8 +68,6 @@ def generate_neuroglancer_multires_mesh(
 
         vertex_min = None
         vertex_max = None
-        lod_vertex_mins = []
-        lod_vertex_maxs = []
         requested_lods = list(lods)
         requested_lod_count = len(requested_lods)
         lod_face_counts = []
@@ -92,32 +89,25 @@ def generate_neuroglancer_multires_mesh(
                 break
 
             num_faces = len(faces)
-            if num_faces >= previous_num_faces:
+            if num_faces > previous_num_faces:
                 previous_lod, previous_faces = lod_face_counts[-1]
                 lod_truncation_reason = (
                     f"Segment {id} using {idx}/{requested_lod_count} requested "
                     f"LODs; dropping LOD {current_lod} and later because it "
-                    f"has {num_faces} faces, not fewer than LOD "
+                    f"has {num_faces} faces, more than LOD "
                     f"{previous_lod} ({previous_faces} faces)."
                 )
                 break
             lod_face_counts.append((current_lod, num_faces))
-            # LOD-0 bounds drive the chunk grid; union bounds drive
-            # the empty-placeholder envelope (which must cover every
-            # LOD's actual face footprint, not just LOD 0's).
+            # LOD-0 bounds drive the chunk grid.
             if current_lod == 0 and vertices is not None:
                 vertex_min = vertices.min(axis=0)
                 vertex_max = vertices.max(axis=0)
-            if vertices is not None and len(vertices) > 0:
-                lod_vmin = vertices.min(axis=0)
-                lod_vmax = vertices.max(axis=0)
-                lod_vertex_mins.append(lod_vmin)
-                lod_vertex_maxs.append(lod_vmax)
 
             # Capture LOD-0 face count for the chunk-shape heuristic
-            # below. We compute lod_0_box_size AFTER the loop so the
-            # octree_unit cap uses the effective num_lods (after any
-            # face-count truncation), not the requested num_lods.
+            # below. We compute lod_0_box_size AFTER the loop so it
+            # reflects the effective num_lods (after any face-count
+            # truncation), not the requested num_lods.
             if current_lod == 0:
                 lod0_num_faces = num_faces
                 lod0_distances_per_axis = np.ceil(
@@ -141,7 +131,6 @@ def generate_neuroglancer_multires_mesh(
             )
             return
 
-        auto_lod_0_box_size = lod_0_box_size is None
         if lod_0_box_size is None:
             # Surface-area scaling: triangles distribute across the
             # mesh's 2-D surface, so total chunks ∝ N²-on-axis. Use
@@ -162,74 +151,6 @@ def generate_neuroglancer_multires_mesh(
             np.ceil(mesh_extent / lod_0_box_size).astype(int), 1
         )
 
-        if auto_lod_0_box_size:
-            requested_lod_count = len(lods)
-            effective_lod_count = requested_lod_count
-            padding_candidates = []
-            for candidate_lod_count in range(requested_lod_count, 0, -1):
-                octree_unit = 2 ** (candidate_lod_count - 1)
-                padded_chunks_per_axis = (
-                    np.ceil(num_chunks_per_axis / octree_unit).astype(int)
-                    * octree_unit
-                )
-                padding_ratio = np.max(
-                    padded_chunks_per_axis / num_chunks_per_axis
-                )
-                padding_candidates.append(
-                    (
-                        candidate_lod_count,
-                        padded_chunks_per_axis,
-                        padding_ratio,
-                    )
-                )
-                if padding_ratio <= MAX_AUTO_LOD_GRID_PADDING_RATIO:
-                    effective_lod_count = candidate_lod_count
-                    break
-
-            if effective_lod_count < requested_lod_count:
-                requested_padding = padding_candidates[0]
-                selected_padding = next(
-                    candidate
-                    for candidate in padding_candidates
-                    if candidate[0] == effective_lod_count
-                )
-                logger.info(
-                    "Reducing segment %s from %d to %d LODs for auto chunking: "
-                    "LOD0 faces=%d, target_faces_per_lod0_chunk=%d, "
-                    "auto_box_size=%s, mesh_extent=%s, lod0_grid=%s. "
-                    "Requested %d LODs would pad the grid to %s (%.2fx); "
-                    "selected %d LODs pads to %s (%.2fx), max_allowed=%.2fx.",
-                    id,
-                    requested_lod_count,
-                    effective_lod_count,
-                    int(lod0_num_faces),
-                    int(target_faces_per_lod0_chunk),
-                    np.asarray(lod_0_box_size).astype(float).tolist(),
-                    np.asarray(mesh_extent).astype(float).tolist(),
-                    np.asarray(num_chunks_per_axis).astype(int).tolist(),
-                    requested_padding[0],
-                    np.asarray(requested_padding[1]).astype(int).tolist(),
-                    float(requested_padding[2]),
-                    selected_padding[0],
-                    np.asarray(selected_padding[1]).astype(int).tolist(),
-                    float(selected_padding[2]),
-                    MAX_AUTO_LOD_GRID_PADDING_RATIO,
-                )
-                lods = lods[:effective_lod_count]
-                lod_vertex_mins = lod_vertex_mins[:effective_lod_count]
-                lod_vertex_maxs = lod_vertex_maxs[:effective_lod_count]
-
-        # The union bbox is only over retained LODs. Decimated meshes can
-        # drift slightly outside LOD 0; empty-placeholder coverage must
-        # include that retained drift, but not LODs dropped by the auto
-        # padding guard above.
-        if lod_vertex_mins:
-            union_vertex_min = np.min(np.stack(lod_vertex_mins), axis=0)
-            union_vertex_max = np.max(np.stack(lod_vertex_maxs), axis=0)
-        else:
-            union_vertex_min = vertex_min.copy()
-            union_vertex_max = vertex_max.copy()
-
         # Center the mesh within the full octree grid so that
         # Neuroglancer's bounding-box center matches the actual mesh
         # center.
@@ -245,20 +166,6 @@ def generate_neuroglancer_multires_mesh(
             grid_origin,
             np.ceil(vertex_max - full_grid_extent),
             np.floor(vertex_min),
-        )
-
-        # Convert union-of-LOD-vertex bbox to LOD-0 chunk units. This is
-        # the face-correct footprint we list at every LOD: a chunk with
-        # any face in any LOD must have a fragment (possibly empty) at
-        # every other LOD whose chunk contains it, so cross-LOD zoom
-        # transitions don't show two scales side by side.
-        union_lod0_min = np.maximum(
-            np.floor((union_vertex_min - grid_origin) / lod_0_box_size).astype(int),
-            0,
-        )
-        union_lod0_max = np.maximum(
-            np.ceil((union_vertex_max - grid_origin) / lod_0_box_size).astype(int),
-            union_lod0_min + 1,
         )
 
         results = []
@@ -356,8 +263,6 @@ def generate_neuroglancer_multires_mesh(
                     current_lod,
                     lods[: idx + 1],
                     np.asarray(lod_0_box_size, dtype=float),
-                    union_lod0_min=union_lod0_min,
-                    union_lod0_max=union_lod0_max,
                 )
 
                 del fragments

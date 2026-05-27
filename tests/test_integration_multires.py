@@ -518,22 +518,24 @@ class TestLodTruncation:
             "The last valid LOD may be getting dropped."
         )
 
-    def test_lod_truncation_on_non_decreasing_faces(self, tmp_output_dir, caplog):
-        """If a higher LOD has >= faces than the previous, truncate there."""
+    def test_lod_truncation_on_increasing_faces(self, tmp_output_dir, caplog):
+        """If a higher LOD has strictly more faces than the previous, truncate."""
         output_path = os.path.join(tmp_output_dir, "truncation_test")
         mesh_lods = os.path.join(output_path, "mesh_lods")
 
         # LOD 0: 642 faces (icosphere subdiv=3)
-        mesh = trimesh.creation.icosphere(subdivisions=3, radius=50.0)
-        mesh.vertices += 100
+        mesh_lod0 = trimesh.creation.icosphere(subdivisions=3, radius=50.0)
+        mesh_lod0.vertices += 100
         s0_dir = os.path.join(mesh_lods, "s0")
         os.makedirs(s0_dir)
-        mesh.export(os.path.join(s0_dir, "1.ply"))
+        mesh_lod0.export(os.path.join(s0_dir, "1.ply"))
 
-        # LOD 1: SAME mesh (not decimated) — should trigger truncation
+        # LOD 1: 2562 faces (icosphere subdiv=4) — strictly more than LOD 0
+        mesh_lod1 = trimesh.creation.icosphere(subdivisions=4, radius=50.0)
+        mesh_lod1.vertices += 100
         s1_dir = os.path.join(mesh_lods, "s1")
         os.makedirs(s1_dir)
-        mesh.export(os.path.join(s1_dir, "1.ply"))
+        mesh_lod1.export(os.path.join(s1_dir, "1.ply"))
 
         with caplog.at_level(logging.INFO, logger="mesh_n_bone.multires.multires"):
             generate_neuroglancer_multires_mesh(
@@ -549,13 +551,40 @@ class TestLodTruncation:
         with open(index_file, "rb") as f:
             data = f.read()
         num_lods = struct.unpack("<I", data[24:28])[0]
-        # LOD 1 has same face count as LOD 0, so it should be truncated
+        # LOD 1 has more faces than LOD 0, so it should be truncated
         assert num_lods == 1
         assert any(
             "dropping LOD 1 and later because it has" in r.message
-            and "not fewer than LOD 0" in r.message
+            and "more than LOD 0" in r.message
             for r in caplog.records
         )
+
+    def test_lod_retained_on_equal_faces(self, tmp_output_dir):
+        """Equal face counts across LODs are retained (pyfqmr floor plateau)."""
+        output_path = os.path.join(tmp_output_dir, "equal_faces_test")
+        mesh_lods = os.path.join(output_path, "mesh_lods")
+
+        mesh = trimesh.creation.icosphere(subdivisions=3, radius=50.0)
+        mesh.vertices += 100
+        for lod in (0, 1):
+            lod_dir = os.path.join(mesh_lods, f"s{lod}")
+            os.makedirs(lod_dir)
+            mesh.export(os.path.join(lod_dir, "1.ply"))
+
+        generate_neuroglancer_multires_mesh(
+            id=1,
+            num_subtask_workers=1,
+            output_path=output_path,
+            lods=[0, 1],
+            original_ext=".ply",
+            lod_0_box_size=None,
+        )
+
+        index_file = os.path.join(output_path, "multires", "1.index")
+        with open(index_file, "rb") as f:
+            data = f.read()
+        num_lods = struct.unpack("<I", data[24:28])[0]
+        assert num_lods == 2
 
     def test_lod_truncation_on_missing_candidate_mesh(self, tmp_output_dir, caplog):
         """If a requested higher LOD mesh is missing, log why it was dropped."""
@@ -664,16 +693,16 @@ class TestLodTruncation:
             "mesh extent, not octree_unit."
         )
 
-    def test_auto_lods_truncated_to_bound_grid_padding(self, tmp_output_dir, caplog):
-        """Auto chunking treats requested LODs as an upper bound.
-
-        Small meshes should not be forced into a deep octree whose padded
-        grid is much larger than the object bounds; that inflated manifest
-        footprint can keep coarse LODs visible in Neuroglancer.
+    def test_auto_lods_keeps_all_requested(self, tmp_output_dir):
+        """Auto chunking now keeps every requested LOD that has fewer
+        faces than the previous LOD. The persistent-coarse-LOD overlay
+        that motivated the old padding cap is handled by the partition
+        snap fix + descent-based minimum empties, so we no longer drop
+        LODs based on padded-grid size.
         """
         import pyfqmr
 
-        output_path = os.path.join(tmp_output_dir, "auto_lod_padding")
+        output_path = os.path.join(tmp_output_dir, "auto_lod_no_cap")
         mesh_lods = os.path.join(output_path, "mesh_lods")
         mesh = trimesh.creation.icosphere(subdivisions=4, radius=50.0)
         mesh.vertices += 100
@@ -694,29 +723,21 @@ class TestLodTruncation:
                 v, f, _ = simplifier.getMesh()
                 trimesh.Trimesh(v, f).export(os.path.join(lod_dir, "1.ply"))
 
-        with caplog.at_level(logging.INFO, logger="mesh_n_bone.multires.multires"):
-            generate_neuroglancer_multires_mesh(
-                id=1,
-                num_subtask_workers=1,
-                output_path=output_path,
-                lods=[0, 1, 2, 3],
-                original_ext=".ply",
-                lod_0_box_size=None,
-            )
+        generate_neuroglancer_multires_mesh(
+            id=1,
+            num_subtask_workers=1,
+            output_path=output_path,
+            lods=[0, 1, 2, 3],
+            original_ext=".ply",
+            lod_0_box_size=None,
+        )
 
         index_file = os.path.join(output_path, "multires", "1.index")
         with open(index_file, "rb") as f:
             data = f.read()
         num_lods = struct.unpack("<I", data[24:28])[0]
-        assert num_lods == 2, (
-            "Default auto chunking should drop excessive LODs for this "
-            f"small mesh; got {num_lods} LODs."
-        )
-        assert any(
-            "Reducing segment 1 from 4 to 2 LODs for auto chunking" in r.message
-            and "auto_box_size=" in r.message
-            and "lod0_grid=" in r.message
-            for r in caplog.records
+        assert num_lods == 4, (
+            f"All 4 requested LODs should be retained; got {num_lods}."
         )
 
     def test_three_lods_all_valid(self, tmp_output_dir):

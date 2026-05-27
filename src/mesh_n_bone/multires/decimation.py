@@ -33,7 +33,7 @@ def pyfqmr_decimate(id, lod, input_path, output_path, ext, decimation_factor, ag
         produce faster but lower-quality decimation.
     """
     vertices, faces = mesh_io.mesh_loader(f"{input_path}/{id}{ext}")
-    desired_faces = max(len(faces) // (decimation_factor**lod), 1000)
+    desired_faces = max(len(faces) // (decimation_factor**lod), 4)
     mesh_simplifier = pyfqmr.Simplify()
     mesh_simplifier.setMesh(vertices, faces)
     del vertices, faces
