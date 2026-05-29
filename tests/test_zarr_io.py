@@ -18,6 +18,7 @@ from mesh_n_bone.util.zarr_io import (
     _read_transforms,
     _read_voxel_size_offset,
     open_dataset,
+    read_raw_offset,
     read_raw_voxel_size,
     split_dataset_path,
 )
@@ -170,6 +171,33 @@ class TestOpenDatasetOmeFallback:
         ds = open_dataset(*os.path.split(path))
         raw = read_raw_voxel_size(ds)
         assert raw == (8.0, 16.0, 32.0)
+
+    @pytest.mark.parametrize("ome_version", ["0.4", "0.5"])
+    def test_read_raw_offset_preserves_fractional_translation(
+        self, tmp_output_dir, ome_version,
+    ):
+        # OME translation with sub-unit precision must survive the
+        # parent-traversal path used by read_raw_offset; the rounded
+        # ds.roi.offset would otherwise drop the fraction.
+        zarr_path = os.path.join(tmp_output_dir, f"frac_trans_{ome_version}.zarr")
+        root = zarr.open_group(zarr_path, mode="w", zarr_format=2)
+        ds_path = "s0"
+        root.create_array(
+            ds_path,
+            data=np.zeros((4, 4, 4), dtype=np.uint32),
+            chunks=(4, 4, 4),
+        )
+        ms = _multiscales_block([8.0, 8.0, 8.0], [10.5, 20.25, 30.125])
+        if ome_version == "0.4":
+            root.attrs["multiscales"] = ms
+        else:
+            root.attrs["ome"] = {"multiscales": ms, "version": "0.5"}
+
+        ds = open_dataset(zarr_path, ds_path)
+        # ds.roi.offset is the rounded Coordinate (integer truncation/round).
+        # The raw accessor must keep the floats verbatim.
+        raw_offset = read_raw_offset(ds)
+        assert raw_offset == (10.5, 20.25, 30.125)
 
     def test_open_http_zarr_without_extension(
         self, tmp_output_dir, _http_directory_server,

@@ -21,6 +21,7 @@ from mesh_n_bone.util.zarr_io import (
     open_dataset,
     split_dataset_path,
     read_raw_voxel_size,
+    read_raw_offset,
     _read_attrs,
     _get_multiscales,
     _extract_ome_scale_translation,
@@ -884,8 +885,13 @@ class Meshify:
         driver = _detect_zarr_driver(self._dataset_path)
         self._swap_axes = driver in ("n5", "neuroglancer_precomputed")
 
-        # Get true (possibly non-integer) voxel size from the underlying data
+        # Get true (possibly non-integer) voxel size and offset from
+        # the underlying data. self.true_offset is the float-precision
+        # OME translation / funlib offset; self.roi.offset stays
+        # integer for funlib Roi arithmetic, and the final mesh
+        # vertices get corrected with true_offset before output.
         self.true_voxel_size = np.array(read_raw_voxel_size(self.segmentation_array))
+        self.true_offset = np.array(read_raw_offset(self.segmentation_array))
 
         # Check if voxel_size is just defaults (1,1,1) and
         # try OME-NGFF multiscales metadata from the parent zarr group.
@@ -924,6 +930,13 @@ class Meshify:
                 self.segmentation_array.roi = Roi(
                     ome_offset_coord, Coordinate(array_shape) * ome_voxel_size_coord
                 )
+                # Track the float-precision OME translation so the
+                # final-mesh rescale can place vertices at sub-unit
+                # positions even when ome_offset_coord rounds them.
+                if ome_offset is not None:
+                    self.true_offset = np.array(ome_offset, dtype=float)
+                else:
+                    self.true_offset = np.zeros(3, dtype=float)
 
         if roi is not None:
             if not isinstance(roi, Roi):
@@ -1646,15 +1659,33 @@ class Meshify:
         except Exception as e:
             raise Exception(f"{mesh_id} failed, with error: {e}")
 
-        # Correct for difference between funlib voxel sizes (rounded) and actual
-        if list(self.true_voxel_size) != list(self.output_voxel_size_funlib):
+        # Correct for differences between funlib's integer voxel_size /
+        # offset (used during marching cubes and Roi math) and the true
+        # float-precision values from OME-NGFF translation / scale.
+        # Rewriting from voxel-index space gives:
+        #   true_pos = true_offset + true_voxel * (int_pos - int_offset) / int_voxel
+        #            = true_offset + scale * (int_pos - int_offset)
+        voxel_mismatch = (
+            list(self.true_voxel_size) != list(self.output_voxel_size_funlib)
+        )
+        true_offset_attr = getattr(self, "true_offset", None)
+        roi_attr = getattr(self, "roi", None)
+        offset_mismatch = False
+        if true_offset_attr is not None and roi_attr is not None:
+            int_offset_xyz = np.array(roi_attr.offset[::-1], dtype=float)
+            true_offset_xyz = np.array(true_offset_attr[::-1], dtype=float)
+            offset_mismatch = not np.allclose(int_offset_xyz, true_offset_xyz)
+        if voxel_mismatch or offset_mismatch:
             scale = np.array(self.true_voxel_size[::-1]) / np.array(
                 self.output_voxel_size_funlib[::-1]
             )
-            offset_xyz = np.array(self.roi.offset[::-1], dtype=float)
-            mesh.vertices -= offset_xyz
+            int_offset_xyz = np.array(self.roi.offset[::-1], dtype=float)
+            true_offset_xyz = np.array(
+                getattr(self, "true_offset", self.roi.offset)[::-1], dtype=float
+            )
+            mesh.vertices -= int_offset_xyz
             mesh.vertices *= scale
-            mesh.vertices += offset_xyz * scale
+            mesh.vertices += true_offset_xyz
 
         from mesh_n_bone.util.neuroglancer import (
             write_ngmesh,

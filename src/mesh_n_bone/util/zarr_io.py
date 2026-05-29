@@ -456,6 +456,27 @@ def read_raw_voxel_size(ds):
     return tuple(float(v) for v in ds.voxel_size)
 
 
+def read_raw_offset(ds):
+    """Return the float offset / OME translation, preserving non-integer precision.
+
+    Same source-resolution as :func:`_read_voxel_size_offset` but does
+    not round. Falls back to ``ds.roi.offset`` (already a Coordinate)
+    when no metadata source declares a value.
+    """
+    parent_attrs = getattr(ds.data, "parent_attrs", None) or _read_parent_attrs(ds)
+    dataset_name = (
+        getattr(ds.data, "dataset_name", None)
+        or _path_basename(getattr(ds, "_dataset_path", ""))
+        or None
+    )
+    _, offset = _resolve_voxel_size_offset(
+        ds.data.attrs, parent_attrs, dataset_name,
+    )
+    if offset is not None:
+        return tuple(float(v) for v in offset)
+    return tuple(float(v) for v in ds.roi.offset)
+
+
 def _get_multiscales(attrs):
     """Return the OME-Zarr ``multiscales`` list, or ``None``.
 
