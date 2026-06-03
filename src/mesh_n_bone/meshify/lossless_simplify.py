@@ -212,22 +212,30 @@ def collapse_planar_vertices(
     verts: np.ndarray, faces: np.ndarray,
     normal_tol: float = _PLANE_TOL,
     lock_vertex_mask: np.ndarray | None = None,
+    collapse_feature_edges: bool = False,
     feature_dihedral_min_deg: float = _FEATURE_DIHEDRAL_MIN_DEG,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Lossless mesh simplification by removing vertices with a planar 1-ring.
 
     A vertex V is removed if every face incident to V has a normal
-    matching every other incident face's normal to within `normal_tol`
-    (small-angle, dot product > 1 - tol). The 1-ring polygon is then
-    re-triangulated by ear-clipping in the patch's plane.
+    matching every other incident face's normal to within ``normal_tol``
+    (dot product > 1 - tol). The 1-ring polygon is then re-triangulated
+    by ear-clipping in the patch's plane. Crucially this is **bit-exact**:
+    no vertex position is ever moved; we only delete vertices whose
+    incident faces are coplanar, so the resulting surface is identical
+    to the input.
 
-    The feature-edge extension (2 coplanar groups joined by a straight
-    edge through V) only fires when the dihedral angle between the two
-    groups is at least ``feature_dihedral_min_deg``. This keeps cube /
-    slab edges (90°) collapsing aggressively while preserving the gentle
-    voxel-step normals on curved surfaces — important because
-    Neuroglancer reads vertex normals straight from the Draco fragment,
-    so collapsing along shallow steps visibly faceting the shading.
+    Optional feature-edge extension (``collapse_feature_edges=True``):
+    when V's 1-ring partitions into exactly 2 coplanar groups joined by
+    a straight edge through V (and the dihedral angle between groups is
+    ≥ ``feature_dihedral_min_deg``), V is removed and each half-arc is
+    retriangulated in its own plane. This collapses cube/slab edges
+    aggressively but reduces vertex density along genuine geometric
+    feature edges — which Neuroglancer renders by averaging incident
+    face normals at each vertex, so fewer feature-edge verts can produce
+    visible facets. **Off by default** for that reason. Flip on only
+    when you know your data is dominated by sharp 90°-ish edges
+    (CAD-like volumes) rather than curved organic shapes.
 
     Locked vertices (e.g. vertices on chunk-boundary planes) are never
     removed.
@@ -317,6 +325,8 @@ def collapse_planar_vertices(
             num_groups = len(group_normals)
             if num_groups > 2:
                 continue  # corner — keep V
+            if num_groups == 2 and not collapse_feature_edges:
+                continue  # 2-group means V sits on a feature edge — keep V
 
             # Build the boundary loop of the 1-ring.
             # Each face contributes its 2 edges that don't touch V.
@@ -747,6 +757,7 @@ def lossless_chunk_simplify(
     normal_tol: float = _PLANE_TOL,
     do_pass_a: bool = True,
     do_pass_b: bool = True,
+    collapse_feature_edges: bool = False,
     feature_dihedral_min_deg: float = _FEATURE_DIHEDRAL_MIN_DEG,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Run both passes. `boundary_planes` is a list of (axis, value)
@@ -769,6 +780,7 @@ def lossless_chunk_simplify(
             lock = None
         verts, faces = collapse_planar_vertices(
             verts, faces, normal_tol=normal_tol, lock_vertex_mask=lock,
+            collapse_feature_edges=collapse_feature_edges,
             feature_dihedral_min_deg=feature_dihedral_min_deg,
         )
 

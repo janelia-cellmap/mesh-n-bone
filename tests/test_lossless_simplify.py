@@ -74,10 +74,11 @@ class TestCoplanarCollapse:
         # interior vertex shares a planar 1-ring → nothing collapses.
         assert len(nf) == 12
 
-    def test_mc_cube_collapses_to_near_minimum(self):
-        """A marching-cubes box (5400 verts, 10796 faces) should collapse to
-        near the 8-vert/12-face theoretical minimum via the feature-edge
-        extension (collinear 2-group vertices on cube edges)."""
+    def test_mc_cube_collapses_to_near_minimum_with_feature_edges(self):
+        """With the (opt-in) feature-edge extension, an MC cube collapses
+        to near the 8-vert/12-face theoretical minimum. Off by default
+        because it damages NG per-vertex normal averaging on curved
+        surfaces; on for cube-like data."""
         from zmesh import Mesher
         vol = np.zeros((40, 40, 40), dtype=np.uint32)
         vol[5:35, 5:35, 5:35] = 1
@@ -86,11 +87,32 @@ class TestCoplanarCollapse:
         m = mesher.get(1, normals=False)
         v = np.asarray(m.vertices, dtype=np.float64)[:, ::-1]
         f = np.asarray(m.faces, dtype=np.int64)
-        nv, nf = collapse_planar_vertices(v, f)
-        # Must collapse aggressively (less than 100 faces) on a pure cube.
+        nv, nf = collapse_planar_vertices(v, f, collapse_feature_edges=True)
         assert len(nf) < 100, (
             f"MC box should collapse to near-minimum; got {len(nf)} faces"
         )
+
+    def test_mc_sphere_pure_lossless_is_bit_exact(self):
+        """Pure Pass A on a curved MC surface invents no new vertex
+        positions: every surviving vertex is one of the originals.
+        The geometry is bit-exact even though NG's *unweighted* face-
+        normal averaging means per-vertex shading may shift slightly
+        (it depends on triangle counts, and retriangulation changes
+        them — a fundamental property of the NG renderer, not the
+        simplifier)."""
+        from zmesh import Mesher
+        vol = np.zeros((40, 40, 40), dtype=np.uint32)
+        zz, yy, xx = np.indices(vol.shape) - 20
+        vol[(xx*xx + yy*yy + zz*zz) < 12*12] = 1
+        mesher = Mesher((1.0, 1.0, 1.0))
+        mesher.mesh(vol, close=False)
+        m = mesher.get(1, normals=False)
+        v = np.asarray(m.vertices, dtype=np.float64)[:, ::-1]
+        f = np.asarray(m.faces, dtype=np.int64)
+        nv, nf = collapse_planar_vertices(v, f)
+        in_orig = set(map(tuple, np.round(v, 6).tolist()))
+        in_out = set(map(tuple, np.round(nv, 6).tolist()))
+        assert in_out.issubset(in_orig)
 
 
 class TestDouglasPeucker:
