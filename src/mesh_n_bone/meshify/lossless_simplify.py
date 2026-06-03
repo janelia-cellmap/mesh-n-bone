@@ -45,6 +45,7 @@ _PLANE_TOL = 1e-4         # max sin(angle) between adjacent face normals
 _COLLINEAR_TOL = 1e-3     # max perp distance from line in nm
 _DP_DEFAULT_EPS = 0.5     # Douglas-Peucker tolerance in nm
 _PLANE_HIT_TOL = 1e-3     # max distance from boundary plane to count as on-plane
+_FEATURE_DIHEDRAL_MIN_DEG = 45.0  # below this, treat as curvature, not feature
 
 
 # ---------------------------------------------------------------------------
@@ -211,6 +212,7 @@ def collapse_planar_vertices(
     verts: np.ndarray, faces: np.ndarray,
     normal_tol: float = _PLANE_TOL,
     lock_vertex_mask: np.ndarray | None = None,
+    feature_dihedral_min_deg: float = _FEATURE_DIHEDRAL_MIN_DEG,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Lossless mesh simplification by removing vertices with a planar 1-ring.
 
@@ -219,11 +221,20 @@ def collapse_planar_vertices(
     (small-angle, dot product > 1 - tol). The 1-ring polygon is then
     re-triangulated by ear-clipping in the patch's plane.
 
+    The feature-edge extension (2 coplanar groups joined by a straight
+    edge through V) only fires when the dihedral angle between the two
+    groups is at least ``feature_dihedral_min_deg``. This keeps cube /
+    slab edges (90°) collapsing aggressively while preserving the gentle
+    voxel-step normals on curved surfaces — important because
+    Neuroglancer reads vertex normals straight from the Draco fragment,
+    so collapsing along shallow steps visibly faceting the shading.
+
     Locked vertices (e.g. vertices on chunk-boundary planes) are never
     removed.
 
     Returns a new (vertices, faces) pair with renumbered vertex indices.
     """
+    feature_cos_max = float(np.cos(np.radians(feature_dihedral_min_deg)))
     verts = np.asarray(verts, dtype=np.float64)
     faces = np.asarray(faces, dtype=np.int64)
     num_verts = len(verts)
@@ -375,6 +386,14 @@ def collapse_planar_vertices(
                 # is in a different group than the edge (loop[(i-1)%n], loop[i]).
                 # The vertex loop[i] is the "pivot" between groups — i.e.,
                 # the feature-edge neighbor of V in the mesh.
+                # Dihedral-angle gate: only collapse along a *real* feature
+                # edge (large angle between the two patches), not a shallow
+                # curvature step that just happens to be locally collinear.
+                # cos(angle) = |n_a · n_b|; reject if angle is too small.
+                n_a = group_normals[0]
+                n_b = group_normals[1]
+                if abs(float(n_a.dot(n_b))) > feature_cos_max:
+                    continue
                 t0, t1 = transitions
                 n = len(loop)
                 fneigh_a = loop[t0]
@@ -728,6 +747,7 @@ def lossless_chunk_simplify(
     normal_tol: float = _PLANE_TOL,
     do_pass_a: bool = True,
     do_pass_b: bool = True,
+    feature_dihedral_min_deg: float = _FEATURE_DIHEDRAL_MIN_DEG,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Run both passes. `boundary_planes` is a list of (axis, value)
     planes to apply Pass B to (typically the 6 faces of the chunk).
@@ -749,6 +769,7 @@ def lossless_chunk_simplify(
             lock = None
         verts, faces = collapse_planar_vertices(
             verts, faces, normal_tol=normal_tol, lock_vertex_mask=lock,
+            feature_dihedral_min_deg=feature_dihedral_min_deg,
         )
 
     if do_pass_b and boundary_planes_list:
