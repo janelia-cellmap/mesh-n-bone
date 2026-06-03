@@ -70,6 +70,41 @@ class TestFixedEdgeSimplification:
             assert np.all(result.vertices >= -0.5)
             assert np.all(result.vertices <= block_size.max())
 
+    def test_target_reduction_relative_to_raw_with_lossless(self):
+        """target_reduction must mean 'fraction of raw MC to remove'
+        regardless of lossless_first. Otherwise lossless adds free
+        reduction on top, over-decimating downstream."""
+        from zmesh import Mesher
+
+        vol = np.zeros((40, 40, 40), dtype=np.uint32)
+        vol[5:35, 5:35, 5:35] = 1
+        mesher = Mesher((1.0, 1.0, 1.0))
+        mesher.mesh(vol, close=False)
+        m = mesher.get(1, normals=False)
+        v = np.asarray(m.vertices, dtype=np.float64)[:, ::-1]
+        f = np.asarray(m.faces, dtype=np.int64)
+        mesh = trimesh.Trimesh(vertices=v, faces=f, process=False)
+        if mesh.volume < 0:
+            mesh.invert()
+        raw_faces = len(mesh.faces)
+        target_reduction = 0.9
+
+        without = simplify_mesh(
+            mesh, target_reduction=target_reduction,
+            voxel_size=(1, 1, 1), block_size=np.array([40.0, 40.0, 40.0]),
+            fix_edges=False, lossless_first=False,
+        )
+        with_loss = simplify_mesh(
+            mesh, target_reduction=target_reduction,
+            voxel_size=(1, 1, 1), block_size=np.array([40.0, 40.0, 40.0]),
+            fix_edges=False, lossless_first=True,
+        )
+        expected = int((1 - target_reduction) * raw_faces)
+        # Both paths should hit roughly the same final face count
+        # (within QEM's tolerance of the absolute target).
+        assert abs(len(without.faces) - expected) <= max(20, 0.1 * expected)
+        assert abs(len(with_loss.faces) - expected) <= max(20, 0.1 * expected)
+
     def test_simplify_empty_mesh(self):
         """Simplifying an empty mesh should return an empty mesh."""
         mesh = trimesh.Trimesh(

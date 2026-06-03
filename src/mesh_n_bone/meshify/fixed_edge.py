@@ -454,6 +454,12 @@ def simplify_mesh(
     F = mesh.faces
     if len(F) == 0:
         return mesh
+    # Capture the raw post-clip face count BEFORE lossless preprocessing so
+    # that target_reduction stays interpretable as "fraction of raw MC to
+    # remove", regardless of whether lossless ran. Otherwise lossless adds
+    # free reduction on top of target_reduction, breaking the composition
+    # with the stage-2 decimation that runs post-assembly.
+    raw_face_count = F.shape[0]
 
     if lossless_first and block_size is not None:
         from mesh_n_bone.meshify.lossless_simplify import (
@@ -480,7 +486,11 @@ def simplify_mesh(
     if target_reduction <= 0:
         return repair_cleanup(mesh)
 
-    target_faces = int(max(12, (1 - target_reduction) * F.shape[0]))
+    target_faces = int(max(12, (1 - target_reduction) * raw_face_count))
+    if target_faces >= F.shape[0]:
+        # Lossless already brought us at or below the requested face budget;
+        # skip decimation entirely so we don't over-reduce.
+        return repair_cleanup(mesh)
     if fix_edges:
         # When preserving borders, boundary vertices cannot be collapsed.
         # If target_faces is too low relative to the number of boundary
