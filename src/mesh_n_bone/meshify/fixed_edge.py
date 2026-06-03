@@ -391,12 +391,17 @@ def remove_boundary_vertices(mesh, voxel_size, block_size=None, verbose=False):
 def simplify_mesh(
     mesh, target_reduction, voxel_size, block_size=None,
     aggressiveness=0.3, verbose=False, use_pymeshlab=True, fix_edges=False,
+    lossless_first=False, lossless_dp_eps=None,
 ):
     """Simplify a mesh with optional boundary preservation.
 
     First removes vertices outside block boundaries via
-    ``remove_boundary_vertices``, then decimates the mesh to the
-    requested face count using either PyMeshLab or pyfqmr.
+    ``remove_boundary_vertices``. Optionally runs a lossless coplanar-
+    patch + boundary-polyline pass that drastically reduces face count
+    on flat regions while guaranteeing identical boundary vertices
+    between neighboring blocks (so the assembled mesh has no seams or
+    T-junctions). Then decimates the mesh to the requested face count
+    using either PyMeshLab or pyfqmr.
 
     Parameters
     ----------
@@ -422,6 +427,23 @@ def simplify_mesh(
     fix_edges : bool, optional
         If ``True``, boundary edges are preserved during decimation.
         Default is ``False``.
+    lossless_first : bool, optional
+        If ``True``, run lossless coplanar / boundary-polyline
+        simplification before the lossy decimation step. Massively
+        reduces face count on flat surfaces (axis-aligned planes,
+        coplanar interior regions, collinear boundary segments) without
+        moving any vertex. Boundary vertices on chunk-boundary planes
+        are reduced using a deterministic algorithm (Douglas-Peucker on
+        the 2D polyline at each plane) so two adjacent blocks compute
+        identical boundary vertex sets without cross-block
+        communication. Default is ``False``.
+    lossless_dp_eps : float or None, optional
+        Douglas-Peucker tolerance for the boundary polyline pass, in
+        the same units as ``voxel_size``. If ``None`` (default), uses
+        half a voxel along the smallest axis — effectively "remove only
+        collinear vertices" for axis-aligned segmentation surfaces.
+        Higher values trade tiny sub-voxel deviation for fewer
+        boundary vertices.
 
     Returns
     -------
@@ -432,6 +454,29 @@ def simplify_mesh(
     F = mesh.faces
     if len(F) == 0:
         return mesh
+
+    if lossless_first and block_size is not None:
+        from mesh_n_bone.meshify.lossless_simplify import (
+            lossless_chunk_simplify, block_boundary_planes,
+        )
+        bp = block_boundary_planes(
+            np.zeros(3, dtype=float), np.asarray(block_size, dtype=float),
+        )
+        if lossless_dp_eps is None:
+            lossless_dp_eps = 0.5 * float(np.min(voxel_size))
+        v_l, f_l = lossless_chunk_simplify(
+            np.asarray(mesh.vertices, dtype=np.float64),
+            np.asarray(mesh.faces, dtype=np.int64),
+            boundary_planes=bp,
+            dp_eps=lossless_dp_eps,
+        )
+        if len(f_l) > 0:
+            mesh = trimesh.Trimesh(vertices=v_l, faces=f_l, process=False)
+            F = mesh.faces
+            if verbose:
+                print(f"  lossless_first: pre-decimation reduced to "
+                      f"{len(F)} faces ({len(v_l)} verts)")
+
     if target_reduction <= 0:
         return repair_cleanup(mesh)
 

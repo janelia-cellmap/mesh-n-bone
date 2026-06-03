@@ -520,6 +520,7 @@ class TestMeshifyFixedEdgeSimplification:
             do_simplification=True,
             target_reduction=0.9,
             n_smoothing_iter=5,
+            stage_1_reduction_fraction=0.5,
             remove_smallest_components=False,
         )
         m.get_meshes()

@@ -670,6 +670,8 @@ def _get_chunked_mesh_worker(block_index, tmpdirname, config):
                 aggressiveness=config["default_aggressiveness"],
                 verbose=False,
                 fix_edges=True,
+                lossless_first=config.get("lossless_chunk_simplify", False),
+                lossless_dp_eps=config.get("lossless_chunk_simplify_dp_eps"),
             )
             # Segments living entirely in this block's padding zone end up
             # empty after boundary clipping. Skip writing — they'll be
@@ -830,10 +832,10 @@ class Meshify:
         max_num_blocks=np.inf,
         read_write_block_shape_pixels: list = None,
         downsample_factor: int | None = None,
-        target_reduction: float = 0.99,
+        target_reduction: float = 0.95,
         num_workers: int = 10,
         remove_smallest_components: bool = True,
-        n_smoothing_iter: int = 10,
+        n_smoothing_iter: int = 3,
         default_aggressiveness: int = 0.3,
         check_mesh_validity: bool = True,
         do_simplification: bool = True,
@@ -847,7 +849,9 @@ class Meshify:
         fixed_edge_taubin_iters: int = 12,
         fixed_edge_taubin_lambda: float = 0.5,
         fixed_edge_taubin_mu: float = -0.53,
-        stage_1_reduction_fraction: float = 0.5,
+        lossless_chunk_simplify: bool = False,
+        lossless_chunk_simplify_dp_eps: float | None = None,
+        stage_1_reduction_fraction: float = 0.25,
         do_multires: bool = False,
         num_lods: int = 3,
         lod_0_box_size=None,
@@ -1011,6 +1015,9 @@ class Meshify:
         self.fixed_edge_taubin_lambda = fixed_edge_taubin_lambda
         self.fixed_edge_taubin_mu = fixed_edge_taubin_mu
 
+        self.lossless_chunk_simplify = lossless_chunk_simplify
+        self.lossless_chunk_simplify_dp_eps = lossless_chunk_simplify_dp_eps
+
         self.stage_1_reduction_fraction = stage_1_reduction_fraction
         self.stage_2_reduction_fraction = 1 - self.stage_1_reduction_fraction
 
@@ -1142,6 +1149,8 @@ class Meshify:
             "downsample_factor": self.downsample_factor,
             "downsample_method": self.downsample_method,
             "use_fixed_edge_simplification": self.use_fixed_edge_simplification,
+            "lossless_chunk_simplify": self.lossless_chunk_simplify,
+            "lossless_chunk_simplify_dp_eps": self.lossless_chunk_simplify_dp_eps,
             "do_simplification": self.do_simplification,
             "target_reduction": self.target_reduction,
             "stage_1_reduction_fraction": self.stage_1_reduction_fraction,
@@ -1225,8 +1234,8 @@ class Meshify:
     @staticmethod
     def simplify_and_smooth_mesh(
         mesh,
-        target_reduction=0.99,
-        n_smoothing_iter=10,
+        target_reduction=0.95,
+        n_smoothing_iter=3,
         remove_smallest_components=True,
         aggressiveness=0.3,
         do_simplification=True,
