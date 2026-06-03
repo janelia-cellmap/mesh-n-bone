@@ -74,6 +74,24 @@ class TestCoplanarCollapse:
         # interior vertex shares a planar 1-ring → nothing collapses.
         assert len(nf) == 12
 
+    def test_mc_cube_collapses_to_near_minimum(self):
+        """A marching-cubes box (5400 verts, 10796 faces) should collapse to
+        near the 8-vert/12-face theoretical minimum via the feature-edge
+        extension (collinear 2-group vertices on cube edges)."""
+        from zmesh import Mesher
+        vol = np.zeros((40, 40, 40), dtype=np.uint32)
+        vol[5:35, 5:35, 5:35] = 1
+        mesher = Mesher((1.0, 1.0, 1.0))
+        mesher.mesh(vol, close=False)
+        m = mesher.get(1, normals=False)
+        v = np.asarray(m.vertices, dtype=np.float64)[:, ::-1]
+        f = np.asarray(m.faces, dtype=np.int64)
+        nv, nf = collapse_planar_vertices(v, f)
+        # Must collapse aggressively (less than 100 faces) on a pure cube.
+        assert len(nf) < 100, (
+            f"MC box should collapse to near-minimum; got {len(nf)} faces"
+        )
+
 
 class TestDouglasPeucker:
     """The DP implementation must be a pure function of its 2D polyline

@@ -280,30 +280,46 @@ def collapse_planar_vertices(
                 if len(face_idxs) < 3:
                     continue
                 face_arr = np.array([new_faces[i] for i in face_idxs])
-            n0 = _face_normal_single(verts, face_arr[0])
-            all_planar = True
-            for f in face_arr[1:]:
-                ni = _face_normal_single(verts, f)
-                if abs(ni.dot(n0)) < 1 - normal_tol:
-                    all_planar = False
-                    break
-            if not all_planar:
-                continue
-            # Build the boundary loop of the 1-ring (= polygon to re-triangulate)
+            # Group incident faces by normal. A vertex V is removable if:
+            #   (a) all 1-ring faces share one normal (planar interior), OR
+            #   (b) the 1-ring partitions into exactly two coplanar groups
+            #       AND V's two feature-edge neighbors are collinear with V
+            #       (so the two coplanar half-polygons can be retriangulated
+            #       independently, then stitched at the straight edge).
+            face_normals = [_face_normal_single(verts, f) for f in face_arr]
+            # Normalize sign: align all normals to the first one's direction
+            # (we treat opposite-normal coplanar faces as the same group;
+            # mesh winding errors shouldn't cause spurious splits).
+            n0 = face_normals[0]
+            group_ids = [0]
+            group_normals = [n0]
+            for ni in face_normals[1:]:
+                placed = False
+                for gi, gn in enumerate(group_normals):
+                    if abs(ni.dot(gn)) > 1 - normal_tol:
+                        group_ids.append(gi)
+                        placed = True
+                        break
+                if not placed:
+                    group_ids.append(len(group_normals))
+                    group_normals.append(ni)
+            num_groups = len(group_normals)
+            if num_groups > 2:
+                continue  # corner — keep V
+
+            # Build the boundary loop of the 1-ring.
             # Each face contributes its 2 edges that don't touch V.
             half_edges: dict[int, list[int]] = {}
-            for f in face_arr:
+            half_edge_group: dict[tuple[int, int], int] = {}
+            for f, g in zip(face_arr, group_ids):
                 f_list = list(f)
-                # Find V's index in this face
                 if V not in f_list:
                     continue
                 idx = f_list.index(V)
                 u = f_list[(idx + 1) % 3]
                 w = f_list[(idx + 2) % 3]
-                # Edge u -> w is the boundary edge of this face opposite V
                 half_edges.setdefault(u, []).append(w)
-            # Detect / require simple loop: each vertex u must appear exactly once
-            # as a source and exactly once as a target.
+                half_edge_group[(u, w)] = g
             sources = list(half_edges.keys())
             targets = [t for ts in half_edges.values() for t in ts]
             if len(sources) != len(targets):
@@ -315,12 +331,98 @@ def collapse_planar_vertices(
             loop = _order_polygon_loop(half_edges)
             if len(loop) < 3 or len(loop) != len(sources):
                 continue
-            # Project to 2D and triangulate
-            coords, _, _ = _vertex_ring_2d_proj(verts, loop, n0)
-            tris = _ear_clip_triangulate(coords, loop)
-            if len(tris) != len(loop) - 2:
-                # Degenerate; bail
-                continue
+
+            if num_groups == 1:
+                # Pure-planar case: triangulate the full polygon in 2D.
+                coords, _, _ = _vertex_ring_2d_proj(verts, loop, n0)
+                tris = _ear_clip_triangulate(coords, loop)
+                if len(tris) != len(loop) - 2:
+                    continue
+            else:
+                # Feature-edge case: 2 coplanar groups meeting at an edge
+                # through V. The polygon has two contiguous "arcs" — one in
+                # each plane — joined at V's feature-edge neighbors.
+                # Walk the loop and assign each edge to its face's group.
+                edge_groups: list[int] = []
+                for i in range(len(loop)):
+                    u = loop[i]
+                    w = loop[(i + 1) % len(loop)]
+                    g = half_edge_group.get((u, w))
+                    if g is None:
+                        edge_groups = []
+                        break
+                    edge_groups.append(g)
+                if len(edge_groups) != len(loop):
+                    continue
+                # Find the two transitions between groups (where consecutive
+                # edges differ in group). For a proper 2-group ring there
+                # are exactly 2 transitions.
+                transitions = [
+                    i for i in range(len(loop))
+                    if edge_groups[i] != edge_groups[(i - 1) % len(loop)]
+                ]
+                if len(transitions) != 2:
+                    continue
+                # Vertices at transitions are V's two feature-edge neighbors.
+                # The transition is on the loop edge (loop[i-1], loop[i]),
+                # so the feature-edge neighbor on this side is loop[i-1]'s
+                # successor going INTO group g... actually it's loop[transitions[k]-1]
+                # and the loop index itself depending on orientation. The
+                # straight-line check needs the two vertices that V connects
+                # to via feature edges in the mesh — these are exactly the
+                # loop vertices at the boundary between the two arcs.
+                # A transition at index i means the edge (loop[i], loop[(i+1)%n])
+                # is in a different group than the edge (loop[(i-1)%n], loop[i]).
+                # The vertex loop[i] is the "pivot" between groups — i.e.,
+                # the feature-edge neighbor of V in the mesh.
+                t0, t1 = transitions
+                n = len(loop)
+                fneigh_a = loop[t0]
+                fneigh_b = loop[t1]
+                pa = verts[fneigh_a]
+                pv = verts[V]
+                pb = verts[fneigh_b]
+                # Collinear if (pv - pa) × (pb - pv) ≈ 0
+                e1 = pv - pa
+                e2 = pb - pv
+                cross_vec = np.cross(e1, e2)
+                len1 = np.linalg.norm(e1)
+                len2 = np.linalg.norm(e2)
+                if len1 < 1e-12 or len2 < 1e-12:
+                    continue
+                if np.linalg.norm(cross_vec) > _COLLINEAR_TOL * max(len1, len2):
+                    continue
+                # Collinear → V is on a straight feature edge. Replace
+                # the 4 (or more) faces around V with two planar polygon
+                # triangulations, one per group, both sharing the
+                # straight edge (fneigh_a → fneigh_b).
+                #
+                # Arc1 = loop[t0 .. t1], polygon closed by the
+                #         straight edge fneigh_b -> fneigh_a.
+                # Arc2 = loop[t1 .. t0+n], polygon closed by the
+                #         straight edge fneigh_a -> fneigh_b.
+                #
+                # Each arc lies in a single plane (its group's normal),
+                # so each can be ear-clipped in 2D.
+                arc1 = [loop[i % n] for i in range(t0, t1 + 1)]
+                arc2 = [loop[i % n] for i in range(t1, t0 + n + 1)]
+                # Edge group at loop index i is for the OUTGOING edge
+                # loop[i] -> loop[(i+1) % n]. So arc1 covers edges with
+                # group edge_groups[t0], edge_groups[t0+1], …, edge_groups[t1-1].
+                g_arc1 = edge_groups[t0]
+                g_arc2 = edge_groups[t1]
+                norm1 = group_normals[g_arc1]
+                norm2 = group_normals[g_arc2]
+                if len(arc1) < 3 or len(arc2) < 3:
+                    continue
+                coords1, _, _ = _vertex_ring_2d_proj(verts, arc1, norm1)
+                tris1 = _ear_clip_triangulate(coords1, arc1)
+                coords2, _, _ = _vertex_ring_2d_proj(verts, arc2, norm2)
+                tris2 = _ear_clip_triangulate(coords2, arc2)
+                if (len(tris1) != len(arc1) - 2
+                        or len(tris2) != len(arc2) - 2):
+                    continue
+                tris = tris1 + tris2
             # Commit: remove V and its incident faces, add the new triangles
             for fi in face_idxs:
                 # Detach the face from its other vertices' incidence lists
