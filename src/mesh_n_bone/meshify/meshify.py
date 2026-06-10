@@ -852,7 +852,7 @@ class Meshify:
         num_lods: int = 4,
         lod_0_box_size=None,
         target_faces_per_lod0_chunk: int = 25_000,
-        downsample_method: str = "mode_suppress_zero",
+        downsample_method: str = "mode",
         multires_strategy: str = "downsample",
         decimation_factor: int = 6,
         decimation_aggressiveness: int = 7,
