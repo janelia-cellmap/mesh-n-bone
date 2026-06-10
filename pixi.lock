@@ -1392,6 +1392,7 @@ environments:
       - pypi: https://files.pythonhosted.org/packages/de/1f/77fa3081e4f66ca3576c896ae5d31c3002ac6607f9747d2e3aa49227e464/markdown-3.10.2-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/3c/2e/8d0c2ab90a8c1d9a24f0399058ab8519a3279d1bd4289511d74e909f060e/markupsafe-3.0.3-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/3a/cb/28ce52eb94390dda42599c98ea0204d74799e4d8047a0eb559b6fd648056/ml_dtypes-0.5.4-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl
+      - pypi: https://files.pythonhosted.org/packages/e5/e2/51ed62063b44d10b06d975ac87af287729eeb5e3ed9772f7584a17983e90/mmh3-5.2.1-cp312-cp312-manylinux1_x86_64.manylinux_2_28_x86_64.manylinux_2_5_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/65/92/a5100f7185a800a5d29f8d14041f61475b9de465ffcc0f3b9fba606e4505/msgpack-1.1.2-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/71/70/38998b950a97ea279e6bd657575d22d1a2047256caf707d9a10fbce4f065/multiprocess-0.70.19-py312-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/37/72/e61e3091e0e00fae9d3a8ef85ece9d2cd4b5966058e1f2901ce42679eebf/narwhals-2.19.0-py3-none-any.whl
@@ -1651,6 +1652,7 @@ environments:
       - pypi: https://files.pythonhosted.org/packages/de/1f/77fa3081e4f66ca3576c896ae5d31c3002ac6607f9747d2e3aa49227e464/markdown-3.10.2-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/9a/81/7e4e08678a1f98521201c3079f77db69fb552acd56067661f8c2f534a718/markupsafe-3.0.3-cp312-cp312-macosx_11_0_arm64.whl
       - pypi: https://files.pythonhosted.org/packages/a8/b8/3c70881695e056f8a32f8b941126cf78775d9a4d7feba8abcb52cb7b04f2/ml_dtypes-0.5.4-cp312-cp312-macosx_10_13_universal2.whl
+      - pypi: https://files.pythonhosted.org/packages/8b/72/e6d6602ce18adf4ddcd0e48f2e13590cc92a536199e52109f46f259d3c46/mmh3-5.2.1-cp312-cp312-macosx_11_0_arm64.whl
       - pypi: https://files.pythonhosted.org/packages/34/68/ba4f155f793a74c1483d4bdef136e1023f7bcba557f0db4ef3db3c665cf1/msgpack-1.1.2-cp312-cp312-macosx_11_0_arm64.whl
       - pypi: https://files.pythonhosted.org/packages/71/70/38998b950a97ea279e6bd657575d22d1a2047256caf707d9a10fbce4f065/multiprocess-0.70.19-py312-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/37/72/e61e3091e0e00fae9d3a8ef85ece9d2cd4b5966058e1f2901ce42679eebf/narwhals-2.19.0-py3-none-any.whl
@@ -6136,6 +6138,52 @@ packages:
   - pylint>=2.6.0 ; extra == 'dev'
   - pyink ; extra == 'dev'
   requires_python: '>=3.9'
+- pypi: https://files.pythonhosted.org/packages/8b/72/e6d6602ce18adf4ddcd0e48f2e13590cc92a536199e52109f46f259d3c46/mmh3-5.2.1-cp312-cp312-macosx_11_0_arm64.whl
+  name: mmh3
+  version: 5.2.1
+  sha256: eee884572b06bbe8a2b54f424dbd996139442cf83c76478e1ec162512e0dd2c7
+  requires_dist:
+  - pytest==9.0.2 ; extra == 'test'
+  - pytest-sugar==1.1.1 ; extra == 'test'
+  - actionlint-py==1.7.11.24 ; extra == 'lint'
+  - clang-format==22.1.0 ; extra == 'lint'
+  - codespell==2.4.1 ; extra == 'lint'
+  - pylint==4.0.5 ; extra == 'lint'
+  - ruff==0.15.4 ; extra == 'lint'
+  - mypy==1.19.1 ; extra == 'type'
+  - myst-parser==5.0.0 ; extra == 'docs'
+  - shibuya==2026.1.9 ; extra == 'docs'
+  - sphinx==8.2.3 ; extra == 'docs'
+  - sphinx-copybutton==0.5.2 ; extra == 'docs'
+  - pymmh3==0.0.5 ; extra == 'benchmark'
+  - pyperf==2.10.0 ; extra == 'benchmark'
+  - xxhash==3.6.0 ; extra == 'benchmark'
+  - matplotlib==3.10.8 ; extra == 'plot'
+  - pandas==3.0.1 ; extra == 'plot'
+  requires_python: '>=3.10'
+- pypi: https://files.pythonhosted.org/packages/e5/e2/51ed62063b44d10b06d975ac87af287729eeb5e3ed9772f7584a17983e90/mmh3-5.2.1-cp312-cp312-manylinux1_x86_64.manylinux_2_28_x86_64.manylinux_2_5_x86_64.whl
+  name: mmh3
+  version: 5.2.1
+  sha256: 8e6c219e375f6341d0959af814296372d265a8ca1af63825f65e2e87c618f006
+  requires_dist:
+  - pytest==9.0.2 ; extra == 'test'
+  - pytest-sugar==1.1.1 ; extra == 'test'
+  - actionlint-py==1.7.11.24 ; extra == 'lint'
+  - clang-format==22.1.0 ; extra == 'lint'
+  - codespell==2.4.1 ; extra == 'lint'
+  - pylint==4.0.5 ; extra == 'lint'
+  - ruff==0.15.4 ; extra == 'lint'
+  - mypy==1.19.1 ; extra == 'type'
+  - myst-parser==5.0.0 ; extra == 'docs'
+  - shibuya==2026.1.9 ; extra == 'docs'
+  - sphinx==8.2.3 ; extra == 'docs'
+  - sphinx-copybutton==0.5.2 ; extra == 'docs'
+  - pymmh3==0.0.5 ; extra == 'benchmark'
+  - pyperf==2.10.0 ; extra == 'benchmark'
+  - xxhash==3.6.0 ; extra == 'benchmark'
+  - matplotlib==3.10.8 ; extra == 'plot'
+  - pandas==3.0.1 ; extra == 'plot'
+  requires_python: '>=3.10'
 - conda: https://conda.anaconda.org/conda-forge/linux-64/mpfr-4.2.2-he0a73b1_0.conda
   sha256: 8690f550a780f75d9c47f7ffc15f5ff1c149d36ac17208e50eda101ca16611b9
   md5: 85ce2ffa51ab21da5efa4a9edc5946aa

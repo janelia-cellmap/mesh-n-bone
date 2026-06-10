@@ -629,3 +629,66 @@ class TestClipPlaneDuplicateMerge:
         assert at_plane_after.sum() == len(unique_after), (
             "All duplicate vertices at the split plane should be merged"
         )
+
+
+class TestPerLodTargetReduction:
+    """The per-LOD target_reduction formula used by the downsample multires
+    strategy. Anchored on hemibrain face counts for seg 488231898: at
+    target_reduction=0.933 / 16nm input / decimation_factor=6, the formula
+    must yield reductions that produce a constant 6x face-count drop per LOD."""
+
+    def _make_meshify(self, target_reduction=0.933, decimation_factor=6):
+        from unittest.mock import MagicMock
+        from mesh_n_bone.meshify.meshify import Meshify
+        m = MagicMock(spec=Meshify)
+        m.target_reduction = target_reduction
+        m.decimation_factor = decimation_factor
+        m._per_lod_target_reduction = (
+            Meshify._per_lod_target_reduction.__get__(m, Meshify)
+        )
+        return m
+
+    def test_lod_0_equals_input_target_reduction(self):
+        m = self._make_meshify(target_reduction=0.933)
+        assert m._per_lod_target_reduction(0) == pytest.approx(0.933, abs=1e-9)
+
+    def test_lod_k_yields_constant_6x_face_drop(self):
+        """For decimation_factor=6, face count at LOD k+1 should be 1/6 of
+        LOD k's face count, given raw MC drops by 4x per scale step."""
+        m = self._make_meshify(target_reduction=0.933, decimation_factor=6)
+        raw_mc_0 = 76_500_000
+        prev_faces = raw_mc_0 * (1 - m._per_lod_target_reduction(0))
+        for k in range(1, 4):
+            raw_mc_k = raw_mc_0 / (4 ** k)
+            faces_k = raw_mc_k * (1 - m._per_lod_target_reduction(k))
+            ratio = prev_faces / faces_k
+            assert ratio == pytest.approx(6.0, rel=1e-6), (
+                f"LOD {k-1}->{k} face ratio should be 6, got {ratio}"
+            )
+            prev_faces = faces_k
+
+    def test_decimation_factor_4_yields_no_extra_reduction(self):
+        """When decimation_factor == 4 (= raw MC scaling per LOD), the
+        per-LOD reduction is constant (no extra decimation needed)."""
+        m = self._make_meshify(target_reduction=0.9, decimation_factor=4)
+        for k in range(4):
+            assert m._per_lod_target_reduction(k) == pytest.approx(0.9, abs=1e-9)
+
+    def test_hemibrain_anchor_values(self):
+        """Formula values at the hemibrain-match config land within ~35%
+        of the per-LOD values computed directly from hemibrain's measured
+        face counts (hemibrain's per-LOD ratio isn't exactly 6 — varies
+        5.13-7.14, hence the slack)."""
+        m = self._make_meshify(target_reduction=0.933, decimation_factor=6)
+        hb_faces = [5_219_990, 730_941, 119_321, 23_259]
+        raw_mc_0 = 76_500_000
+        for k in range(4):
+            raw_k = raw_mc_0 / (4 ** k)
+            tr_formula = m._per_lod_target_reduction(k)
+            keep_formula = 1 - tr_formula
+            faces_formula = raw_k * keep_formula
+            ratio = faces_formula / hb_faces[k]
+            assert 0.7 < ratio < 1.35, (
+                f"LOD {k}: formula {faces_formula:.0f} vs hemibrain "
+                f"{hb_faces[k]} (ratio {ratio:.2f}) out of expected band"
+            )
