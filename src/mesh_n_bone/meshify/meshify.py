@@ -796,13 +796,30 @@ class Meshify:
     lod_0_box_size : array-like or None
         Chunk box size for LOD 0. ``None`` for auto-computation.
     downsample_method : str
-        Downsampling method: ``"mode_suppress_zero"``,
-        ``"mode"``, or ``"binary"``.
+        Downsampling method for in-worker volume downsampling:
+        ``"mode"`` (majority-label voting, default), ``"mode_suppress_zero"``
+        (mode that ignores background voxels — keeps thin segments
+        visible at coarse LODs but inflates their apparent extent),
+        ``"binary"``, or ``"nearest"`` (stride).
     multires_strategy : str
-        Strategy for generating LODs: ``"decimate"`` (simplify s0
-        meshes) or ``"downsample"`` (re-mesh at lower resolutions).
+        Strategy for generating LODs (default ``"downsample"``):
+          - ``"decimate"``: mesh s0 once, face-decimate that mesh for
+            higher LODs by ``decimation_factor`` per LOD.
+          - ``"downsample"``: mesh each LOD from a coarser volume,
+            preferring pre-existing OME-NGFF multiscale levels when
+            available; otherwise downsampling in-worker via
+            ``downsample_method``. Each LOD's effective
+            ``target_reduction`` is auto-computed so the per-LOD face
+            count drops by ``decimation_factor`` (4x raw-MC drop from
+            voxel doubling, plus ``4 / decimation_factor`` extra
+            decimation per LOD). Default — produces hemibrain-density
+            face counts when paired with the matched ``target_reduction``
+            and ``decimation_factor`` defaults.
     decimation_factor : int
-        Face-count reduction factor between consecutive LODs.
+        Per-LOD face-count reduction factor (default 6, hemibrain-matched).
+        In the decimate strategy it's the literal ratio between
+        consecutive LODs. In the downsample strategy it's the target
+        per-LOD ratio used to derive each LOD's ``target_reduction``.
     decimation_aggressiveness : int
         Aggressiveness for pyfqmr decimation across LODs.
     delete_decimated_meshes : bool
