@@ -123,13 +123,15 @@ num_lods: 4                      # Number of levels of detail (default: 4)
 multires_strategy: downsample    # LOD strategy: decimate (face-decimate s0 mesh for higher LODs) or
                                  # downsample (re-mesh from progressively downsampled volumes,
                                  # better-looking coarse LODs) (default: downsample)
-# IMPORTANT: in the downsample strategy, the volume is downsampled in-memory by
-# the worker using `downsample_method` — pre-existing multiscale levels in the
-# input zarr (s1, s2, ...) are NOT read for higher LODs. The whole multires
-# pyramid is built from the single `input_path` you supply. If you'd rather mesh
-# from a pre-computed coarse scale (e.g. hemibrain's `s2` at 32 nm), point
-# `input_path` directly at that scale — but then *that* scale becomes LOD 0 and
-# all coarser LODs are built by further downsampling it.
+# In the downsample strategy, each LOD prefers a pre-existing OME-NGFF
+# multiscale level when one matches the required factor. For example, if
+# input_path is `.../seg/s0` and the parent group exposes `s0`, `s1`, `s2`,
+# then LOD 0 reads s0, LOD 1 reads s1 directly, LOD 2 reads s2 directly,
+# and only LODs without a matching pre-built scale fall back to
+# downsample_method-based in-worker downsampling. This is automatic — no
+# extra config needed beyond having OME-NGFF multiscales metadata on the
+# input zarr. For precomputed sources or zarrs without multiscales,
+# every LOD downsamples in-worker via `downsample_method`.
 decimation_factor: 6             # Per-LOD face reduction factor. In decimate strategy: literal ratio
                                  # between LODs. In downsample strategy: target ratio used to derive
                                  # per-LOD target_reduction so the LOD-to-LOD face count drops by this

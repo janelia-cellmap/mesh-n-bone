@@ -1812,7 +1812,8 @@ class Meshify:
         shutil.rmtree(dirname)
 
     def _generate_meshes_at_scale(self, output_mesh_dir, downsample_factor=None,
-                                   target_reduction_override=None):
+                                   target_reduction_override=None,
+                                   input_dataset_path=None):
         """Generate meshes at a given downsampling level, writing PLYs to output_mesh_dir.
 
         This creates a temporary Meshify-like pipeline that:
@@ -1823,6 +1824,13 @@ class Meshify:
         ``target_reduction_override`` lets the caller swap in a per-LOD
         reduction value for this run (used by the downsample multires
         strategy so each LOD lands at hemibrain-equivalent face count).
+
+        ``input_dataset_path`` lets the caller point at a different
+        OME-NGFF multiscale level for this LOD (e.g. read ``.../s2``
+        directly instead of downsampling ``.../s0`` by 4 in-worker).
+        When this is given, ``downsample_factor`` should typically be 1
+        (or omitted) since the source is already at the desired
+        resolution.
         """
         # Save/restore state so we can temporarily override output + downsample
         orig_output = self.output_directory
@@ -1832,6 +1840,12 @@ class Meshify:
         orig_do_legacy = self.do_legacy_neuroglancer
         orig_do_singleres = self.do_singleres_multires_neuroglancer
         orig_target_reduction = self.target_reduction
+        orig_seg_array = self.segmentation_array
+        orig_dataset_path = self._dataset_path
+        orig_input_path = self.input_path
+        orig_base_voxel = self.base_voxel_size_funlib
+        orig_true_offset = self.true_offset.copy()
+        orig_roi = self.roi
 
         try:
             # Override to write PLYs (not neuroglancer format) to the scale dir
@@ -1839,7 +1853,38 @@ class Meshify:
             self.do_legacy_neuroglancer = False
             self.do_singleres_multires_neuroglancer = False
 
-            if downsample_factor is not None:
+            if input_dataset_path is not None:
+                # Swap to a pre-existing multiscale level. Reads that
+                # dataset directly — no in-worker downsampling.
+                from mesh_n_bone.util.zarr_io import (
+                    open_dataset, split_dataset_path,
+                    read_raw_voxel_size, read_raw_offset,
+                )
+                f_name, d_name = split_dataset_path(input_dataset_path)
+                new_arr = open_dataset(f_name, d_name)
+                self.segmentation_array = new_arr
+                self._dataset_path = (
+                    getattr(new_arr, "_dataset_path", None) or input_dataset_path
+                )
+                self.input_path = input_dataset_path
+                self.base_voxel_size_funlib = new_arr.voxel_size
+                self.output_voxel_size_funlib = new_arr.voxel_size
+                # Prefer OME-NGFF fractional precision when available
+                ome_vs, ome_off, _ = _read_ome_ngff_transform(input_dataset_path)
+                self.true_voxel_size = (
+                    np.array(ome_vs, dtype=float) if ome_vs is not None
+                    else np.array(read_raw_voxel_size(new_arr), dtype=float)
+                )
+                self.true_offset = (
+                    np.array(ome_off, dtype=float) if ome_off is not None
+                    else np.array(read_raw_offset(new_arr), dtype=float)
+                )
+                self.downsample_factor = None
+                # Refresh ROI when we didn't have a custom one. For a
+                # custom ROI we keep the user-specified world bbox.
+                if not self.has_custom_roi:
+                    self.roi = new_arr.roi
+            elif downsample_factor is not None:
                 self.downsample_factor = downsample_factor
                 self.output_voxel_size_funlib = Coordinate(
                     np.array(self.base_voxel_size_funlib) * downsample_factor
@@ -1863,6 +1908,81 @@ class Meshify:
             self.do_legacy_neuroglancer = orig_do_legacy
             self.do_singleres_multires_neuroglancer = orig_do_singleres
             self.target_reduction = orig_target_reduction
+            self.segmentation_array = orig_seg_array
+            self._dataset_path = orig_dataset_path
+            self.input_path = orig_input_path
+            self.base_voxel_size_funlib = orig_base_voxel
+            self.true_offset = orig_true_offset
+            self.roi = orig_roi
+
+    def _discover_existing_scales(self):
+        """Return ``{relative_downsample_factor: dataset_path}`` for OME-NGFF
+        multiscale levels available in the input zarr, relative to the
+        input dataset's own scale.
+
+        For example, if ``input_path`` is ``.../seg/s0`` (scale=[1,1,1])
+        and the group exposes s0..s3, this returns ``{1: '...s0', 2:
+        '...s1', 4: '...s2', 8: '...s3'}``. If the input is already s1,
+        the same group gives ``{1: '...s1', 2: '...s2', 4: '...s3'}``
+        (s0 is finer than input → not useful for a downsample pyramid).
+
+        Cached after first call. Returns ``{}`` when the input has no
+        recognisable multiscales metadata (precomputed sources, plain
+        zarr arrays without OME, etc.) — caller should fall back to
+        in-worker downsampling.
+        """
+        if hasattr(self, "_existing_scales_cache"):
+            return self._existing_scales_cache
+
+        result = {}
+        try:
+            from mesh_n_bone.util.zarr_io import (
+                _get_multiscales,
+                _extract_ome_scale_translation,
+                _read_parent_attrs,
+                _path_join,
+                _path_dirname,
+                _path_basename,
+            )
+            parent_attrs = _read_parent_attrs(self.segmentation_array)
+            multiscales = _get_multiscales(parent_attrs)
+            if multiscales and isinstance(multiscales, list) and multiscales:
+                ms = multiscales[0]
+                input_ds_name = _path_basename(self._dataset_path)
+                input_scale, _ = _extract_ome_scale_translation(
+                    parent_attrs, dataset_name=input_ds_name,
+                )
+                if input_scale is not None and all(s > 0 for s in input_scale):
+                    parent_path = _path_dirname(self._dataset_path)
+                    for ds in ms.get("datasets", []) or []:
+                        ds_name = ds.get("path")
+                        if not ds_name:
+                            continue
+                        ds_scale, _ = _extract_ome_scale_translation(
+                            parent_attrs, dataset_name=ds_name,
+                        )
+                        if ds_scale is None:
+                            continue
+                        ratios = [d / i for d, i in zip(ds_scale, input_scale)]
+                        if not all(abs(r - ratios[0]) < 1e-6 for r in ratios):
+                            continue
+                        ratio = ratios[0]
+                        if ratio < 1.0 - 1e-6:
+                            continue
+                        ratio_int = int(round(ratio))
+                        if abs(ratio - ratio_int) > 1e-6:
+                            continue
+                        if ratio_int < 1 or (ratio_int & (ratio_int - 1)) != 0:
+                            continue
+                        result[ratio_int] = _path_join(parent_path, ds_name)
+        except Exception as e:
+            logger.warning(
+                "Could not discover existing multiscale levels (%s); "
+                "falling back to in-worker downsampling for all LODs.", e,
+            )
+
+        self._existing_scales_cache = result
+        return result
 
     def _per_lod_target_reduction(self, lod: int) -> float:
         """Per-LOD target_reduction for the downsample multires strategy.
@@ -2116,19 +2236,45 @@ class Meshify:
         constant ``decimation_factor`` ratio between consecutive LODs
         (default 6 for hemibrain). LOD 0 uses the configured
         ``target_reduction`` unchanged.
+
+        If the input zarr exposes OME-NGFF multiscales metadata, each
+        LOD prefers reading from the matching pre-existing scale (e.g.
+        ``s_k`` for LOD k) rather than downsampling the input in-worker.
+        Falls back to in-worker downsampling per-LOD when no matching
+        scale exists.
         """
+        existing_scales = self._discover_existing_scales()
+        base_ds = self.downsample_factor or 1
         for lod in lods:
             scale_dir = f"{mesh_lods_dir}/s{lod}"
-            ds_factor = (self.downsample_factor if lod == 0
-                         else self._get_downsample_factor_for_lod(lod))
+            target_factor = 2 ** lod
             tr_lod = self._per_lod_target_reduction(lod)
-            logger.info(
-                f"Generating meshes at LOD {lod} "
-                f"(downsample factor {ds_factor}, target_reduction {tr_lod:.4f})"
-            )
-            self._generate_meshes_at_scale(
-                scale_dir, ds_factor, target_reduction_override=tr_lod,
-            )
+
+            existing_path = existing_scales.get(target_factor)
+            if existing_path is not None and base_ds == 1:
+                # Read directly from a pre-computed scale; no in-worker downsample
+                logger.info(
+                    f"Generating meshes at LOD {lod} "
+                    f"(reading existing scale {existing_path}, "
+                    f"target_reduction {tr_lod:.4f})"
+                )
+                self._generate_meshes_at_scale(
+                    scale_dir,
+                    target_reduction_override=tr_lod,
+                    input_dataset_path=existing_path,
+                )
+            else:
+                # Fall back to in-worker downsampling of the input volume
+                ds_factor = (self.downsample_factor if lod == 0
+                             else self._get_downsample_factor_for_lod(lod))
+                logger.info(
+                    f"Generating meshes at LOD {lod} "
+                    f"(downsample factor {ds_factor}, "
+                    f"target_reduction {tr_lod:.4f})"
+                )
+                self._generate_meshes_at_scale(
+                    scale_dir, ds_factor, target_reduction_override=tr_lod,
+                )
 
             # Move meshes from s{lod}/meshes/ up to s{lod}/
             scale_mesh_subdir = f"{scale_dir}/meshes"
