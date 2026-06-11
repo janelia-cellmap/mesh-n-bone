@@ -280,6 +280,239 @@ class TestMeshifyWithDownsampling:
         assert mesh.volume > 0
 
 
+class TestMeshifyDownsampleStrategyExistingScales:
+    """When the input zarr has OME-NGFF multiscales metadata exposing
+    pre-computed coarser scales (s1, s2, ...), the downsample multires
+    strategy should read directly from those scales instead of
+    redundantly downsampling the input in-worker."""
+
+    @staticmethod
+    def _create_multiscale_zarr(tmpdir, base_voxel_size=(8, 8, 8), num_levels=3):
+        """Write a zarr v3 group with OME-NGFF multiscales metadata and
+        pre-computed s0..s{num_levels-1} arrays."""
+        import json
+        import tensorstore as ts
+
+        zarr_path = os.path.join(tmpdir, "multiscale.zarr")
+        os.makedirs(zarr_path, exist_ok=True)
+        # Generate s0 volume (binary sphere) and progressively downsampled levels
+        N = 64
+        vol = np.zeros((N, N, N), dtype=np.uint8)
+        zz, yy, xx = np.indices(vol.shape) - N // 2
+        vol[(xx*xx + yy*yy + zz*zz) < 24*24] = 1
+
+        datasets = []
+        for level in range(num_levels):
+            f = 2 ** level
+            ds_name = f"s{level}"
+            if level == 0:
+                lvl_vol = vol
+            else:
+                # Strided downsample (preserves segment, simpler than mode for test)
+                lvl_vol = vol[::f, ::f, ::f].copy()
+            ds_dir = os.path.join(zarr_path, ds_name)
+            os.makedirs(ds_dir, exist_ok=True)
+            arr = ts.open({
+                "driver": "zarr3",
+                "kvstore": {"driver": "file", "path": ds_dir},
+                "metadata": {
+                    "shape": list(lvl_vol.shape),
+                    "data_type": "uint8",
+                    "chunk_grid": {
+                        "name": "regular",
+                        "configuration": {"chunk_shape": [16, 16, 16]},
+                    },
+                },
+                "create": True, "delete_existing": True,
+            }).result()
+            arr.write(lvl_vol).result()
+            datasets.append({
+                "path": ds_name,
+                "coordinateTransformations": [
+                    {"type": "scale", "scale": [
+                        base_voxel_size[0] * f,
+                        base_voxel_size[1] * f,
+                        base_voxel_size[2] * f,
+                    ]},
+                ],
+            })
+
+        with open(os.path.join(zarr_path, "zarr.json"), "w") as f:
+            json.dump({
+                "zarr_format": 3,
+                "node_type": "group",
+                "attributes": {
+                    "multiscales": [{
+                        "version": "0.5",
+                        "axes": [
+                            {"name": "z", "type": "space", "unit": "nanometer"},
+                            {"name": "y", "type": "space", "unit": "nanometer"},
+                            {"name": "x", "type": "space", "unit": "nanometer"},
+                        ],
+                        "datasets": datasets,
+                    }],
+                },
+            }, f)
+        return f"{zarr_path}/s0", zarr_path
+
+    def test_discover_existing_scales_finds_pre_computed_levels(self, tmp_output_dir):
+        """_discover_existing_scales returns {1: s0, 2: s1, 4: s2}
+        when input is s0 of a 3-level multiscale group."""
+        s0_path, _ = self._create_multiscale_zarr(tmp_output_dir, num_levels=3)
+        output_dir = os.path.join(tmp_output_dir, "out_discover")
+        m = Meshify(
+            input_path=s0_path,
+            output_directory=output_dir,
+            num_workers=1,
+            do_multires=False,
+            check_mesh_validity=False,
+            do_analysis=False,
+            do_simplification=False,
+        )
+        scales = m._discover_existing_scales()
+        assert set(scales.keys()) == {1, 2, 4}, (
+            f"Expected factors 1,2,4 but got {sorted(scales.keys())}"
+        )
+        for factor, path in scales.items():
+            assert path.endswith(f"s{factor.bit_length() - 1}"), (
+                f"Factor {factor} mapped to wrong path {path}"
+            )
+
+    def test_discover_returns_empty_for_non_multiscale_input(self, tmp_output_dir):
+        """Input zarr without OME-NGFF multiscales metadata yields {}."""
+        vol = np.zeros((32, 32, 32), dtype=np.uint64)
+        vol[2:30, 2:30, 2:30] = 1
+        input_path = _create_zarr_volume(tmp_output_dir, vol)
+        m = Meshify(
+            input_path=input_path,
+            output_directory=os.path.join(tmp_output_dir, "out_no_ms"),
+            num_workers=1,
+            do_multires=False,
+            check_mesh_validity=False,
+            do_analysis=False,
+            do_simplification=False,
+        )
+        assert m._discover_existing_scales() == {}
+
+    def test_downsample_strategy_reads_existing_scales(self, tmp_output_dir):
+        """End-to-end: when meshing with multires_strategy='downsample'
+        on a multiscale input, the per-LOD log lines should mention the
+        pre-existing s_k path being read directly — not 'downsample
+        factor N' in-worker. Captured by patching _generate_meshes_at_scale
+        to record what each LOD was called with."""
+        s0_path, _ = self._create_multiscale_zarr(tmp_output_dir, num_levels=3)
+        output_dir = os.path.join(tmp_output_dir, "out_downsample")
+        m = Meshify(
+            input_path=s0_path,
+            output_directory=output_dir,
+            num_workers=1,
+            do_multires=True,
+            num_lods=3,
+            multires_strategy="downsample",
+            target_faces_per_lod0_chunk=200,
+            check_mesh_validity=False,
+            do_analysis=False,
+            do_simplification=True,
+        )
+
+        # Record per-LOD inputs to _generate_meshes_at_scale
+        calls = []
+        orig = m._generate_meshes_at_scale.__func__
+        def _spy(self_, output_mesh_dir, downsample_factor=None,
+                  target_reduction_override=None, input_dataset_path=None):
+            calls.append({
+                "output_mesh_dir": output_mesh_dir,
+                "downsample_factor": downsample_factor,
+                "input_dataset_path": input_dataset_path,
+                "target_reduction_override": target_reduction_override,
+            })
+            return orig(self_, output_mesh_dir,
+                         downsample_factor=downsample_factor,
+                         target_reduction_override=target_reduction_override,
+                         input_dataset_path=input_dataset_path)
+        m._generate_meshes_at_scale = _spy.__get__(m, Meshify)
+
+        m.get_meshes()
+
+        # Each LOD should have been called with input_dataset_path pointing
+        # to the matching pre-existing scale, NOT with a downsample_factor.
+        assert len(calls) == 3, f"Expected 3 LOD calls, got {len(calls)}"
+        for k, call in enumerate(calls):
+            assert call["input_dataset_path"] is not None, (
+                f"LOD {k} did NOT use pre-existing scale (called with "
+                f"downsample_factor={call['downsample_factor']})"
+            )
+            assert call["input_dataset_path"].endswith(f"s{k}"), (
+                f"LOD {k} read from {call['input_dataset_path']}, expected s{k}"
+            )
+            assert call["downsample_factor"] is None, (
+                f"LOD {k} should have downsample_factor=None when reading "
+                f"existing scale; got {call['downsample_factor']}"
+            )
+
+
+class TestMeshifyDownsampleStrategyOverride:
+    """The use_existing_scales=False override forces in-worker
+    downsampling at every LOD, even when matching pre-built scales
+    exist on the input zarr."""
+
+    def test_override_forces_in_worker_downsampling(self, tmp_output_dir):
+        from tests.test_integration_meshify import TestMeshifyDownsampleStrategyExistingScales as Helper
+        s0_path, _ = Helper._create_multiscale_zarr(tmp_output_dir, num_levels=3)
+        output_dir = os.path.join(tmp_output_dir, "out_override")
+        m = Meshify(
+            input_path=s0_path,
+            output_directory=output_dir,
+            num_workers=1,
+            do_multires=True,
+            num_lods=3,
+            multires_strategy="downsample",
+            use_existing_scales=False,   # <-- force in-worker downsample
+            target_faces_per_lod0_chunk=200,
+            check_mesh_validity=False,
+            do_analysis=False,
+            do_simplification=True,
+        )
+
+        # Spy on per-LOD calls
+        calls = []
+        orig = m._generate_meshes_at_scale.__func__
+        def _spy(self_, output_mesh_dir, downsample_factor=None,
+                  target_reduction_override=None, input_dataset_path=None):
+            calls.append({
+                "downsample_factor": downsample_factor,
+                "input_dataset_path": input_dataset_path,
+            })
+            return orig(self_, output_mesh_dir,
+                         downsample_factor=downsample_factor,
+                         target_reduction_override=target_reduction_override,
+                         input_dataset_path=input_dataset_path)
+        m._generate_meshes_at_scale = _spy.__get__(m, Meshify)
+
+        m.get_meshes()
+
+        # Every LOD should use downsample_factor (in-worker), never
+        # input_dataset_path (existing scale).
+        assert len(calls) == 3
+        for k, call in enumerate(calls):
+            assert call["input_dataset_path"] is None, (
+                f"LOD {k} read from {call['input_dataset_path']} despite "
+                f"use_existing_scales=False"
+            )
+            # LOD 0 uses self.downsample_factor (None by default = no extra DS).
+            # Higher LODs apply 2^k.
+            if k == 0:
+                assert call["downsample_factor"] in (None, 1), (
+                    f"LOD 0 downsample_factor={call['downsample_factor']}, "
+                    "expected None or 1"
+                )
+            else:
+                assert call["downsample_factor"] == 2 ** k, (
+                    f"LOD {k} downsample_factor={call['downsample_factor']}, "
+                    f"expected {2 ** k}"
+                )
+
+
 class TestMeshifyNeuroglancerOutput:
     """Test neuroglancer format output from meshify."""
 
