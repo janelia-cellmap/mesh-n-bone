@@ -93,12 +93,12 @@ output_directory: /path/to/output            # Where to write output meshes
 
 # ── Mesh generation ──
 downsample_factor: 2             # Downsample volume by this factor before meshing (default: none)
-downsample_method: mode          # Downsampling method: mode, mode_suppress_zero, or binary (default: mode_suppress_zero)
+downsample_method: mode          # Downsampling method: mode, mode_suppress_zero, or binary (default: mode)
 
 # ── Simplification & smoothing ──
 do_simplification: true          # Simplify meshes after assembly (default: true)
-target_reduction: 0.99           # Total fraction of faces to remove (default: 0.99)
-n_smoothing_iter: 10             # Taubin smoothing iterations (default: 10)
+target_reduction: 0.933          # Total fraction of faces to remove (default: 0.933, hemibrain-matched)
+n_smoothing_iter: 2              # Taubin smoothing iterations (default: 2)
 check_mesh_validity: false       # Require watertight meshes (default: true; disable for ROI)
 # When smooth_before_simplify is true (default), Taubin smoothing runs on the
 # DENSE assembled mesh first, then quadric decimation collapses the smooth
@@ -119,9 +119,14 @@ do_analysis: false               # Compute mesh metrics CSV (default: true)
 
 # ── Multiresolution output ──
 do_multires: true                # Also generate neuroglancer multilod_draco output (default: false)
-num_lods: 3                      # Number of levels of detail (default: 3)
-multires_strategy: decimate      # LOD strategy: decimate or downsample (default: decimate)
-decimation_factor: 4             # Face reduction factor per LOD (default: 4)
+num_lods: 4                      # Number of levels of detail (default: 4)
+multires_strategy: downsample    # LOD strategy: decimate (face-decimate s0 mesh for higher LODs) or
+                                 # downsample (re-mesh from progressively downsampled volumes,
+                                 # better-looking coarse LODs) (default: downsample)
+decimation_factor: 6             # Per-LOD face reduction factor. In decimate strategy: literal ratio
+                                 # between LODs. In downsample strategy: target ratio used to derive
+                                 # per-LOD target_reduction so the LOD-to-LOD face count drops by this
+                                 # factor. (default: 6, hemibrain-matched)
 delete_decimated_meshes: true    # Remove intermediate LOD mesh files (default: true)
 
 # ── Sharded output (recommended for thousands of meshes) ──
