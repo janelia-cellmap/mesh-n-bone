@@ -807,14 +807,24 @@ class Meshify:
             higher LODs by ``decimation_factor`` per LOD.
           - ``"downsample"``: mesh each LOD from a coarser volume,
             preferring pre-existing OME-NGFF multiscale levels when
-            available; otherwise downsampling in-worker via
-            ``downsample_method``. Each LOD's effective
-            ``target_reduction`` is auto-computed so the per-LOD face
-            count drops by ``decimation_factor`` (4x raw-MC drop from
-            voxel doubling, plus ``4 / decimation_factor`` extra
-            decimation per LOD). Default — produces hemibrain-density
-            face counts when paired with the matched ``target_reduction``
-            and ``decimation_factor`` defaults.
+            available (see ``use_existing_scales``); otherwise
+            downsampling in-worker via ``downsample_method``. Each
+            LOD's effective ``target_reduction`` is auto-computed so
+            the per-LOD face count drops by ``decimation_factor``
+            (4x raw-MC drop from voxel doubling, plus
+            ``4 / decimation_factor`` extra decimation per LOD).
+            Default — produces hemibrain-density face counts when
+            paired with the matched ``target_reduction`` and
+            ``decimation_factor`` defaults.
+    use_existing_scales : bool
+        When ``True`` (default) and ``multires_strategy="downsample"``,
+        each LOD prefers reading the matching pre-existing OME-NGFF
+        multiscale level (``s_k``) over re-downsampling the input
+        in-worker. Set ``False`` to force every LOD to downsample the
+        input via ``downsample_method`` instead — useful when the
+        dataset's own downsampling is poor quality or you want
+        consistent ``mode_suppress_zero`` behavior at every LOD that the
+        source's pre-built scales weren't built with.
     decimation_factor : int
         Per-LOD face-count reduction factor (default 6, hemibrain-matched).
         In the decimate strategy it's the literal ratio between
@@ -871,6 +881,7 @@ class Meshify:
         target_faces_per_lod0_chunk: int = 25_000,
         downsample_method: str = "mode",
         multires_strategy: str = "downsample",
+        use_existing_scales: bool = True,
         decimation_factor: int = 6,
         decimation_aggressiveness: int = 7,
         delete_decimated_meshes: bool = True,
@@ -1043,6 +1054,7 @@ class Meshify:
         self.downsample_method = downsample_method
         self.input_path = input_path
         self.multires_strategy = multires_strategy
+        self.use_existing_scales = use_existing_scales
         self.decimation_factor = decimation_factor
         self.decimation_aggressiveness = decimation_aggressiveness
         self.delete_decimated_meshes = delete_decimated_meshes
@@ -2260,7 +2272,9 @@ class Meshify:
         Falls back to in-worker downsampling per-LOD when no matching
         scale exists.
         """
-        existing_scales = self._discover_existing_scales()
+        existing_scales = (
+            self._discover_existing_scales() if self.use_existing_scales else {}
+        )
         base_ds = self.downsample_factor or 1
         for lod in lods:
             scale_dir = f"{mesh_lods_dir}/s{lod}"

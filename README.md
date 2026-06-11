@@ -132,6 +132,11 @@ multires_strategy: downsample    # LOD strategy: decimate (face-decimate s0 mesh
 # extra config needed beyond having OME-NGFF multiscales metadata on the
 # input zarr. For precomputed sources or zarrs without multiscales,
 # every LOD downsamples in-worker via `downsample_method`.
+use_existing_scales: true        # Set false to FORCE in-worker downsampling at every LOD,
+                                 # ignoring any pre-built s_k scales on the input zarr. Use
+                                 # when you don't trust the source's downsampling and want
+                                 # consistent `downsample_method` behavior at every LOD.
+                                 # (default: true)
 decimation_factor: 6             # Per-LOD face reduction factor. In decimate strategy: literal ratio
                                  # between LODs. In downsample strategy: target ratio used to derive
                                  # per-LOD target_reduction so the LOD-to-LOD face count drops by this

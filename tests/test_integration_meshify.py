@@ -451,6 +451,68 @@ class TestMeshifyDownsampleStrategyExistingScales:
             )
 
 
+class TestMeshifyDownsampleStrategyOverride:
+    """The use_existing_scales=False override forces in-worker
+    downsampling at every LOD, even when matching pre-built scales
+    exist on the input zarr."""
+
+    def test_override_forces_in_worker_downsampling(self, tmp_output_dir):
+        from tests.test_integration_meshify import TestMeshifyDownsampleStrategyExistingScales as Helper
+        s0_path, _ = Helper._create_multiscale_zarr(tmp_output_dir, num_levels=3)
+        output_dir = os.path.join(tmp_output_dir, "out_override")
+        m = Meshify(
+            input_path=s0_path,
+            output_directory=output_dir,
+            num_workers=1,
+            do_multires=True,
+            num_lods=3,
+            multires_strategy="downsample",
+            use_existing_scales=False,   # <-- force in-worker downsample
+            target_faces_per_lod0_chunk=200,
+            check_mesh_validity=False,
+            do_analysis=False,
+            do_simplification=True,
+        )
+
+        # Spy on per-LOD calls
+        calls = []
+        orig = m._generate_meshes_at_scale.__func__
+        def _spy(self_, output_mesh_dir, downsample_factor=None,
+                  target_reduction_override=None, input_dataset_path=None):
+            calls.append({
+                "downsample_factor": downsample_factor,
+                "input_dataset_path": input_dataset_path,
+            })
+            return orig(self_, output_mesh_dir,
+                         downsample_factor=downsample_factor,
+                         target_reduction_override=target_reduction_override,
+                         input_dataset_path=input_dataset_path)
+        m._generate_meshes_at_scale = _spy.__get__(m, Meshify)
+
+        m.get_meshes()
+
+        # Every LOD should use downsample_factor (in-worker), never
+        # input_dataset_path (existing scale).
+        assert len(calls) == 3
+        for k, call in enumerate(calls):
+            assert call["input_dataset_path"] is None, (
+                f"LOD {k} read from {call['input_dataset_path']} despite "
+                f"use_existing_scales=False"
+            )
+            # LOD 0 uses self.downsample_factor (None by default = no extra DS).
+            # Higher LODs apply 2^k.
+            if k == 0:
+                assert call["downsample_factor"] in (None, 1), (
+                    f"LOD 0 downsample_factor={call['downsample_factor']}, "
+                    "expected None or 1"
+                )
+            else:
+                assert call["downsample_factor"] == 2 ** k, (
+                    f"LOD {k} downsample_factor={call['downsample_factor']}, "
+                    f"expected {2 ** k}"
+                )
+
+
 class TestMeshifyNeuroglancerOutput:
     """Test neuroglancer format output from meshify."""
 
