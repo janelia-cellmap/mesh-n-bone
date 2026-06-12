@@ -19,6 +19,37 @@ logger = logging.getLogger(__name__)
 _REMOTE_SCHEMES = {"http", "https", "gs", "s3"}
 
 
+def _should_use_anonymous_s3(anonymous):
+    """Resolve whether to inject anonymous S3 credentials.
+
+    When ``anonymous`` is ``None`` (default), use anonymous unless any
+    of ``AWS_ACCESS_KEY_ID``, ``AWS_PROFILE``, or ``AWS_ENDPOINT_URL``
+    is set in the environment:
+
+      - ``AWS_ACCESS_KEY_ID``: explicit credentials present.
+      - ``AWS_PROFILE``: user picked a credential profile.
+      - ``AWS_ENDPOINT_URL``: moto/MinIO/self-hosted S3 — typically
+        needs credentials and overrides anonymous behavior.
+
+    Without one of these, tensorstore would walk the IMDS / web-
+    identity chain and time out on non-EC2 machines (~2 s per provider,
+    ~7 s total). Injecting ``aws_credentials={"type": "anonymous"}``
+    short-circuits the entire chain, dropping OpenOrganelle open+read
+    from ~7 s to ~0.2 s.
+
+    Trade-off: a ``~/.aws/credentials`` user with no ``AWS_PROFILE``
+    in the environment falls through to anonymous. For
+    OpenOrganelle/COSEM reads (the headline use case) that's still
+    fine; for private-bucket reads they need to ``export
+    AWS_PROFILE=default`` or set ``AWS_ACCESS_KEY_ID``.
+    """
+    if anonymous is not None:
+        return bool(anonymous)
+    return not any(
+        os.environ.get(k) for k in ("AWS_ACCESS_KEY_ID", "AWS_PROFILE", "AWS_ENDPOINT_URL")
+    )
+
+
 def _is_http_url(path):
     """Return True if *path* is an HTTP(S) URL."""
     return urlparse(str(path)).scheme in {"http", "https"}
@@ -72,7 +103,7 @@ def _path_basename(path):
     return os.path.basename(path)
 
 
-def kvstore_for_path(path):
+def kvstore_for_path(path, anonymous=None):
     """Build a TensorStore kvstore spec for *path* (any supported scheme).
 
     Returns ``(kvstore_dict, normalized_path)`` where ``normalized_path``
@@ -81,6 +112,16 @@ def kvstore_for_path(path):
 
     Supported schemes: ``gs``, ``s3``, ``http``, ``https``, ``file``,
     plus a bare local filesystem path.
+
+    For ``s3`` URLs, ``anonymous`` controls whether to inject
+    ``aws_credentials={"type": "anonymous"}`` into the spec. When
+    ``None`` (default) the choice is auto-detected via
+    ``_should_use_anonymous_s3``: explicit env-var control via
+    ``AWS_NO_SIGN_REQUEST``, otherwise anonymous when no AWS
+    credentials are configured in the environment. This avoids the
+    multi-second IMDS lookup for public buckets like OpenOrganelle and
+    COSEM on machines with no AWS credentials, while still using the
+    user's configured credentials when they exist.
     """
     inner = _strip_precomputed_prefix(path)
     parsed = urlparse(inner)
@@ -91,10 +132,10 @@ def kvstore_for_path(path):
             parsed.path.lstrip("/"),
         )
     if scheme == "s3":
-        return (
-            {"driver": "s3", "bucket": parsed.netloc},
-            parsed.path.lstrip("/"),
-        )
+        spec = {"driver": "s3", "bucket": parsed.netloc}
+        if _should_use_anonymous_s3(anonymous):
+            spec["aws_credentials"] = {"type": "anonymous"}
+        return (spec, parsed.path.lstrip("/"))
     if scheme in ("http", "https"):
         return (
             {"driver": "http", "base_url": f"{scheme}://{parsed.netloc}"},
