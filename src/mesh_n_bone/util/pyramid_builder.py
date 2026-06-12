@@ -392,23 +392,67 @@ def build_missing_pyramid_levels(
 # ---------------------------------------------------------------------------
 
 
+_TS_DTYPE_MAP = {
+    np.dtype("uint8"): "|u1",
+    np.dtype("uint16"): "<u2",
+    np.dtype("uint32"): "<u4",
+    np.dtype("uint64"): "<u8",
+    np.dtype("int8"): "|i1",
+    np.dtype("int16"): "<i2",
+    np.dtype("int32"): "<i4",
+    np.dtype("int64"): "<i8",
+    np.dtype("float32"): "<f4",
+    np.dtype("float64"): "<f8",
+}
+
+
 def _create_zarr_v2_array(path, shape, chunks, dtype):
-    """Create a zarr v2 array on disk and return a handle."""
-    import zarr
-    arr = zarr.open_array(
-        store=path, mode="w", shape=shape, chunks=chunks, dtype=dtype,
-        fill_value=0,
-    )
-    return arr
+    """Create a zarr v2 array on disk via tensorstore and return a handle.
+
+    Uses tensorstore (already a core dep) instead of the optional ``zarr``
+    package so the pyramid builder works in any pixi env that has the
+    base mesh-n-bone install.
+    """
+    import tensorstore as ts
+    if os.path.exists(path):
+        shutil.rmtree(path)
+    dt = np.dtype(dtype)
+    ts_dtype = _TS_DTYPE_MAP.get(dt)
+    if ts_dtype is None:
+        raise ValueError(
+            f"Unsupported dtype for pyramid build: {dt}. "
+            f"Add it to _TS_DTYPE_MAP."
+        )
+    spec = {
+        "driver": "zarr",  # zarr v2
+        "kvstore": {"driver": "file", "path": path},
+        "metadata": {
+            "shape": list(shape),
+            "chunks": list(chunks),
+            "dtype": ts_dtype,
+            "compressor": None,
+            "fill_value": 0,
+            "order": "C",
+        },
+        "create": True,
+        "delete_existing": True,
+    }
+    return ts.open(spec).result()
 
 
 def _write_zarr_v2_region(arr, origin_voxels, data):
-    """Write ``data`` into ``arr`` at the given origin (zyx voxel coords)."""
+    """Write ``data`` into ``arr`` at the given origin (zyx voxel coords).
+
+    ``arr`` is a tensorstore handle from ``_create_zarr_v2_array``.
+    """
     z, y, x = origin_voxels.tolist()
-    zE, yE, xE = z + data.shape[0], y + data.shape[1], x + data.shape[2]
-    # Clip in case the block extends past array bounds (boundary chunks)
-    zE = min(zE, arr.shape[0]); yE = min(yE, arr.shape[1]); xE = min(xE, arr.shape[2])
-    arr[z:zE, y:yE, x:xE] = data[: zE - z, : yE - y, : xE - x]
+    shape = arr.shape
+    zE = min(z + data.shape[0], shape[0])
+    yE = min(y + data.shape[1], shape[1])
+    xE = min(x + data.shape[2], shape[2])
+    # Clip the data block to the array bounds (boundary chunks at the edge)
+    clipped = data[: zE - z, : yE - y, : xE - x]
+    arr[z:zE, y:yE, x:xE].write(clipped).result()
 
 
 def _try_symlink_s0(pyramid_path, s0_source_path):
