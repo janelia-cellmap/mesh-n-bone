@@ -882,6 +882,8 @@ class Meshify:
         downsample_method: str = "mode",
         multires_strategy: str = "downsample",
         use_existing_scales: bool = True,
+        keep_intermediate_scales: bool = False,
+        pyramid_alignment_mode: str = "snap",
         decimation_factor: int = 6,
         decimation_aggressiveness: int = 7,
         delete_decimated_meshes: bool = True,
@@ -1055,6 +1057,8 @@ class Meshify:
         self.input_path = input_path
         self.multires_strategy = multires_strategy
         self.use_existing_scales = use_existing_scales
+        self.keep_intermediate_scales = keep_intermediate_scales
+        self.pyramid_alignment_mode = pyramid_alignment_mode
         self.decimation_factor = decimation_factor
         self.decimation_aggressiveness = decimation_aggressiveness
         self.delete_decimated_meshes = delete_decimated_meshes
@@ -2013,6 +2017,155 @@ class Meshify:
         self._existing_scales_cache = result
         return result
 
+    def _build_missing_pyramid_scales(self, num_lods):
+        """Auto-build missing OME-NGFF multiscale levels for the
+        downsample multires strategy.
+
+        Looks at what the source group exposes, computes the per-axis
+        cumulative factors needed for ``num_lods``, and builds whatever's
+        missing under ``{output_directory}/_intermediate_scales.zarr``.
+
+        Returns ``{int_factor: dataset_path}`` mapping ONLY the
+        newly-built scales (so the caller can merge with the source's
+        existing scales). The mapping key is a single int — only valid
+        for isotropic-factor levels — to match the existing
+        ``_discover_existing_scales`` cache shape. Anisotropic factor
+        tuples aren't yet honored by the downstream LOD dispatch, so
+        the builder skips emitting them into the cache (they still get
+        written to disk for future use); falls back to in-worker
+        downsampling for those LODs.
+        """
+        from mesh_n_bone.util.pyramid_builder import (
+            per_lod_factors_for_anisotropy,
+            build_missing_pyramid_levels,
+        )
+        from mesh_n_bone.util.image_data_interface import to_ndarray_tensorstore
+        from funlib.geometry import Coordinate, Roi
+
+        voxel_size = np.asarray(self.true_voxel_size, dtype=float)
+        factors_per_lod = per_lod_factors_for_anisotropy(voxel_size, num_lods)
+
+        existing = self._discover_existing_scales() if self.use_existing_scales else {}
+        # Only build levels where the factor is "uniform" — i.e. (k,k,k) —
+        # since downstream LOD dispatch is by single int factor. Anisotropic
+        # output is still written to disk (useful for future runs or external
+        # tools) but isn't fed back into the cache.
+        needed_uniform = []
+        for k, factor in enumerate(factors_per_lod):
+            if k == 0:
+                continue
+            if factor[0] == factor[1] == factor[2]:
+                if factor[0] not in existing:
+                    needed_uniform.append((k, factor))
+        if not needed_uniform:
+            # Nothing to build OR everything is anisotropic (no cache benefit)
+            return {}
+
+        pyramid_path = os.path.join(
+            self.output_directory, "_intermediate_scales.zarr",
+        )
+
+        # ROI in voxel coordinates relative to the dataset's own (0, 0, 0)
+        seg_arr = self.segmentation_array
+        ds_offset = np.asarray(seg_arr.roi.offset, dtype=np.int64)
+        vs_int = np.asarray(seg_arr.voxel_size, dtype=np.int64)
+        roi_world_origin = np.asarray(self.roi.offset, dtype=np.int64)
+        roi_world_shape = np.asarray(self.roi.shape, dtype=np.int64)
+        roi_voxel_origin = (roi_world_origin - ds_offset) // vs_int
+        roi_voxel_shape = roi_world_shape // vs_int
+
+        # Dataset shape in voxels
+        dataset_shape = np.asarray(seg_arr.data.shape[-3:], dtype=np.int64)
+
+        # Open a tensorstore handle for s0 (Meshify's segmentation_array.data is
+        # ArrayMetadata, not a tensorstore — to_ndarray_tensorstore needs the
+        # real handle).
+        from mesh_n_bone.util.image_data_interface import open_ds_tensorstore
+        dataset_path = self._dataset_path
+        swap_axes = self._swap_axes
+        ds_offset_coord = Coordinate(seg_arr.roi.offset)
+        vs_coord = Coordinate(seg_arr.voxel_size)
+        ts_dataset = open_ds_tensorstore(dataset_path)
+
+        def _s0_reader(origin_voxels, shape_voxels):
+            world_origin = ds_offset_coord + Coordinate(origin_voxels.tolist()) * vs_coord
+            world_shape = Coordinate(shape_voxels.tolist()) * vs_coord
+            roi = Roi(world_origin, world_shape)
+            return to_ndarray_tensorstore(
+                ts_dataset, roi, vs_coord, ds_offset_coord,
+                swap_axes=swap_axes, fill_value=0, source_path=dataset_path,
+            )
+
+        # Downsample function dispatch
+        from mesh_n_bone.meshify.downsample import (
+            downsample_labels_3d,
+            downsample_binary_3d,
+            downsample_labels_3d_suppress_zero,
+        )
+        downsample_dispatch = {
+            "mode": downsample_labels_3d,
+            "mode_suppress_zero": downsample_labels_3d_suppress_zero,
+            "binary": downsample_binary_3d,
+        }
+        if self.downsample_method == "nearest":
+            # Striding is free at the worker; no point caching a pyramid.
+            return {}
+        if self.downsample_method not in downsample_dispatch:
+            raise ValueError(
+                f"Unknown downsample_method '{self.downsample_method}'. "
+                f"Choose from: {list(downsample_dispatch.keys()) + ['nearest']}"
+            )
+        downsample_func = downsample_dispatch[self.downsample_method]
+
+        # Choose a reasonable output chunk shape: largest multiple of source
+        # chunk shape that's also a multiple of max factor, capped at 256.
+        src_chunk = np.asarray(seg_arr.chunk_shape, dtype=np.int64)
+        max_factor = np.max(np.array([f for _, f in needed_uniform]), axis=0)
+        # Round source chunk to be a multiple of max_factor; cap at 256
+        out_chunk_shape = []
+        for ax in range(3):
+            ch = int(src_chunk[ax])
+            mf = int(max_factor[ax])
+            # round up to multiple of mf, then cap
+            ch = max(mf, (ch + mf - 1) // mf * mf)
+            ch = min(ch, 256)
+            # ensure still a multiple of mf after the cap
+            ch = (ch // mf) * mf
+            ch = max(ch, mf)
+            out_chunk_shape.append(ch)
+
+        # Build
+        logger.info(
+            "pyramid_builder: %d missing scale(s) detected for downsample multires "
+            "(factors=%s); building under %s with alignment_mode=%s",
+            len(needed_uniform),
+            [factor for _, factor in needed_uniform],
+            pyramid_path,
+            self.pyramid_alignment_mode,
+        )
+        build_missing_pyramid_levels(
+            s0_reader=_s0_reader,
+            s0_dataset_shape_voxels=dataset_shape,
+            s0_voxel_size_zyx=self.true_voxel_size.tolist(),
+            s0_translation_zyx=self.true_offset.tolist(),
+            dtype=seg_arr.data.dtype,
+            num_lods=num_lods,
+            existing_factors=set(),  # build all uniform-factor levels into pyramid
+            output_zarr_path=pyramid_path,
+            downsample_func=downsample_func,
+            roi_origin_voxels=roi_voxel_origin,
+            roi_shape_voxels=roi_voxel_shape,
+            out_chunk_shape_voxels=tuple(out_chunk_shape),
+            alignment_mode=self.pyramid_alignment_mode,
+            s0_source_path=self._dataset_path,
+        )
+
+        # Return mapping of newly-built factors -> path within the pyramid
+        return {
+            factor[0]: os.path.join(pyramid_path, f"s{k}")
+            for k, factor in needed_uniform
+        }
+
     def _per_lod_target_reduction(self, lod: int) -> float:
         """Per-LOD target_reduction for the downsample multires strategy.
 
@@ -2192,6 +2345,14 @@ class Meshify:
             with Timing_Messager("Cleaning up intermediate mesh files", logger):
                 shutil.rmtree(mesh_lods_dir, ignore_errors=True)
 
+        # Pyramid scale cache: keep when explicitly requested for reuse,
+        # otherwise tear down so the output dir doesn't accumulate the
+        # downsampled-segmentation zarrs.
+        pyramid_path = os.path.join(self.output_directory, "_intermediate_scales.zarr")
+        if os.path.isdir(pyramid_path) and not self.keep_intermediate_scales:
+            with Timing_Messager("Cleaning up intermediate scale zarr", logger):
+                shutil.rmtree(pyramid_path, ignore_errors=True)
+
         logger.info("Multires pipeline complete")
 
     def _generate_multires_decimate(self, mesh_lods_dir, lods):
@@ -2276,6 +2437,27 @@ class Meshify:
             self._discover_existing_scales() if self.use_existing_scales else {}
         )
         base_ds = self.downsample_factor or 1
+
+        # If any LOD's required factor is missing from the input zarr's
+        # OME-NGFF multiscales, build the missing scales upfront into an
+        # intermediate pyramid zarr. This avoids the slow per-LOD
+        # in-worker fallback (reads s0 once instead of N times).
+        if self.use_existing_scales and base_ds == 1 and self.num_lods > 1:
+            needed_uniform = [2 ** lod for lod in lods if lod > 0]
+            if any(f not in existing_scales for f in needed_uniform):
+                try:
+                    new_scales = self._build_missing_pyramid_scales(self.num_lods)
+                    existing_scales = {**existing_scales, **new_scales}
+                except ValueError:
+                    # User-config errors (e.g. invalid downsample_method) must
+                    # propagate — the in-worker path would raise the same error.
+                    raise
+                except Exception as e:
+                    logger.warning(
+                        "pyramid_builder: failed to pre-build missing scales "
+                        "(%s); falling back to in-worker downsampling per LOD.", e,
+                    )
+
         for lod in lods:
             scale_dir = f"{mesh_lods_dir}/s{lod}"
             target_factor = 2 ** lod

@@ -460,6 +460,137 @@ class TestMeshifyDownsampleStrategyExistingScales:
             )
 
 
+class TestMeshifyDownsampleAutoBuildPyramid:
+    """When the input zarr exposes only s0 (no pre-computed coarser
+    scales), the downsample multires strategy auto-builds the missing
+    s_k arrays under {output}/_intermediate_scales.zarr/, then reads
+    each LOD from the corresponding s_k. Avoids the slow per-LOD
+    in-worker fallback that re-reads s0 once per LOD."""
+
+    @staticmethod
+    def _create_single_scale_ome_zarr(tmpdir):
+        import json
+        import tensorstore as ts
+        zarr_path = os.path.join(tmpdir, "single_scale.zarr")
+        os.makedirs(zarr_path, exist_ok=True)
+        N = 64
+        vol = np.zeros((N, N, N), dtype=np.uint8)
+        zz, yy, xx = np.indices(vol.shape) - N // 2
+        vol[(xx*xx + yy*yy + zz*zz) < 24*24] = 1
+
+        s0_dir = os.path.join(zarr_path, "s0")
+        os.makedirs(s0_dir, exist_ok=True)
+        arr = ts.open({
+            "driver": "zarr3",
+            "kvstore": {"driver": "file", "path": s0_dir},
+            "metadata": {
+                "shape": list(vol.shape),
+                "data_type": "uint8",
+                "chunk_grid": {"name": "regular",
+                                "configuration": {"chunk_shape": [16, 16, 16]}},
+            },
+            "create": True, "delete_existing": True,
+        }).result()
+        arr.write(vol).result()
+
+        with open(os.path.join(zarr_path, "zarr.json"), "w") as f:
+            json.dump({
+                "zarr_format": 3, "node_type": "group",
+                "attributes": {
+                    "multiscales": [{
+                        "version": "0.5",
+                        "axes": [
+                            {"name": "z", "type": "space", "unit": "nanometer"},
+                            {"name": "y", "type": "space", "unit": "nanometer"},
+                            {"name": "x", "type": "space", "unit": "nanometer"},
+                        ],
+                        "datasets": [{
+                            "path": "s0",
+                            "coordinateTransformations": [
+                                {"type": "scale", "scale": [8.0, 8.0, 8.0]},
+                            ],
+                        }],
+                    }],
+                },
+            }, f)
+        return f"{zarr_path}/s0", zarr_path
+
+    def test_auto_builds_pyramid_for_single_scale_input(self, tmp_output_dir):
+        s0_path, _ = self._create_single_scale_ome_zarr(tmp_output_dir)
+        output_dir = os.path.join(tmp_output_dir, "out_autobuild")
+        m = Meshify(
+            input_path=s0_path,
+            output_directory=output_dir,
+            num_workers=1,
+            do_multires=True,
+            num_lods=3,
+            multires_strategy="downsample",
+            keep_intermediate_scales=True,  # keep for inspection
+            target_faces_per_lod0_chunk=200,
+            check_mesh_validity=False,
+            do_analysis=False,
+            do_simplification=True,
+        )
+        # Spy on which LODs read from the pyramid vs in-worker downsample
+        calls = []
+        orig = m._generate_meshes_at_scale.__func__
+        def _spy(self_, output_mesh_dir, downsample_factor=None,
+                  target_reduction_override=None, input_dataset_path=None):
+            calls.append({
+                "downsample_factor": downsample_factor,
+                "input_dataset_path": input_dataset_path,
+            })
+            return orig(self_, output_mesh_dir,
+                         downsample_factor=downsample_factor,
+                         target_reduction_override=target_reduction_override,
+                         input_dataset_path=input_dataset_path)
+        m._generate_meshes_at_scale = _spy.__get__(m, Meshify)
+        m.get_meshes()
+
+        # Pyramid zarr should have been written
+        pyramid_root = os.path.join(output_dir, "_intermediate_scales.zarr")
+        assert os.path.isdir(pyramid_root), (
+            f"Expected pyramid at {pyramid_root}"
+        )
+        for k in (1, 2):  # LOD 0 may be a symlink, LODs 1+ are real arrays
+            assert os.path.isdir(os.path.join(pyramid_root, f"s{k}")), (
+                f"Expected pyramid s{k} array on disk"
+            )
+
+        # Every LOD > 0 should have read from the pyramid (input_dataset_path
+        # set), not via in-worker downsample_factor.
+        assert len(calls) == 3
+        for k in (1, 2):
+            assert calls[k]["input_dataset_path"] is not None, (
+                f"LOD {k} should read from auto-built pyramid; "
+                f"call={calls[k]}"
+            )
+            assert "_intermediate_scales.zarr" in calls[k]["input_dataset_path"]
+
+    def test_keep_intermediate_scales_false_cleans_up(self, tmp_output_dir):
+        s0_path, _ = self._create_single_scale_ome_zarr(tmp_output_dir)
+        output_dir = os.path.join(tmp_output_dir, "out_autobuild_cleanup")
+        m = Meshify(
+            input_path=s0_path,
+            output_directory=output_dir,
+            num_workers=1,
+            do_multires=True,
+            num_lods=3,
+            multires_strategy="downsample",
+            keep_intermediate_scales=False,  # default: clean up
+            target_faces_per_lod0_chunk=200,
+            check_mesh_validity=False,
+            do_analysis=False,
+            do_simplification=True,
+        )
+        m.get_meshes()
+        # Pyramid zarr should be gone
+        pyramid_root = os.path.join(output_dir, "_intermediate_scales.zarr")
+        assert not os.path.exists(pyramid_root), (
+            f"Pyramid should have been cleaned up; still exists at {pyramid_root}"
+        )
+
+
 class TestMeshifyDownsampleStrategyOverride:
     """The use_existing_scales=False override forces in-worker
     downsampling at every LOD, even when matching pre-built scales

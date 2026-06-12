@@ -331,6 +331,101 @@ class TestEndToEndPyramidBuild:
         assert os.path.isdir(os.path.join(out_path, "s2"))
 
 
+class TestUnalignedRoiHalo:
+    """When ROI is unaligned and alignment_mode='halo', the pyramid
+    builder reads beyond the ROI to complete boundary cubes. Output
+    covers the ROI rounded OUTWARD to factor boundaries — no data loss
+    at unaligned ROI edges."""
+
+    def test_halo_mode_reads_beyond_roi(self, tmp_path):
+        """With ROI [3, 37) (size 34) and max factor 4, halo mode should
+        round outward to [0, 40) and produce s1=20 voxels, s2=10 voxels.
+
+        The downsampled values must match a global single-pass downsample
+        of vol[0:40, 0:40, 0:40] (the halo-extended region) — proving the
+        halo reads actually pulled the surrounding voxels."""
+        rng = np.random.default_rng(0)
+        vol = rng.integers(low=0, high=4, size=(40, 40, 40), dtype=np.uint8)
+
+        # Reader tracks what voxel ranges it was asked for, so we can
+        # assert the halo actually fetched outside the ROI.
+        read_log = []
+        def reader(o, s):
+            read_log.append((tuple(o.tolist()), tuple(s.tolist())))
+            return vol[o[0]:o[0]+s[0], o[1]:o[1]+s[1], o[2]:o[2]+s[2]].copy()
+
+        out_path = str(tmp_path / "pyramid_halo.zarr")
+        build_missing_pyramid_levels(
+            s0_reader=reader,
+            s0_dataset_shape_voxels=np.array(vol.shape),
+            s0_voxel_size_zyx=[1.0, 1.0, 1.0],
+            s0_translation_zyx=[0.5, 0.5, 0.5],
+            dtype=vol.dtype,
+            num_lods=3,                       # max factor 4
+            existing_factors=set(),
+            output_zarr_path=out_path,
+            downsample_func=downsample_labels_3d,
+            out_chunk_shape_voxels=(4, 4, 4),
+            roi_origin_voxels=np.array([3, 3, 3]),
+            roi_shape_voxels=np.array([34, 34, 34]),
+            alignment_mode="halo",
+        )
+
+        # Output region: ROI rounded OUTWARD to factor 4 → [0:40, 0:40, 0:40].
+        # Downsampled by 2 → 20³; by 4 → 10³.
+        import zarr
+        s1 = zarr.open_array(os.path.join(out_path, "s1"), mode="r")
+        s2 = zarr.open_array(os.path.join(out_path, "s2"), mode="r")
+        assert s1.shape == (20, 20, 20)
+        assert s2.shape == (10, 10, 10)
+
+        # Match global single-pass downsample of the halo-extended region
+        ref_s1, _ = downsample_labels_3d(vol[0:40, 0:40, 0:40], (2, 2, 2))
+        ref_s2, _ = downsample_labels_3d(vol[0:40, 0:40, 0:40], (4, 4, 4))
+        np.testing.assert_array_equal(s1[:], ref_s1)
+        np.testing.assert_array_equal(s2[:], ref_s2)
+
+        # The reader log should show reads starting at voxel 0 — outside
+        # the original ROI which starts at voxel 3. If snap mode had been
+        # used, reads would never go below voxel 4.
+        min_read_origin = min(o for o, _ in read_log)
+        assert min_read_origin == (0, 0, 0), (
+            f"halo mode should read from voxel 0 (outside original ROI); "
+            f"min read origin was {min_read_origin}"
+        )
+
+    def test_halo_clipped_at_dataset_bounds(self, tmp_path):
+        """When the halo would extend past the dataset, the read is clipped
+        and zero-padding (or partial cubes) take over. The output should
+        still complete cleanly — no exceptions, output array fully written."""
+        # 18-voxel dataset, ROI [3, 18) (size 15), max factor 4 → halo
+        # rounds out to [0, 20). Dataset bounds clip the read at 18.
+        rng = np.random.default_rng(1)
+        vol = rng.integers(low=0, high=4, size=(18, 18, 18), dtype=np.uint8)
+        out_path = str(tmp_path / "pyramid_halo_clip.zarr")
+        build_missing_pyramid_levels(
+            s0_reader=lambda o, s: vol[o[0]:o[0]+s[0], o[1]:o[1]+s[1], o[2]:o[2]+s[2]].copy(),
+            s0_dataset_shape_voxels=np.array(vol.shape),
+            s0_voxel_size_zyx=[1.0, 1.0, 1.0],
+            s0_translation_zyx=[0.5, 0.5, 0.5],
+            dtype=vol.dtype,
+            num_lods=3,
+            existing_factors=set(),
+            output_zarr_path=out_path,
+            downsample_func=downsample_labels_3d,
+            out_chunk_shape_voxels=(4, 4, 4),
+            roi_origin_voxels=np.array([3, 3, 3]),
+            roi_shape_voxels=np.array([15, 15, 15]),
+            alignment_mode="halo",
+        )
+        # Output region: [0, 20) rounded outward, but dataset only has 18.
+        # Builder must handle this without crashing.
+        import zarr
+        s1 = zarr.open_array(os.path.join(out_path, "s1"), mode="r")
+        # s1 covers output region 20 voxels / 2 = 10 voxels
+        assert s1.shape == (10, 10, 10)
+
+
 class TestUnalignedRoiSnap:
     """When the ROI is unaligned, snap mode drops up to max_factor-1
     voxels per edge; downsampled output covers the snapped region only."""
