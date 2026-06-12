@@ -2230,23 +2230,21 @@ class Meshify:
             fallback_mb=2048,
         )
 
-        def _size_super_chunk(per_worker_mb):
-            """Choose super_chunk_shape (in s0 voxels). Each worker
-            process holds at most one super-chunk + one LOD output + scratch
-            in memory at any time. ``per_worker_mb`` is per-process
-            budget (NOT per-thread / not divided by num_workers — each
-            dask worker is its own LSF process).
+        # super_chunk_shape is FIXED at out_chunk * max_factor — the smallest
+        # super-chunk that fills exactly one output chunk per LOD. Growing
+        # super-chunks past this point reduces task count (= parallelism)
+        # without any real benefit for label data (mode downsamples are
+        # CPU-bounded, not I/O-amortization-bounded). Memory tuning is done
+        # by adjusting processes-per-LSF-job (= memory per worker), not by
+        # growing super-chunks.
+        super_chunk_shape = (out_chunk_arr * max_factor).tolist()
+        super_chunk_arr = np.asarray(super_chunk_shape, dtype=np.int64)
+        super_bytes = int(np.prod(super_chunk_arr)) * itemsize
 
-            Returns the super_chunk_shape as a multiple of
-            ``out_chunk_shape * max_factor`` (so each task fills integer
-            output chunks at every LOD).
-            """
-            budget_bytes = max(1e6, per_worker_mb * 1e6 / amplification)
-            base_chunk_voxels = float(np.prod(out_chunk_arr * max_factor))
-            base_chunk_bytes = base_chunk_voxels * itemsize
-            multiplier = max(1, int(budget_bytes // max(1, base_chunk_bytes)))
-            multi_side = max(1, int(multiplier ** (1.0 / 3.0)))
-            return (out_chunk_arr * max_factor * multi_side).tolist()
+        def _per_worker_mb_for(processes):
+            if job_memory is not None and processes > 0:
+                return (job_memory / processes) / 1e6
+            return fallback_per_worker_mb
 
         # Resolve ROI alignment up-front (we need the aligned out_shape to
         # build the output zarr arrays)
@@ -2284,8 +2282,7 @@ class Meshify:
         )
 
         # Load dask config once. We use it to compute per-worker memory
-        # budget (= job_memory / processes_per_job) and to feed into
-        # run_with_oom_retry.
+        # budget (= job_memory / processes_per_job).
         try:
             base_dask_config = dask_util._load_dask_config()
         except (FileNotFoundError, OSError):
@@ -2296,48 +2293,32 @@ class Meshify:
         fallback_per_worker_mb = 2048
 
         # Proactive sizing — mirror assembly's _plan_assembly_waves pattern.
-        # For pyramid we have one "estimate" (per-super-chunk peak memory)
-        # since all tasks are identical, so it reduces to: size the
-        # super-chunk at the base per-worker budget, then if the minimum
-        # possible super-chunk wouldn't fit, halve processes-per-job to
-        # give each worker more memory.
+        # With super_chunk_shape fixed at the minimum, this reduces to:
+        # if super_chunk + scratch wouldn't fit per-worker at base_processes,
+        # halve processes-per-job upfront.
+        peak_bytes = int(super_bytes * amplification)
         starting_processes = base_processes
         if job_memory is not None:
-            tentative_super = _size_super_chunk(
-                (job_memory / base_processes) / 1e6
-            )
-            tentative_peak_bytes = int(
-                np.prod(tentative_super) * itemsize * amplification
-            )
             starting_processes = _recommended_assembly_processes(
-                tentative_peak_bytes, job_memory, base_processes,
+                peak_bytes, job_memory, base_processes,
                 memory_fraction=0.60,
             )
             if starting_processes != base_processes:
                 logger.info(
-                    "pyramid_builder: minimum super-chunk peak %.1f MB > "
-                    "job_memory/base_processes; reducing processes/job %d → %d "
-                    "(2x memory per worker)",
-                    tentative_peak_bytes / 1e6,
+                    "pyramid_builder: super-chunk peak %.1f MB > 60%% of "
+                    "(job_memory %.1f GB / %d procs = %.1f GB per worker); "
+                    "reducing processes/job %d → %d (more memory per worker)",
+                    peak_bytes / 1e6, job_memory / 1e9, base_processes,
+                    job_memory / base_processes / 1e9,
                     base_processes, starting_processes,
                 )
 
-        # OOM retry loop. On MemoryError, halve processes-per-job further
-        # (gives each worker another 2× memory) and rebuild the super-chunk.
+        # OOM retry loop. On MemoryError, halve processes-per-job (gives
+        # each worker another 2× memory).
         max_retries = int(getattr(self, "memory_retry_max", 3))
         attempt_processes = starting_processes
         for attempt in range(max_retries + 1):
-            # Per-worker memory: each LSF job hosts `processes` worker
-            # processes sharing the job's memory. Each worker holds ONE
-            # super-chunk in flight.
-            if job_memory is not None and attempt_processes > 0:
-                per_worker_mb = (job_memory / attempt_processes) / 1e6
-            else:
-                per_worker_mb = fallback_per_worker_mb
-
-            super_chunk_shape = _size_super_chunk(per_worker_mb)
-            super_chunk_arr = np.asarray(super_chunk_shape, dtype=np.int64)
-            super_bytes = int(np.prod(super_chunk_arr)) * itemsize
+            per_worker_mb = _per_worker_mb_for(attempt_processes)
             logger.info(
                 "pyramid_builder: %sattempt %d: per-worker budget %.0f MB, "
                 "processes/job=%d → out_chunk_shape=%s, super_chunk_shape=%s "
