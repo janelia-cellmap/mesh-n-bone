@@ -2246,6 +2246,7 @@ class Meshify:
             out_chunk_shape_voxels=tuple(out_chunk_shape),
             alignment_mode=self.pyramid_alignment_mode,
             s0_source_path=self._dataset_path,
+            num_workers=max(1, int(self.num_workers)),
         )
 
         # Return mapping of newly-built factors -> path within the pyramid

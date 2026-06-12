@@ -258,6 +258,7 @@ def build_missing_pyramid_levels(
     zarr_format: int = 2,
     s0_source_path: str | None = None,
     dispatch=None,
+    num_workers: int = 1,
 ) -> str:
     """Build missing OME-NGFF pyramid levels and return the group path.
 
@@ -373,11 +374,47 @@ def build_missing_pyramid_levels(
             local_origin = ds_origin - (out_origin // f)
             _write_zarr_v2_region(arr, local_origin, ds_block)
 
-    if dispatch is None:
-        for sc in sc_grid:
-            _process_super_chunk(sc)
-    else:
+    n_chunks = len(sc_grid)
+    if dispatch is not None:
         dispatch(_process_super_chunk, sc_grid)
+    elif num_workers > 1 and n_chunks > 1:
+        from concurrent.futures import ThreadPoolExecutor
+        import threading
+        workers = min(num_workers, n_chunks)
+        logger.info(
+            "pyramid_builder: dispatching %d super-chunks across %d threads "
+            "(super_chunk_shape=%s s0 voxels)",
+            n_chunks, workers, super_chunk_shape.tolist(),
+        )
+        done = [0]
+        report_every = max(1, n_chunks // 20)
+        lock = threading.Lock()
+
+        def _worker(sc):
+            _process_super_chunk(sc)
+            with lock:
+                done[0] += 1
+                if done[0] % report_every == 0 or done[0] == n_chunks:
+                    logger.info(
+                        "pyramid_builder: %d/%d super-chunks done", done[0], n_chunks,
+                    )
+
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            list(ex.map(_worker, sc_grid))
+    else:
+        logger.info(
+            "pyramid_builder: processing %d super-chunks sequentially "
+            "(super_chunk_shape=%s s0 voxels)",
+            n_chunks, super_chunk_shape.tolist(),
+        )
+        report_every = max(1, n_chunks // 20)
+        for i, sc in enumerate(sc_grid):
+            _process_super_chunk(sc)
+            done = i + 1
+            if done % report_every == 0 or done == n_chunks:
+                logger.info(
+                    "pyramid_builder: %d/%d super-chunks done", done, n_chunks,
+                )
 
     logger.info(
         "pyramid_builder: built %d new scales at %s (factors=%s)",

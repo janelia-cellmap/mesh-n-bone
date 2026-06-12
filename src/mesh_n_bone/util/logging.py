@@ -11,7 +11,47 @@ from contextlib import ContextDecorator, contextmanager
 from subprocess import Popen, PIPE, TimeoutExpired, run as subprocess_run
 from datetime import datetime
 
-logging.basicConfig(format="%(levelname)s:%(message)s", level=logging.INFO)
+# Force stdout/stderr to be line-buffered so each log line is flushed
+# immediately. When the pipeline runs under LSF/dask with output
+# redirected to a file, the default block-buffering on stderr swallows
+# progress logs until the buffer fills (hundreds of KiB), which can
+# mean no visible progress for a long time even when the worker is
+# making steady headway.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(line_buffering=True)
+    except (AttributeError, ValueError):
+        pass
+
+
+class _FlushingStreamHandler(logging.StreamHandler):
+    """StreamHandler that flushes after every emit.
+
+    The base StreamHandler's emit() already calls self.flush(), but only
+    on the Python-level stream; when output is piped to a file via the
+    shell, the OS-level buffer for the file descriptor may still hold
+    the data. We force flush on every record to make sure tail -f works.
+    """
+
+    def emit(self, record):
+        super().emit(record)
+        try:
+            self.flush()
+            self.stream.flush()
+        except (AttributeError, ValueError, OSError):
+            pass
+
+
+_root = logging.getLogger()
+if not any(isinstance(h, _FlushingStreamHandler) for h in _root.handlers):
+    # Remove any default handlers installed earlier so our flushing one wins
+    for _h in list(_root.handlers):
+        _root.removeHandler(_h)
+    _h = _FlushingStreamHandler()
+    _h.setFormatter(logging.Formatter("%(levelname)s:%(message)s"))
+    _root.addHandler(_h)
+    _root.setLevel(logging.INFO)
+
 logger = logging.getLogger(__name__)
 
 
