@@ -461,47 +461,71 @@ def _write_assembly_memory_plan(output_directory, estimates, waves):
         json.dump(plan, f, indent=2)
 
 
-def _safely_remove_pyramid(pyramid_path):
-    """Delete the auto-built pyramid zarr without ever following symlinks.
+def _safely_remove_pyramid(pyramid_path, num_workers=8):
+    """Delete the auto-built pyramid zarr in parallel without ever following symlinks.
 
     The pyramid's ``s0`` is a symlink to the USER'S INPUT data on local
-    filesystems. ``shutil.rmtree`` does the right thing here on modern
-    Python (it unlinks symlinks rather than following them), but we
-    belt-and-braces the safety: walk top-down, unlink every symlink
-    explicitly, then ``rmtree`` whatever remains.
+    filesystems — under no circumstances should the cleanup follow it
+    into the target. We:
+
+    1. Refuse to act when ``pyramid_path`` itself is a symlink.
+    2. Unlink every symlink found at the pyramid root explicitly,
+       BEFORE any recursive walk. (The recursive walk wouldn't follow
+       them either, but this is belt-and-braces for a destructive op.)
+    3. Spawn a thread pool to ``shutil.rmtree`` the real subdirectories
+       (one per pyramid level: s1, s2, ...) in parallel.
+
+    Parallelism: ``shutil.rmtree`` releases the GIL during ``os.unlink``
+    /``os.rmdir`` syscalls, so threads scale on shared filesystems
+    (Lustre/NFS/GPFS) where metadata operations are the bottleneck.
+    On a single-node SSD this still helps for trees with thousands of
+    chunks per array. Caller-tunable ``num_workers``.
     """
     if not os.path.isdir(pyramid_path):
         return
     if os.path.islink(pyramid_path):
-        # The pyramid root ITSELF is somehow a symlink. Don't touch.
         logger.warning(
             "Refusing to delete %s: it is itself a symlink. Manual cleanup required.",
             pyramid_path,
         )
         return
-    # Walk top-down, unlinking symlinks explicitly. Anything left is a
-    # real directory or file the pyramid built itself.
-    for root, dirs, files in os.walk(pyramid_path, topdown=True, followlinks=False):
-        # Files including symlinks-to-files
-        for name in files:
-            os.unlink(os.path.join(root, name))
-        # Directories: handle symlinks-to-dirs here, prune from descent
-        survivors = []
-        for name in dirs:
-            full = os.path.join(root, name)
-            if os.path.islink(full):
-                os.unlink(full)
-                # Don't recurse into it — already unlinked from filesystem
-            else:
-                survivors.append(name)
-        dirs[:] = survivors
-    # Now empty real dirs from the bottom up
-    for root, dirs, _files in os.walk(pyramid_path, topdown=False, followlinks=False):
+
+    # Top-level inventory. Crucially: unlink symlinks first so the
+    # parallel rmtree below NEVER receives a path that points into the
+    # user's data.
+    real_dirs = []
+    real_files = []
+    for entry in os.scandir(pyramid_path):
+        if entry.is_symlink():
+            os.unlink(entry.path)
+        elif entry.is_dir(follow_symlinks=False):
+            real_dirs.append(entry.path)
+        else:
+            real_files.append(entry.path)
+
+    # Small metadata files (.zattrs, .zgroup, info, etc.) — inline.
+    for f in real_files:
         try:
-            os.rmdir(root)
+            os.unlink(f)
         except OSError:
-            # Non-empty (shouldn't happen) or already gone — skip
             pass
+
+    # Parallel rmtree of pyramid level subdirectories
+    if real_dirs:
+        from concurrent.futures import ThreadPoolExecutor
+        max_workers = min(num_workers, len(real_dirs)) if num_workers else 1
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            # Use ignore_errors=True so a transient failure in one subtree
+            # doesn't abort cleanup of the rest. We don't care about residual
+            # files in the pyramid — they're never read again — but we DO want
+            # to clean up as much as possible.
+            list(ex.map(lambda p: shutil.rmtree(p, ignore_errors=True), real_dirs))
+
+    # Final rmdir of the now-empty pyramid root
+    try:
+        os.rmdir(pyramid_path)
+    except OSError:
+        pass
 
 
 def _estimate_block_target_mb_from_dask_config(
@@ -925,7 +949,7 @@ class Meshify:
         downsample_method: str = "mode",
         multires_strategy: str = "downsample",
         use_existing_scales: bool = True,
-        keep_intermediate_scales: bool = False,
+        delete_intermediate_scales: bool = True,
         pyramid_alignment_mode: str = "halo",
         decimation_factor: int = 6,
         decimation_aggressiveness: int = 7,
@@ -1100,7 +1124,7 @@ class Meshify:
         self.input_path = input_path
         self.multires_strategy = multires_strategy
         self.use_existing_scales = use_existing_scales
-        self.keep_intermediate_scales = keep_intermediate_scales
+        self.delete_intermediate_scales = delete_intermediate_scales
         self.pyramid_alignment_mode = pyramid_alignment_mode
         self.decimation_factor = decimation_factor
         self.decimation_aggressiveness = decimation_aggressiveness
@@ -2401,9 +2425,11 @@ class Meshify:
         # regressed: it would walk into the user's input and delete
         # their data.
         pyramid_path = os.path.join(self.output_directory, "_intermediate_scales.zarr")
-        if os.path.isdir(pyramid_path) and not self.keep_intermediate_scales:
+        if os.path.isdir(pyramid_path) and self.delete_intermediate_scales:
             with Timing_Messager("Cleaning up intermediate scale zarr", logger):
-                _safely_remove_pyramid(pyramid_path)
+                _safely_remove_pyramid(
+                    pyramid_path, num_workers=max(1, int(self.num_workers)),
+                )
 
         logger.info("Multires pipeline complete")
 

@@ -525,7 +525,7 @@ class TestMeshifyDownsampleAutoBuildPyramid:
             do_multires=True,
             num_lods=3,
             multires_strategy="downsample",
-            keep_intermediate_scales=True,  # keep for inspection
+            delete_intermediate_scales=False,  # keep for inspection
             target_faces_per_lod0_chunk=200,
             check_mesh_validity=False,
             do_analysis=False,
@@ -567,7 +567,7 @@ class TestMeshifyDownsampleAutoBuildPyramid:
             )
             assert "_intermediate_scales.zarr" in calls[k]["input_dataset_path"]
 
-    def test_keep_intermediate_scales_false_cleans_up(self, tmp_output_dir):
+    def test_delete_intermediate_scales_default_cleans_up(self, tmp_output_dir):
         s0_path, _ = self._create_single_scale_ome_zarr(tmp_output_dir)
         output_dir = os.path.join(tmp_output_dir, "out_autobuild_cleanup")
         m = Meshify(
@@ -577,7 +577,7 @@ class TestMeshifyDownsampleAutoBuildPyramid:
             do_multires=True,
             num_lods=3,
             multires_strategy="downsample",
-            keep_intermediate_scales=False,  # default: clean up
+            delete_intermediate_scales=True,  # default: clean up
             target_faces_per_lod0_chunk=200,
             check_mesh_validity=False,
             do_analysis=False,

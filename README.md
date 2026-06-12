@@ -142,9 +142,10 @@ use_existing_scales: true        # Set false to FORCE in-worker downsampling at 
 # into `{output_directory}/_intermediate_scales.zarr` in a single
 # parallel super-chunk pass over s0. Each LOD then reads from the
 # pre-built pyramid instead of repeatedly re-reading s0.
-keep_intermediate_scales: false  # Keep the auto-built `_intermediate_scales.zarr` after the
-                                 # pipeline finishes. Useful for re-running with different mesh
-                                 # params on the same data; disk-heavy on big datasets. (default: false)
+delete_intermediate_scales: true # Delete the auto-built `_intermediate_scales.zarr` once the
+                                 # multires pipeline finishes. Set false to keep the pyramid
+                                 # around for re-running with different mesh params on the same
+                                 # data. (default: true)
 pyramid_alignment_mode: snap     # "snap" rounds an unaligned ROI INWARD to multiples of the
                                  # max per-axis factor (drops up to max_factor-1 voxels per edge);
                                  # "halo" rounds OUTWARD and reads beyond the ROI to complete the
