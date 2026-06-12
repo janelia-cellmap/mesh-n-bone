@@ -2205,22 +2205,51 @@ class Meshify:
             )
         downsample_func = downsample_dispatch[self.downsample_method]
 
-        # Choose a reasonable output chunk shape: largest multiple of source
-        # chunk shape that's also a multiple of max factor, capped at 256.
+        # Choose out_chunk_shape memory-aware. Each thread holds one super-chunk
+        # of s0 voxels in memory simultaneously, plus the per-LOD downsamples
+        # (cumulative ~1.14x of the s0 read for factors 2/4/8). Per-thread
+        # budget = per-worker dask budget / num_workers; cap super-chunk
+        # voxel count so the read + downsample fit comfortably (50% headroom).
         src_chunk = np.asarray(seg_arr.chunk_shape, dtype=np.int64)
         max_factor = np.max(np.array([f for _, f in needed_uniform]), axis=0)
-        # Round source chunk to be a multiple of max_factor; cap at 256
+        itemsize = int(np.dtype(seg_arr.data.dtype).itemsize)
+        # Amplification: downsample at every level holds an output buffer +
+        # an intermediate working buffer roughly equal to its own size.
+        # Sum over LODs: 1 (read) + sum(1/f^3) for k>=1, plus ~2x scratch.
+        amp_per_lod = sum(1.0 / (mf ** 3) for mf in (2, 4, 8))  # 0.142
+        amplification = 1.0 + amp_per_lod * 2.0  # ~1.3x
+
+        worker_mb = _estimate_block_target_mb_from_dask_config(
+            "dask-config.yaml",  # resolved relative to cwd (the config dir)
+            fallback_mb=2048,    # 2 GB sane default if dask config missing
+        )
+        per_thread_bytes = (
+            worker_mb * 1e6 / max(1, int(self.num_workers)) / amplification
+        )
+        max_super_chunk_voxels = int(per_thread_bytes / itemsize)
+
+        # Largest cube of voxels that fits and is a multiple of max_factor
+        # along each axis. cube_side = floor(cuberoot(max_voxels))
+        target_super_side = max(1, int(max_super_chunk_voxels ** (1.0 / 3.0)))
         out_chunk_shape = []
         for ax in range(3):
-            ch = int(src_chunk[ax])
             mf = int(max_factor[ax])
-            # round up to multiple of mf, then cap
-            ch = max(mf, (ch + mf - 1) // mf * mf)
-            ch = min(ch, 256)
-            # ensure still a multiple of mf after the cap
-            ch = (ch // mf) * mf
-            ch = max(ch, mf)
-            out_chunk_shape.append(ch)
+            super_side = (target_super_side // mf) * mf
+            super_side = max(mf, super_side)  # at least one max_factor cube
+            out_side = max(1, super_side // mf)
+            out_chunk_shape.append(out_side)
+
+        # Diagnostic so the chosen sizes are visible in the log
+        super_voxels = int(np.prod(np.array(out_chunk_shape) * max_factor))
+        super_bytes = super_voxels * itemsize
+        logger.info(
+            "pyramid_builder: per-worker budget %d MB, num_workers %d, dtype "
+            "itemsize %d → out_chunk_shape=%s, super_chunk_shape=%s "
+            "(%.1f MB s0 read per task)",
+            worker_mb, int(self.num_workers), itemsize,
+            out_chunk_shape, (np.array(out_chunk_shape) * max_factor).tolist(),
+            super_bytes / 1e6,
+        )
 
         # Build
         logger.info(
