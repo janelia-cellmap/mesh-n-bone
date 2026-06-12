@@ -462,24 +462,26 @@ def _write_assembly_memory_plan(output_directory, estimates, waves):
 
 
 def _safely_remove_pyramid(pyramid_path, num_workers=8):
-    """Delete the auto-built pyramid zarr in parallel without ever following symlinks.
+    """Delete the auto-built pyramid zarr with chunk-level parallelism.
 
     The pyramid's ``s0`` is a symlink to the USER'S INPUT data on local
     filesystems — under no circumstances should the cleanup follow it
-    into the target. We:
+    into the target. Process:
 
     1. Refuse to act when ``pyramid_path`` itself is a symlink.
-    2. Unlink every symlink found at the pyramid root explicitly,
-       BEFORE any recursive walk. (The recursive walk wouldn't follow
-       them either, but this is belt-and-braces for a destructive op.)
-    3. Spawn a thread pool to ``shutil.rmtree`` the real subdirectories
-       (one per pyramid level: s1, s2, ...) in parallel.
+    2. Walk the tree top-down WITHOUT following symlinks. Unlink every
+       symlink encountered immediately (the s0 link disappears here
+       BEFORE any parallel worker can race for it). Collect real files
+       (zarr chunk files + metadata) and real directories separately.
+    3. Partition the collected real files across ``num_workers`` threads;
+       each thread ``os.unlink``s its batch. This is where the chunk-
+       level parallelism happens — on shared filesystems
+       (Lustre/NFS/GPFS) where unlink throughput is metadata-server-
+       bound, parallel threads scale linearly up to the MDS cap.
+    4. Remove now-empty real directories bottom-up.
 
-    Parallelism: ``shutil.rmtree`` releases the GIL during ``os.unlink``
-    /``os.rmdir`` syscalls, so threads scale on shared filesystems
-    (Lustre/NFS/GPFS) where metadata operations are the bottleneck.
-    On a single-node SSD this still helps for trees with thousands of
-    chunks per array. Caller-tunable ``num_workers``.
+    Adapted from cellmap-analyze's depth-based blockwise delete pattern
+    in dask_util.py:delete_tmp_dir_blockwise.
     """
     if not os.path.isdir(pyramid_path):
         return
@@ -490,42 +492,61 @@ def _safely_remove_pyramid(pyramid_path, num_workers=8):
         )
         return
 
-    # Top-level inventory. Crucially: unlink symlinks first so the
-    # parallel rmtree below NEVER receives a path that points into the
-    # user's data.
-    real_dirs = []
+    # Step 1: walk and inventory. Unlink symlinks IMMEDIATELY at each
+    # level so the parallel batch below never sees a path that could
+    # follow into user data.
     real_files = []
-    for entry in os.scandir(pyramid_path):
-        if entry.is_symlink():
-            os.unlink(entry.path)
-        elif entry.is_dir(follow_symlinks=False):
-            real_dirs.append(entry.path)
-        else:
-            real_files.append(entry.path)
+    real_dirs = []
+    for root, dirs, files in os.walk(pyramid_path, topdown=True, followlinks=False):
+        real_dirs.append(root)
+        # Symlinks may appear as either files or dirs depending on target type.
+        surviving_files = []
+        for name in files:
+            full = os.path.join(root, name)
+            if os.path.islink(full):
+                try:
+                    os.unlink(full)
+                except OSError:
+                    pass
+            else:
+                surviving_files.append(full)
+        real_files.extend(surviving_files)
+        # Prune symlinked directories from descent + unlink them right now
+        surviving_dirs = []
+        for name in dirs:
+            full = os.path.join(root, name)
+            if os.path.islink(full):
+                try:
+                    os.unlink(full)
+                except OSError:
+                    pass
+            else:
+                surviving_dirs.append(name)
+        dirs[:] = surviving_dirs
 
-    # Small metadata files (.zattrs, .zgroup, info, etc.) — inline.
-    for f in real_files:
+    # Step 2: parallel unlink of all real files (the chunk-level work)
+    def _safe_unlink(path):
         try:
-            os.unlink(f)
+            os.unlink(path)
         except OSError:
             pass
 
-    # Parallel rmtree of pyramid level subdirectories
-    if real_dirs:
-        from concurrent.futures import ThreadPoolExecutor
-        max_workers = min(num_workers, len(real_dirs)) if num_workers else 1
-        with ThreadPoolExecutor(max_workers=max_workers) as ex:
-            # Use ignore_errors=True so a transient failure in one subtree
-            # doesn't abort cleanup of the rest. We don't care about residual
-            # files in the pyramid — they're never read again — but we DO want
-            # to clean up as much as possible.
-            list(ex.map(lambda p: shutil.rmtree(p, ignore_errors=True), real_dirs))
+    if real_files:
+        max_workers = max(1, int(num_workers))
+        if max_workers > 1 and len(real_files) > max_workers:
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=max_workers) as ex:
+                list(ex.map(_safe_unlink, real_files))
+        else:
+            for f in real_files:
+                _safe_unlink(f)
 
-    # Final rmdir of the now-empty pyramid root
-    try:
-        os.rmdir(pyramid_path)
-    except OSError:
-        pass
+    # Step 3: rmdir empty real directories bottom-up
+    for d in reversed(real_dirs):
+        try:
+            os.rmdir(d)
+        except OSError:
+            pass
 
 
 def _estimate_block_target_mb_from_dask_config(

@@ -367,6 +367,32 @@ class TestSymlinkSafeCleanup:
         assert (src / "DO_NOT_DELETE.txt").read_text() == "user's input data"
         assert (src / "subdir" / "deeper.txt").read_text() == "also critical"
 
+    def test_safe_remove_handles_many_chunk_files(self, tmp_path):
+        """Cleanup must scale to many chunk-like files (zarr v2 flat layout)
+        — each pyramid sk array is a single directory containing thousands
+        of small files. _safely_remove_pyramid partitions them across the
+        thread pool so chunk-file unlinks are parallel, not serialised."""
+        from mesh_n_bone.meshify.meshify import _safely_remove_pyramid
+
+        pyramid = tmp_path / "pyramid.zarr"
+        pyramid.mkdir()
+        (pyramid / ".zattrs").write_text("{}")
+        # Make a "fake s1 array" with many flat chunk files (like zarr v2)
+        s1 = pyramid / "s1"
+        s1.mkdir()
+        n_files = 500
+        for i in range(n_files):
+            (s1 / f"0.0.{i}").write_text(str(i))
+        # And a "fake s2 array" with fewer files
+        s2 = pyramid / "s2"
+        s2.mkdir()
+        for i in range(50):
+            (s2 / f"0.0.{i}").write_text(str(i))
+
+        _safely_remove_pyramid(str(pyramid), num_workers=8)
+        # Everything gone
+        assert not pyramid.exists()
+
     def test_safe_remove_refuses_to_delete_when_root_is_symlink(self, tmp_path):
         from mesh_n_bone.meshify.meshify import _safely_remove_pyramid
 
