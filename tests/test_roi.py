@@ -107,6 +107,7 @@ class TestMeshifyRoiConfig:
         from mesh_n_bone.meshify.meshify import Meshify
 
         m = Meshify(
+            do_multires=False,
             input_path=zarr_segmentation,
             output_directory=os.path.join(tmp_output_dir, "output"),
             roi={"begin": [0, 0, 0], "end": [16, 16, 16]},
@@ -125,6 +126,7 @@ class TestMeshifyRoiConfig:
         from mesh_n_bone.meshify.meshify import Meshify
 
         m = Meshify(
+            do_multires=False,
             input_path=zarr_segmentation,
             output_directory=os.path.join(tmp_output_dir, "output"),
             roi={"offset": [4, 4, 4], "shape": [20, 20, 20]},
@@ -144,6 +146,7 @@ class TestMeshifyRoiConfig:
 
         with pytest.raises(ValueError, match="must have"):
             Meshify(
+                do_multires=False,
                 input_path=zarr_segmentation,
                 output_directory=os.path.join(tmp_output_dir, "output"),
                 roi={"foo": [0, 0, 0], "bar": [10, 10, 10]},
@@ -157,6 +160,7 @@ class TestMeshifyRoiConfig:
 
         with pytest.raises(ValueError, match="must be a Roi"):
             Meshify(
+                do_multires=False,
                 input_path=zarr_segmentation,
                 output_directory=os.path.join(tmp_output_dir, "output"),
                 roi=[0, 0, 0, 10, 10, 10],
@@ -180,6 +184,7 @@ class TestMeshifyRoiIntegration:
         from mesh_n_bone.meshify.meshify import Meshify
 
         m = Meshify(
+            do_multires=False,
             input_path=input_path,
             output_directory=output_dir,
             roi={"begin": [0, 0, 0], "end": [16, 16, 16]},
@@ -210,6 +215,7 @@ class TestMeshifyRoiIntegration:
         from mesh_n_bone.meshify.meshify import Meshify
 
         m = Meshify(
+            do_multires=False,
             input_path=input_path,
             output_directory=output_dir,
             roi={"begin": [0, 0, 0], "end": [32, 32, 32]},
@@ -312,6 +318,7 @@ class TestMeshifyRoiBoundaryProtection:
         from mesh_n_bone.meshify.meshify import Meshify
 
         m_with = Meshify(
+            do_multires=False,
             input_path=zarr_segmentation,
             output_directory=os.path.join(tmp_output_dir, "with"),
             roi={"begin": [0, 0, 0], "end": [16, 16, 16]},
@@ -321,6 +328,7 @@ class TestMeshifyRoiBoundaryProtection:
         assert m_with.has_custom_roi is True
 
         m_without = Meshify(
+            do_multires=False,
             input_path=zarr_segmentation,
             output_directory=os.path.join(tmp_output_dir, "without"),
             num_workers=1,
@@ -373,6 +381,7 @@ class TestMeshifyRoiBoundaryProtection:
 
         output_dir = os.path.join(tmp_output_dir, "output")
         m = Meshify(
+            do_multires=False,
             input_path=input_path,
             output_directory=output_dir,
             roi={"begin": [0, 0, 0], "end": [16, 16, 16]},
@@ -430,6 +439,7 @@ class TestNeuroglancerCoordinateUnits:
         from mesh_n_bone.meshify.meshify import Meshify
 
         m = Meshify(
+            do_multires=False,
             input_path=zarr_segmentation,
             output_directory=os.path.join(tmp_output_dir, "output"),
             num_workers=1,
