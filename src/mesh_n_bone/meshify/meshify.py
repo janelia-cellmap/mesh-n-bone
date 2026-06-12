@@ -461,6 +461,49 @@ def _write_assembly_memory_plan(output_directory, estimates, waves):
         json.dump(plan, f, indent=2)
 
 
+def _safely_remove_pyramid(pyramid_path):
+    """Delete the auto-built pyramid zarr without ever following symlinks.
+
+    The pyramid's ``s0`` is a symlink to the USER'S INPUT data on local
+    filesystems. ``shutil.rmtree`` does the right thing here on modern
+    Python (it unlinks symlinks rather than following them), but we
+    belt-and-braces the safety: walk top-down, unlink every symlink
+    explicitly, then ``rmtree`` whatever remains.
+    """
+    if not os.path.isdir(pyramid_path):
+        return
+    if os.path.islink(pyramid_path):
+        # The pyramid root ITSELF is somehow a symlink. Don't touch.
+        logger.warning(
+            "Refusing to delete %s: it is itself a symlink. Manual cleanup required.",
+            pyramid_path,
+        )
+        return
+    # Walk top-down, unlinking symlinks explicitly. Anything left is a
+    # real directory or file the pyramid built itself.
+    for root, dirs, files in os.walk(pyramid_path, topdown=True, followlinks=False):
+        # Files including symlinks-to-files
+        for name in files:
+            os.unlink(os.path.join(root, name))
+        # Directories: handle symlinks-to-dirs here, prune from descent
+        survivors = []
+        for name in dirs:
+            full = os.path.join(root, name)
+            if os.path.islink(full):
+                os.unlink(full)
+                # Don't recurse into it — already unlinked from filesystem
+            else:
+                survivors.append(name)
+        dirs[:] = survivors
+    # Now empty real dirs from the bottom up
+    for root, dirs, _files in os.walk(pyramid_path, topdown=False, followlinks=False):
+        try:
+            os.rmdir(root)
+        except OSError:
+            # Non-empty (shouldn't happen) or already gone — skip
+            pass
+
+
 def _estimate_block_target_mb_from_dask_config(
     config_path="dask-config.yaml",
     fallback_mb=128,
@@ -883,7 +926,7 @@ class Meshify:
         multires_strategy: str = "downsample",
         use_existing_scales: bool = True,
         keep_intermediate_scales: bool = False,
-        pyramid_alignment_mode: str = "snap",
+        pyramid_alignment_mode: str = "halo",
         decimation_factor: int = 6,
         decimation_aggressiveness: int = 7,
         delete_decimated_meshes: bool = True,
@@ -2348,10 +2391,19 @@ class Meshify:
         # Pyramid scale cache: keep when explicitly requested for reuse,
         # otherwise tear down so the output dir doesn't accumulate the
         # downsampled-segmentation zarrs.
+        #
+        # CRITICAL: s0 inside the pyramid is a symlink to the user's
+        # original input array. shutil.rmtree on its own does the right
+        # thing (unlinks the symlink, doesn't follow it into the target),
+        # but we explicitly unlink every symlink first BEFORE the
+        # recursive tree walk runs — defensive coding around a
+        # destructive operation. Worst case if shutil.rmtree ever
+        # regressed: it would walk into the user's input and delete
+        # their data.
         pyramid_path = os.path.join(self.output_directory, "_intermediate_scales.zarr")
         if os.path.isdir(pyramid_path) and not self.keep_intermediate_scales:
             with Timing_Messager("Cleaning up intermediate scale zarr", logger):
-                shutil.rmtree(pyramid_path, ignore_errors=True)
+                _safely_remove_pyramid(pyramid_path)
 
         logger.info("Multires pipeline complete")
 

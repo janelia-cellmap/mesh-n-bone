@@ -331,6 +331,61 @@ class TestEndToEndPyramidBuild:
         assert os.path.isdir(os.path.join(out_path, "s2"))
 
 
+class TestSymlinkSafeCleanup:
+    """The pyramid's ``s0`` is a symlink to the user's input data.
+    Cleanup (whether via shutil.rmtree or our explicit walk) must
+    unlink the symlink — NEVER follow it into the input."""
+
+    def test_safe_remove_pyramid_preserves_symlink_target(self, tmp_path):
+        from mesh_n_bone.meshify.meshify import _safely_remove_pyramid
+
+        # Build a fake "source" directory with critical data
+        src = tmp_path / "important_source"
+        src.mkdir()
+        (src / "DO_NOT_DELETE.txt").write_text("user's input data")
+        (src / "subdir").mkdir()
+        (src / "subdir" / "deeper.txt").write_text("also critical")
+
+        # Build a fake pyramid with s0 -> src symlink
+        pyramid = tmp_path / "pyramid.zarr"
+        pyramid.mkdir()
+        (pyramid / ".zattrs").write_text("{}")
+        os.symlink(str(src), str(pyramid / "s0"))
+        (pyramid / "s1").mkdir()
+        (pyramid / "s1" / "data.bin").write_text("downsampled")
+
+        # Sanity: symlink works
+        assert (pyramid / "s0" / "DO_NOT_DELETE.txt").exists()
+
+        # Tear down via our helper
+        _safely_remove_pyramid(str(pyramid))
+
+        # Pyramid is gone
+        assert not pyramid.exists()
+        # Source SURVIVES with all contents
+        assert src.exists()
+        assert (src / "DO_NOT_DELETE.txt").read_text() == "user's input data"
+        assert (src / "subdir" / "deeper.txt").read_text() == "also critical"
+
+    def test_safe_remove_refuses_to_delete_when_root_is_symlink(self, tmp_path):
+        from mesh_n_bone.meshify.meshify import _safely_remove_pyramid
+
+        src = tmp_path / "real_data"
+        src.mkdir()
+        (src / "data.txt").write_text("real")
+
+        # Hostile setup: pyramid_path itself is a symlink
+        pyramid_link = tmp_path / "pyramid.zarr"
+        os.symlink(str(src), str(pyramid_link))
+
+        # Our helper refuses to delete a symlinked root
+        _safely_remove_pyramid(str(pyramid_link))
+
+        # Real data still exists
+        assert (src / "data.txt").read_text() == "real"
+        # The symlink itself may or may not be removed, but the target survives.
+
+
 class TestUnalignedRoiHalo:
     """When ROI is unaligned and alignment_mode='halo', the pyramid
     builder reads beyond the ROI to complete boundary cubes. Output
