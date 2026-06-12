@@ -2205,78 +2205,100 @@ class Meshify:
             )
         downsample_func = downsample_dispatch[self.downsample_method]
 
-        # Choose out_chunk_shape memory-aware. Each thread holds one super-chunk
-        # of s0 voxels in memory simultaneously, plus the per-LOD downsamples
-        # (cumulative ~1.14x of the s0 read for factors 2/4/8). Per-thread
-        # budget = per-worker dask budget / num_workers; cap super-chunk
-        # voxel count so the read + downsample fit comfortably (50% headroom).
-        src_chunk = np.asarray(seg_arr.chunk_shape, dtype=np.int64)
+        # Memory-aware sizing. Each thread holds one super-chunk of s0 voxels
+        # in memory simultaneously, plus the per-LOD downsamples (cumulative
+        # ~14% of the s0 read for factors 2/4/8) and scratch (~2x of that).
+        # Per-thread budget = per-worker dask memory budget / threads.
         max_factor = np.max(np.array([f for _, f in needed_uniform]), axis=0)
         itemsize = int(np.dtype(seg_arr.data.dtype).itemsize)
-        # Amplification: downsample at every level holds an output buffer +
-        # an intermediate working buffer roughly equal to its own size.
-        # Sum over LODs: 1 (read) + sum(1/f^3) for k>=1, plus ~2x scratch.
         amp_per_lod = sum(1.0 / (mf ** 3) for mf in (2, 4, 8))  # 0.142
-        amplification = 1.0 + amp_per_lod * 2.0  # ~1.3x
+        amplification = 1.0 + amp_per_lod * 2.0                # ~1.3x
 
         worker_mb = _estimate_block_target_mb_from_dask_config(
-            "dask-config.yaml",  # resolved relative to cwd (the config dir)
-            fallback_mb=2048,    # 2 GB sane default if dask config missing
-        )
-        per_thread_bytes = (
-            worker_mb * 1e6 / max(1, int(self.num_workers)) / amplification
-        )
-        max_super_chunk_voxels = int(per_thread_bytes / itemsize)
-
-        # Largest cube of voxels that fits and is a multiple of max_factor
-        # along each axis. cube_side = floor(cuberoot(max_voxels))
-        target_super_side = max(1, int(max_super_chunk_voxels ** (1.0 / 3.0)))
-        out_chunk_shape = []
-        for ax in range(3):
-            mf = int(max_factor[ax])
-            super_side = (target_super_side // mf) * mf
-            super_side = max(mf, super_side)  # at least one max_factor cube
-            out_side = max(1, super_side // mf)
-            out_chunk_shape.append(out_side)
-
-        # Diagnostic so the chosen sizes are visible in the log
-        super_voxels = int(np.prod(np.array(out_chunk_shape) * max_factor))
-        super_bytes = super_voxels * itemsize
-        logger.info(
-            "pyramid_builder: per-worker budget %d MB, num_workers %d, dtype "
-            "itemsize %d → out_chunk_shape=%s, super_chunk_shape=%s "
-            "(%.1f MB s0 read per task)",
-            worker_mb, int(self.num_workers), itemsize,
-            out_chunk_shape, (np.array(out_chunk_shape) * max_factor).tolist(),
-            super_bytes / 1e6,
+            "dask-config.yaml",
+            fallback_mb=2048,
         )
 
-        # Build
-        logger.info(
-            "pyramid_builder: %d missing scale(s) detected for downsample multires "
-            "(factors=%s); building under %s with alignment_mode=%s",
-            len(needed_uniform),
-            [factor for _, factor in needed_uniform],
-            pyramid_path,
-            self.pyramid_alignment_mode,
-        )
-        build_missing_pyramid_levels(
-            s0_reader=_s0_reader,
-            s0_dataset_shape_voxels=dataset_shape,
-            s0_voxel_size_zyx=self.true_voxel_size.tolist(),
-            s0_translation_zyx=self.true_offset.tolist(),
-            dtype=seg_arr.data.dtype,
-            num_lods=num_lods,
-            existing_factors=set(),  # build all uniform-factor levels into pyramid
-            output_zarr_path=pyramid_path,
-            downsample_func=downsample_func,
-            roi_origin_voxels=roi_voxel_origin,
-            roi_shape_voxels=roi_voxel_shape,
-            out_chunk_shape_voxels=tuple(out_chunk_shape),
-            alignment_mode=self.pyramid_alignment_mode,
-            s0_source_path=self._dataset_path,
-            num_workers=max(1, int(self.num_workers)),
-        )
+        def _size_super_chunk(thread_count):
+            """Choose out_chunk_shape so each of ``thread_count`` threads
+            can hold one super-chunk plus scratch within the per-worker
+            memory budget."""
+            per_thread_bytes = (
+                worker_mb * 1e6 / max(1, int(thread_count)) / amplification
+            )
+            max_super_voxels = int(per_thread_bytes / itemsize)
+            target_super_side = max(1, int(max_super_voxels ** (1.0 / 3.0)))
+            shape = []
+            for ax in range(3):
+                mf = int(max_factor[ax])
+                super_side = (target_super_side // mf) * mf
+                super_side = max(mf, super_side)
+                shape.append(max(1, super_side // mf))
+            return shape
+
+        # Build, with OOM retry that halves thread count + re-sizes super-chunks
+        # if the worker runs out of memory. Mirrors run_with_oom_retry on the
+        # mesh side, scoped to the pyramid build.
+        max_retries = int(getattr(self, "memory_retry_max", 3))
+        attempt_workers = max(1, int(self.num_workers))
+        last_exc = None
+        for attempt in range(max_retries + 1):
+            out_chunk_shape = _size_super_chunk(attempt_workers)
+            super_voxels = int(np.prod(np.array(out_chunk_shape) * max_factor))
+            super_bytes = super_voxels * itemsize
+            logger.info(
+                "pyramid_builder: %sattempt %d: per-worker budget %d MB, "
+                "threads %d, dtype itemsize %d → out_chunk_shape=%s, "
+                "super_chunk_shape=%s (%.1f MB s0 read per task)",
+                "" if attempt == 0 else "retry ",
+                attempt + 1, worker_mb, attempt_workers, itemsize,
+                out_chunk_shape,
+                (np.array(out_chunk_shape) * max_factor).tolist(),
+                super_bytes / 1e6,
+            )
+            if attempt == 0:
+                logger.info(
+                    "pyramid_builder: %d missing scale(s) detected for "
+                    "downsample multires (factors=%s); building under %s "
+                    "with alignment_mode=%s",
+                    len(needed_uniform),
+                    [factor for _, factor in needed_uniform],
+                    pyramid_path, self.pyramid_alignment_mode,
+                )
+            try:
+                build_missing_pyramid_levels(
+                    s0_reader=_s0_reader,
+                    s0_dataset_shape_voxels=dataset_shape,
+                    s0_voxel_size_zyx=self.true_voxel_size.tolist(),
+                    s0_translation_zyx=self.true_offset.tolist(),
+                    dtype=seg_arr.data.dtype,
+                    num_lods=num_lods,
+                    existing_factors=set(),
+                    output_zarr_path=pyramid_path,
+                    downsample_func=downsample_func,
+                    roi_origin_voxels=roi_voxel_origin,
+                    roi_shape_voxels=roi_voxel_shape,
+                    out_chunk_shape_voxels=tuple(out_chunk_shape),
+                    alignment_mode=self.pyramid_alignment_mode,
+                    s0_source_path=self._dataset_path,
+                    num_workers=attempt_workers,
+                )
+                break
+            except MemoryError as e:
+                last_exc = e
+                if attempt_workers == 1 or attempt >= max_retries:
+                    raise
+                new_workers = max(1, attempt_workers // 2)
+                logger.warning(
+                    "pyramid_builder: MemoryError on attempt %d with %d threads. "
+                    "Halving to %d threads and retrying with larger per-thread "
+                    "memory budget (which means bigger super-chunks).",
+                    attempt + 1, attempt_workers, new_workers,
+                )
+                attempt_workers = new_workers
+                # Tear down whatever partial pyramid landed before retrying
+                if os.path.isdir(pyramid_path):
+                    _safely_remove_pyramid(pyramid_path, num_workers=attempt_workers)
 
         # Return mapping of newly-built factors -> path within the pyramid
         return {
