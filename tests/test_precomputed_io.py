@@ -68,11 +68,20 @@ class TestKvstoreForUrl:
         assert kv == {"driver": "gcs", "bucket": "my-bucket"}
         assert path == "data/segmentation"
 
-    def test_s3_url(self):
+    def test_s3_url(self, monkeypatch):
+        # With no AWS env vars set, the S3 kvstore now defaults to anonymous
+        # credentials to avoid the multi-second IMDS / credential-chain
+        # timeout on public buckets like OpenOrganelle. See
+        # ``_should_use_anonymous_s3`` in zarr_io.
+        for k in ("AWS_ACCESS_KEY_ID", "AWS_PROFILE", "AWS_ENDPOINT_URL"):
+            monkeypatch.delenv(k, raising=False)
         kv, path = precomputed_io._kvstore_for_url(
             "s3://my-bucket/path/to/seg"
         )
-        assert kv == {"driver": "s3", "bucket": "my-bucket"}
+        assert kv == {
+            "driver": "s3", "bucket": "my-bucket",
+            "aws_credentials": {"type": "anonymous"},
+        }
         assert path == "path/to/seg"
 
     def test_http_url(self):

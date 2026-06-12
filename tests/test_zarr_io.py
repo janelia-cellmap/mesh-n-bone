@@ -493,3 +493,69 @@ class TestFunlibHelper:
         }
         vs, _ = _read_funlib_voxel_offset(attrs)
         assert vs == [4.0, 4.0, 4.0]
+
+
+class TestS3AnonymousCredentials:
+    """When no AWS credentials are configured in the environment, the
+    S3 kvstore spec must include ``aws_credentials: {type: anonymous}``
+    so tensorstore skips the multi-second IMDS / credential-chain
+    timeout on every fresh OpenOrganelle / COSEM read (~7s -> ~0.2s).
+
+    The heuristic checks three env vars (AWS_ACCESS_KEY_ID, AWS_PROFILE,
+    AWS_ENDPOINT_URL). If any is set, the user has explicit
+    intent — credentials, profile, or a moto/MinIO endpoint that
+    needs credentials — so we don't override."""
+
+    @pytest.fixture
+    def clean_aws_env(self, monkeypatch):
+        for k in ("AWS_ACCESS_KEY_ID", "AWS_PROFILE", "AWS_ENDPOINT_URL"):
+            monkeypatch.delenv(k, raising=False)
+
+    def test_anonymous_when_no_aws_env_vars(self, clean_aws_env):
+        from mesh_n_bone.util.zarr_io import kvstore_for_path
+        spec, path = kvstore_for_path("s3://openorganelle/data.zarr")
+        assert spec["driver"] == "s3"
+        assert spec["bucket"] == "openorganelle"
+        assert spec.get("aws_credentials") == {"type": "anonymous"}
+        assert path == "data.zarr"
+
+    def test_no_anonymous_when_access_key_set(self, clean_aws_env, monkeypatch):
+        from mesh_n_bone.util.zarr_io import kvstore_for_path
+        monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIA...")
+        spec, _ = kvstore_for_path("s3://private/data.zarr")
+        assert "aws_credentials" not in spec
+
+    def test_no_anonymous_when_profile_set(self, clean_aws_env, monkeypatch):
+        from mesh_n_bone.util.zarr_io import kvstore_for_path
+        monkeypatch.setenv("AWS_PROFILE", "default")
+        spec, _ = kvstore_for_path("s3://private/data.zarr")
+        assert "aws_credentials" not in spec
+
+    def test_no_anonymous_when_endpoint_url_set(self, clean_aws_env, monkeypatch):
+        from mesh_n_bone.util.zarr_io import kvstore_for_path
+        monkeypatch.setenv("AWS_ENDPOINT_URL", "http://localhost:5000")
+        spec, _ = kvstore_for_path("s3://moto-bucket/data.zarr")
+        assert "aws_credentials" not in spec
+
+    def test_explicit_anonymous_kwarg_wins(self, clean_aws_env, monkeypatch):
+        from mesh_n_bone.util.zarr_io import kvstore_for_path
+        # Force anonymous=False even with no env vars
+        monkeypatch.delenv("AWS_ACCESS_KEY_ID", raising=False)
+        spec, _ = kvstore_for_path("s3://bucket/data.zarr", anonymous=False)
+        assert "aws_credentials" not in spec
+        # Force anonymous=True even with AWS_ACCESS_KEY_ID set
+        monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIA...")
+        spec, _ = kvstore_for_path("s3://bucket/data.zarr", anonymous=True)
+        assert spec.get("aws_credentials") == {"type": "anonymous"}
+
+    def test_non_s3_schemes_unaffected(self, clean_aws_env):
+        from mesh_n_bone.util.zarr_io import kvstore_for_path
+        # gs: should never get aws_credentials regardless of env
+        spec, _ = kvstore_for_path("gs://bucket/data.zarr")
+        assert "aws_credentials" not in spec
+        # http: same
+        spec, _ = kvstore_for_path("https://example.com/data.zarr")
+        assert "aws_credentials" not in spec
+        # file: same
+        spec, _ = kvstore_for_path("/local/data.zarr")
+        assert "aws_credentials" not in spec
