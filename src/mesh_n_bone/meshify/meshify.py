@@ -2192,36 +2192,61 @@ class Meshify:
             )
         downsample_func = downsample_dispatch[self.downsample_method]
 
-        # Memory-aware sizing. With streaming writes (downsample_super_chunk's
-        # write_chunk callback), each thread holds at most: the s0 super-chunk
-        # + ONE LOD's output buffer at a time. Largest LOD output is LOD 1
-        # (1/8 of s0). Plus scratch (~2x of the LOD output).
+        # Two decoupled sizes:
+        #   out_chunk_shape:  on-disk chunk shape of the s_k zarr arrays.
+        #                     Should be a SANE chunk size (~64-128) so
+        #                     subsequent reads from the s_k arrays
+        #                     produce a manageable number of files.
+        #                     Independent of memory budget.
+        #   super_chunk_shape:  region of s0 each worker task reads. Must
+        #                     be a multiple of out_chunk_shape * max_factor
+        #                     (so each task fills an integer number of
+        #                     output chunks at every LOD). Sized to fit
+        #                     per-worker memory budget.
         max_factor = np.max(np.array([f for _, f in needed_uniform]), axis=0)
         itemsize = int(np.dtype(seg_arr.data.dtype).itemsize)
         # 1.0 (s0 read) + 1/8 (LOD 1 output) + ~2*1/8 (downsample scratch)
         amplification = 1.0 + 1.0 / 8.0 + 2.0 / 8.0            # ~1.375x
+
+        # Sane output chunk shape: inherit s0's chunk shape, clamped to
+        # the [32, 256] range and rounded to a multiple of max_factor per
+        # axis. 32 is the lower bound for "not silly small"; 256 caps
+        # the file size to ~16 MiB at uint8.
+        SANE_CHUNK_MIN = 32
+        SANE_CHUNK_MAX = 256
+        src_chunk = np.asarray(seg_arr.chunk_shape, dtype=np.int64)
+        out_chunk_shape = []
+        for ax in range(3):
+            mf = int(max_factor[ax])
+            ch = int(src_chunk[ax])
+            ch = max(SANE_CHUNK_MIN, min(SANE_CHUNK_MAX, ch))
+            # round to multiple of mf (so super-chunk * mf = out chunk)
+            ch = max(mf, (ch // mf) * mf)
+            out_chunk_shape.append(ch)
+        out_chunk_arr = np.asarray(out_chunk_shape, dtype=np.int64)
 
         worker_mb = _estimate_block_target_mb_from_dask_config(
             "dask-config.yaml",
             fallback_mb=2048,
         )
 
-        def _size_super_chunk(thread_count):
-            """Choose out_chunk_shape so each of ``thread_count`` threads
-            can hold one super-chunk plus scratch within the per-worker
-            memory budget."""
-            per_thread_bytes = (
-                worker_mb * 1e6 / max(1, int(thread_count)) / amplification
-            )
-            max_super_voxels = int(per_thread_bytes / itemsize)
-            target_super_side = max(1, int(max_super_voxels ** (1.0 / 3.0)))
-            shape = []
-            for ax in range(3):
-                mf = int(max_factor[ax])
-                super_side = (target_super_side // mf) * mf
-                super_side = max(mf, super_side)
-                shape.append(max(1, super_side // mf))
-            return shape
+        def _size_super_chunk(per_worker_mb):
+            """Choose super_chunk_shape (in s0 voxels). Each worker
+            process holds at most one super-chunk + one LOD output + scratch
+            in memory at any time. ``per_worker_mb`` is per-process
+            budget (NOT per-thread / not divided by num_workers — each
+            dask worker is its own LSF process).
+
+            Returns the super_chunk_shape as a multiple of
+            ``out_chunk_shape * max_factor`` (so each task fills integer
+            output chunks at every LOD).
+            """
+            budget_bytes = max(1e6, per_worker_mb * 1e6 / amplification)
+            base_chunk_voxels = float(np.prod(out_chunk_arr * max_factor))
+            base_chunk_bytes = base_chunk_voxels * itemsize
+            multiplier = max(1, int(budget_bytes // max(1, base_chunk_bytes)))
+            multi_side = max(1, int(multiplier ** (1.0 / 3.0)))
+            return (out_chunk_arr * max_factor * multi_side).tolist()
 
         # Resolve ROI alignment up-front (we need the aligned out_shape to
         # build the output zarr arrays)
@@ -2258,29 +2283,72 @@ class Meshify:
             pyramid_path, self.pyramid_alignment_mode,
         )
 
-        # OOM retry loop. On MemoryError from any worker, we halve the worker
-        # count (giving each worker 2x memory) and recompute a bigger
-        # super-chunk size.
+        # Load dask config once. We use it to compute per-worker memory
+        # budget (= job_memory / processes_per_job) and to feed into
+        # run_with_oom_retry.
+        try:
+            base_dask_config = dask_util._load_dask_config()
+        except (FileNotFoundError, OSError):
+            base_dask_config = None
+        cluster_type, settings = _jobqueue_settings(base_dask_config) if base_dask_config else (None, None)
+        base_processes = int((settings or {}).get("processes", 1) or 1)
+        job_memory = _job_memory_bytes(settings)
+        fallback_per_worker_mb = 2048
+
+        # Proactive sizing — mirror assembly's _plan_assembly_waves pattern.
+        # For pyramid we have one "estimate" (per-super-chunk peak memory)
+        # since all tasks are identical, so it reduces to: size the
+        # super-chunk at the base per-worker budget, then if the minimum
+        # possible super-chunk wouldn't fit, halve processes-per-job to
+        # give each worker more memory.
+        starting_processes = base_processes
+        if job_memory is not None:
+            tentative_super = _size_super_chunk(
+                (job_memory / base_processes) / 1e6
+            )
+            tentative_peak_bytes = int(
+                np.prod(tentative_super) * itemsize * amplification
+            )
+            starting_processes = _recommended_assembly_processes(
+                tentative_peak_bytes, job_memory, base_processes,
+                memory_fraction=0.60,
+            )
+            if starting_processes != base_processes:
+                logger.info(
+                    "pyramid_builder: minimum super-chunk peak %.1f MB > "
+                    "job_memory/base_processes; reducing processes/job %d → %d "
+                    "(2x memory per worker)",
+                    tentative_peak_bytes / 1e6,
+                    base_processes, starting_processes,
+                )
+
+        # OOM retry loop. On MemoryError, halve processes-per-job further
+        # (gives each worker another 2× memory) and rebuild the super-chunk.
         max_retries = int(getattr(self, "memory_retry_max", 3))
-        attempt_workers = max(1, int(self.num_workers))
+        attempt_processes = starting_processes
         for attempt in range(max_retries + 1):
-            out_chunk_shape = _size_super_chunk(attempt_workers)
-            super_voxels = int(np.prod(np.array(out_chunk_shape) * max_factor))
-            super_bytes = super_voxels * itemsize
+            # Per-worker memory: each LSF job hosts `processes` worker
+            # processes sharing the job's memory. Each worker holds ONE
+            # super-chunk in flight.
+            if job_memory is not None and attempt_processes > 0:
+                per_worker_mb = (job_memory / attempt_processes) / 1e6
+            else:
+                per_worker_mb = fallback_per_worker_mb
+
+            super_chunk_shape = _size_super_chunk(per_worker_mb)
+            super_chunk_arr = np.asarray(super_chunk_shape, dtype=np.int64)
+            super_bytes = int(np.prod(super_chunk_arr)) * itemsize
             logger.info(
-                "pyramid_builder: %sattempt %d: dask cluster workers=%d, "
-                "per-worker budget %d MB, dtype itemsize %d → "
-                "out_chunk_shape=%s, super_chunk_shape=%s "
+                "pyramid_builder: %sattempt %d: per-worker budget %.0f MB, "
+                "processes/job=%d → out_chunk_shape=%s, super_chunk_shape=%s "
                 "(%.1f MB s0 read per task)",
                 "" if attempt == 0 else "retry ",
-                attempt + 1, attempt_workers, worker_mb, itemsize,
-                out_chunk_shape,
-                (np.array(out_chunk_shape) * max_factor).tolist(),
-                super_bytes / 1e6,
+                attempt + 1, per_worker_mb, attempt_processes,
+                out_chunk_shape, super_chunk_shape, super_bytes / 1e6,
             )
 
             # Driver-side: write OME metadata + create empty output arrays
-            super_chunk_shape, _ = prepare_pyramid_metadata_and_arrays(
+            prepare_pyramid_metadata_and_arrays(
                 output_zarr_path=pyramid_path,
                 factors_per_lod=factors_per_lod_full,
                 missing_lods=[k for k, _ in needed_uniform],
@@ -2292,21 +2360,20 @@ class Meshify:
                 s0_source_path=self._dataset_path,
             )
 
-            # Build the super-chunk grid (in s0 voxels)
+            # Super-chunk grid (in s0 voxels)
             sc_grid = []
             for z0 in range(int(aligned_out_origin[0]),
                             int(aligned_out_origin[0] + aligned_out_shape[0]),
-                            int(super_chunk_shape[0])):
+                            int(super_chunk_arr[0])):
                 for y0 in range(int(aligned_out_origin[1]),
                                 int(aligned_out_origin[1] + aligned_out_shape[1]),
-                                int(super_chunk_shape[1])):
+                                int(super_chunk_arr[1])):
                     for x0 in range(int(aligned_out_origin[2]),
                                     int(aligned_out_origin[2] + aligned_out_shape[2]),
-                                    int(super_chunk_shape[2])):
+                                    int(super_chunk_arr[2])):
                         sc_grid.append((z0, y0, x0))
             n_chunks = len(sc_grid)
 
-            # Worker config: must be picklable (no closures, no opened handles)
             worker_config = {
                 "s0_dataset_path": dataset_path,
                 "dataset_offset": tuple(int(v) for v in seg_arr.roi.offset),
@@ -2317,82 +2384,42 @@ class Meshify:
                 "missing_lods": [k for k, _ in needed_uniform],
                 "downsample_method": self.downsample_method,
                 "pyramid_path": pyramid_path,
-                "super_chunk_shape": tuple(int(v) for v in super_chunk_shape.tolist()),
+                "super_chunk_shape": tuple(int(v) for v in super_chunk_arr.tolist()),
                 "out_origin": tuple(int(v) for v in aligned_out_origin.tolist()),
             }
 
-            # Smart dask sizing — match the assembly pipeline's pattern:
-            # estimate per-task peak memory, recommend processes-per-LSF-job
-            # so each worker has enough memory for one super-chunk, build the
-            # adjusted dask config up-front, then let run_with_oom_retry
-            # halve further on actual OOM.
-            #
-            # Tolerant of missing dask-config.yaml: tests (and runs that
-            # don't use LSF) can dispatch via a LocalCluster without a
-            # jobqueue config — in that case run_with_oom_retry gets
-            # config=None and starts a LocalCluster.
-            adjusted_dask_config = None
-            workers_with_adjusted = attempt_workers
-            try:
-                base_dask_config = dask_util._load_dask_config()
-            except (FileNotFoundError, OSError):
-                base_dask_config = None
-            if base_dask_config:
-                cluster_type, settings = _jobqueue_settings(base_dask_config)
-                base_processes = int((settings or {}).get("processes", 1) or 1)
-                job_memory = _job_memory_bytes(settings)
-                per_task_peak_bytes = int(super_bytes * amplification)
-                recommended_processes = _recommended_assembly_processes(
-                    per_task_peak_bytes, job_memory, base_processes,
-                    memory_fraction=0.60,
-                )
+            # Build adjusted dask config when processes/job has changed
+            if base_dask_config and attempt_processes != base_processes:
                 adjusted_dask_config = _assembly_config_for_processes(
-                    base_dask_config, cluster_type, recommended_processes,
+                    base_dask_config, cluster_type, attempt_processes,
                 )
-                if recommended_processes < base_processes:
-                    # Each LSF job now hosts fewer processes (= workers), so
-                    # we need MORE jobs to keep the requested total worker
-                    # count. dask-jobqueue spins one LSF job per "worker" in
-                    # the user's request, with `processes` workers in each
-                    # job. Increase the requested-job count proportionally.
-                    workers_with_adjusted = max(
-                        1,
-                        attempt_workers * base_processes // recommended_processes,
-                    )
-                if recommended_processes != base_processes:
-                    logger.info(
-                        "pyramid_builder: super-chunk peak %.1f MB per task vs "
-                        "job memory %.1f MB / %d base processes = %.1f MB each → "
-                        "reducing processes/job to %d (2x memory per worker)",
-                        per_task_peak_bytes / 1e6,
-                        (job_memory or 0) / 1e6, base_processes,
-                        (job_memory or 0) / max(1, base_processes) / 1e6,
-                        recommended_processes,
-                    )
+                # When we shrink processes-per-job, we need MORE jobs to
+                # keep the requested total worker count.
+                workers_with_adjusted = max(
+                    1,
+                    int(self.num_workers) * base_processes // attempt_processes,
+                )
+            else:
+                adjusted_dask_config = base_dask_config
+                workers_with_adjusted = max(1, int(self.num_workers))
 
-            # Diagnostic: show the driver process's actual file-descriptor
-            # limit. The earlier crash at ~576 workers with EMFILE was
-            # surprising given the shell's ulimit -n = 1M; if we see a
-            # different number here, that's the root cause.
+            # Raise the FD soft limit to the hard cap so dask's
+            # scheduler↔worker sockets don't trip EMFILE at high worker
+            # counts. Silent: log only on actual failure.
             try:
                 import resource as _resource
                 soft, hard = _resource.getrlimit(_resource.RLIMIT_NOFILE)
                 if hard > soft:
                     _resource.setrlimit(_resource.RLIMIT_NOFILE, (hard, hard))
-                    logger.info(
-                        "pyramid_builder: FD soft limit raised %d → %d "
-                        "(hard cap)", soft, hard,
-                    )
-                else:
-                    logger.info(
-                        "pyramid_builder: FD soft limit %d, hard %d (no raise needed)",
-                        soft, hard,
-                    )
             except (ImportError, ValueError, OSError) as _e:
                 logger.warning("pyramid_builder: could not adjust FD limit: %s", _e)
 
             effective_workers = dask_util.effective_num_workers(
                 workers_with_adjusted, n_chunks, logger, "pyramid build",
+            )
+            logger.info(
+                "pyramid_builder: dispatching %d super-chunks across %d "
+                "dask workers", n_chunks, effective_workers,
             )
 
             def _run(workers, dask_config):
@@ -2418,18 +2445,18 @@ class Meshify:
                 )
                 break
             except MemoryError:
-                if attempt_workers == 1 or attempt >= max_retries:
+                if attempt_processes == 1 or attempt >= max_retries:
                     raise
-                new_workers = max(1, attempt_workers // 2)
+                new_processes = max(1, attempt_processes // 2)
                 logger.warning(
-                    "pyramid_builder: MemoryError on attempt %d with %d workers. "
-                    "Halving to %d workers and retrying with a larger per-worker "
-                    "memory budget.",
-                    attempt + 1, attempt_workers, new_workers,
+                    "pyramid_builder: MemoryError on attempt %d with "
+                    "processes/job=%d. Halving processes/job to %d (2x memory "
+                    "per worker) and retrying.",
+                    attempt + 1, attempt_processes, new_processes,
                 )
-                attempt_workers = new_workers
+                attempt_processes = new_processes
                 if os.path.isdir(pyramid_path):
-                    _safely_remove_pyramid(pyramid_path, num_workers=attempt_workers)
+                    _safely_remove_pyramid(pyramid_path, num_workers=max(1, int(self.num_workers)))
 
         # Return mapping of newly-built factors -> path within the pyramid
         return {
