@@ -40,6 +40,7 @@ class TestMeshifyFromZarr:
         output_dir = os.path.join(tmp_output_dir, "output")
 
         m = Meshify(
+            do_multires=False,
             input_path=input_path,
             output_directory=output_dir,
             num_workers=1,
@@ -73,6 +74,7 @@ class TestMeshifyFromZarr:
         output_dir = os.path.join(tmp_output_dir, "output")
 
         m = Meshify(
+            do_multires=False,
             input_path=input_path,
             output_directory=output_dir,
             num_workers=1,
@@ -110,6 +112,7 @@ class TestMeshifyFromZarr:
             f.write("id\n1\n3\n")
 
         m = Meshify(
+            do_multires=False,
             input_path=input_path,
             output_directory=output_dir,
             num_workers=1,
@@ -137,6 +140,7 @@ class TestMeshifyFromZarr:
         output_dir = os.path.join(tmp_output_dir, "output")
 
         m = Meshify(
+            do_multires=False,
             input_path=input_path,
             output_directory=output_dir,
             num_workers=1,
@@ -163,6 +167,7 @@ class TestMeshifyFromZarr:
         output_dir = os.path.join(tmp_output_dir, "output")
 
         m = Meshify(
+            do_multires=False,
             input_path=input_path,
             output_directory=output_dir,
             num_workers=1,
@@ -193,6 +198,7 @@ class TestMeshifyWithSimplification:
         # First: no simplification
         output_raw = os.path.join(tmp_output_dir, "output_raw")
         m_raw = Meshify(
+            do_multires=False,
             input_path=input_path,
             output_directory=output_raw,
             num_workers=1,
@@ -208,6 +214,7 @@ class TestMeshifyWithSimplification:
         # Second: with simplification
         output_simp = os.path.join(tmp_output_dir, "output_simp")
         m_simp = Meshify(
+            do_multires=False,
             input_path=input_path,
             output_directory=output_simp,
             num_workers=1,
@@ -233,6 +240,7 @@ class TestMeshifyWithSimplification:
         output_dir = os.path.join(tmp_output_dir, "output")
 
         m = Meshify(
+            do_multires=False,
             input_path=input_path,
             output_directory=output_dir,
             num_workers=1,
@@ -261,6 +269,7 @@ class TestMeshifyWithDownsampling:
         output_dir = os.path.join(tmp_output_dir, "output")
 
         m = Meshify(
+            do_multires=False,
             input_path=input_path,
             output_directory=output_dir,
             num_workers=1,
@@ -525,6 +534,7 @@ class TestMeshifyNeuroglancerOutput:
         output_dir = os.path.join(tmp_output_dir, "output")
 
         m = Meshify(
+            do_multires=False,
             input_path=input_path,
             output_directory=output_dir,
             num_workers=1,
@@ -558,6 +568,7 @@ class TestMeshifyNeuroglancerOutput:
         output_dir = os.path.join(tmp_output_dir, "output")
 
         m = Meshify(
+            do_multires=False,
             input_path=input_path,
             output_directory=output_dir,
             num_workers=1,
@@ -594,6 +605,7 @@ class TestMeshifyWithAnalysis:
         output_dir = os.path.join(tmp_output_dir, "output")
 
         m = Meshify(
+            do_multires=False,
             input_path=input_path,
             output_directory=output_dir,
             num_workers=1,
@@ -630,6 +642,7 @@ class TestMeshifyAnisotropicVoxels:
         output_dir = os.path.join(tmp_output_dir, "output")
 
         m = Meshify(
+            do_multires=False,
             input_path=input_path,
             output_directory=output_dir,
             num_workers=1,
@@ -671,6 +684,7 @@ class TestMeshifyFixedEdgeSimplification:
         output_dir = os.path.join(tmp_output_dir, "output")
 
         m = Meshify(
+            do_multires=False,
             input_path=input_path,
             output_directory=output_dir,
             num_workers=1,
@@ -712,6 +726,7 @@ class TestMeshifyFixedEdgeSimplification:
         output_dir = os.path.join(tmp_output_dir, "output")
 
         m = Meshify(
+            do_multires=False,
             input_path=input_path,
             output_directory=output_dir,
             num_workers=1,
@@ -744,6 +759,7 @@ class TestMeshifyFixedEdgeSimplification:
         output_dir = os.path.join(tmp_output_dir, "output")
 
         m = Meshify(
+            do_multires=False,
             input_path=input_path,
             output_directory=output_dir,
             num_workers=1,

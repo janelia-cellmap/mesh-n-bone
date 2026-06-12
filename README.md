@@ -99,7 +99,7 @@ downsample_method: mode          # Downsampling method: mode, mode_suppress_zero
 do_simplification: true          # Simplify meshes after assembly (default: true)
 target_reduction: 0.933          # Total fraction of faces to remove (default: 0.933, hemibrain-matched)
 n_smoothing_iter: 2              # Taubin smoothing iterations (default: 2)
-check_mesh_validity: false       # Require watertight meshes (default: true; disable for ROI)
+check_mesh_validity: false       # Validate watertightness + winding after simplify+smooth (default: false; turn on for strict validation)
 # When smooth_before_simplify is true (default), Taubin smoothing runs on the
 # DENSE assembled mesh first, then quadric decimation collapses the smooth
 # surface to target_reduction. Empirically ~2x lower RMS deviation from the
@@ -115,10 +115,10 @@ smooth_before_simplify: true     # (default: true)
 # When false, a single standard simplification pass runs after assembly.
 use_fixed_edge_simplification: true  # (default: false)
 stage_1_reduction_fraction: 0.5      # Share of target_reduction in the per-chunk stage (default: 0.5)
-do_analysis: false               # Compute mesh metrics CSV (default: true)
+do_analysis: false               # Compute mesh metrics CSV after meshing (default: false)
 
 # ── Multiresolution output ──
-do_multires: true                # Also generate neuroglancer multilod_draco output (default: false)
+do_multires: true                # Also generate neuroglancer multilod_draco output (default: true)
 num_lods: 4                      # Number of levels of detail (default: 4)
 multires_strategy: downsample    # LOD strategy: decimate (face-decimate s0 mesh for higher LODs) or
                                  # downsample (re-mesh from progressively downsampled volumes,
@@ -141,7 +141,7 @@ decimation_factor: 6             # Per-LOD face reduction factor. In decimate st
                                  # between LODs. In downsample strategy: target ratio used to derive
                                  # per-LOD target_reduction so the LOD-to-LOD face count drops by this
                                  # factor. (default: 6, hemibrain-matched)
-delete_decimated_meshes: true    # Remove intermediate LOD mesh files (default: true)
+delete_decimated_meshes: true    # Remove intermediate LOD mesh files after Draco output (default: true)
 
 # ── Sharded output (recommended for thousands of meshes) ──
 sharded: true                    # Pack all meshes into a few <n>.shard files

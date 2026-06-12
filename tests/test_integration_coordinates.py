@@ -22,6 +22,10 @@ def _run_meshify(input_path, output_dir, **kwargs):
         check_mesh_validity=False,
         do_analysis=False,
         n_smoothing_iter=0,
+        # do_multires now defaults to True at the Meshify level; these
+        # tests inspect single-res PLYs under output/meshes/, so opt out
+        # unless the caller explicitly turns it back on.
+        do_multires=False,
     )
     defaults.update(kwargs)
     meshify = Meshify(input_path=input_path, output_directory=output_dir, **defaults)
