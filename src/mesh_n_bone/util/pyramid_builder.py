@@ -210,28 +210,45 @@ def downsample_super_chunk(
     per_lod_factors: list[tuple[int, int, int]],
     downsample_func,
     out_chunk_shape: np.ndarray,
-) -> dict[int, tuple[np.ndarray, np.ndarray]]:
-    """Compute all-LOD downsamples for a single super-chunk of s0.
+    write_chunk=None,
+) -> dict[int, tuple[np.ndarray, np.ndarray]] | None:
+    """Direct-downsample a single super-chunk of s0 into all LODs.
 
-    ``s0_block`` is the s0 voxel data covering the super-chunk extent
-    (caller is responsible for reading + clipping/zero-padding).
-    Returns ``{lod: (output_block, output_origin_voxels)}`` for every
-    LOD ≥ 1. LOD 0 isn't emitted — the caller writes/links s0 separately.
+    Each output LOD voxel = ``downsample_func(s0 cube)`` where the cube
+    extent is the LOD's per-axis cumulative factor. We downsample s0
+    directly at each LOD (not s_{k-1} → s_k cascade).
+
+    Memory: with the ``write_chunk`` callback, each LOD's output is
+    written immediately and dropped — peak in-memory at any moment is
+    ``s0_block + one_lod_output``. Without the callback, all LOD blocks
+    are collected and returned (legacy dict API kept for tests).
+
+    Parameters
+    ----------
+    write_chunk : callable, optional
+        ``write_chunk(lod_k, ds_block, out_origin)``. Called per LOD as
+        soon as the block is computed. Function returns ``None``.
     """
-    out = {}
+    collected = None if write_chunk is not None else {}
     for k, factor in enumerate(per_lod_factors):
         if k == 0:
             continue
         f = np.asarray(factor, dtype=int)
-        # Trim s0_block to the largest extent that's a multiple of f.
+        # Trim s0_block to the largest extent that's a multiple of f
         trim = (np.array(s0_block.shape) // f) * f
         block = s0_block[: trim[0], : trim[1], : trim[2]]
         if block.size == 0:
             continue
         ds_block, _ = downsample_func(block, tuple(f.tolist()))
         out_origin = super_chunk_origin_voxels // f
-        out[k] = (ds_block, out_origin)
-    return out
+        if write_chunk is not None:
+            # Drop the reference inside this iteration so the buffer
+            # can be GC'd before the next downsample allocates
+            write_chunk(k, ds_block, out_origin)
+            del ds_block
+        else:
+            collected[k] = (ds_block, out_origin)
+    return collected
 
 
 # ---------------------------------------------------------------------------
@@ -359,20 +376,22 @@ def build_missing_pyramid_levels(
         read_end = np.minimum(sc_origin + super_chunk_shape, dataset_shape)
         read_size = read_end - sc_origin
         s0_block = s0_reader(sc_origin, read_size)
-        # Downsample to all missing LODs
-        downsamples = downsample_super_chunk(
-            s0_block, sc_origin, factors_per_lod,
-            downsample_func, out_chunk,
-        )
-        # Write each LOD's chunk
-        for k, (ds_block, ds_origin) in downsamples.items():
+
+        def _write_one(k, ds_block, ds_origin):
             if k not in out_arrays:
-                continue
+                return
             arr = out_arrays[k]
-            # Output position relative to out_origin/factor
             f = np.asarray(factors_per_lod[k], dtype=np.int64)
             local_origin = ds_origin - (out_origin // f)
             _write_zarr_v2_region(arr, local_origin, ds_block)
+
+        # Stream each LOD's output: compute → write → drop the buffer.
+        # Peak memory per task ≈ s0_block + one_lod_output.
+        downsample_super_chunk(
+            s0_block, sc_origin, factors_per_lod,
+            downsample_func, out_chunk,
+            write_chunk=_write_one,
+        )
 
     n_chunks = len(sc_grid)
     if dispatch is not None:

@@ -2205,14 +2205,14 @@ class Meshify:
             )
         downsample_func = downsample_dispatch[self.downsample_method]
 
-        # Memory-aware sizing. Each thread holds one super-chunk of s0 voxels
-        # in memory simultaneously, plus the per-LOD downsamples (cumulative
-        # ~14% of the s0 read for factors 2/4/8) and scratch (~2x of that).
-        # Per-thread budget = per-worker dask memory budget / threads.
+        # Memory-aware sizing. With streaming writes (downsample_super_chunk's
+        # write_chunk callback), each thread holds at most: the s0 super-chunk
+        # + ONE LOD's output buffer at a time. Largest LOD output is LOD 1
+        # (1/8 of s0). Plus scratch (~2x of the LOD output).
         max_factor = np.max(np.array([f for _, f in needed_uniform]), axis=0)
         itemsize = int(np.dtype(seg_arr.data.dtype).itemsize)
-        amp_per_lod = sum(1.0 / (mf ** 3) for mf in (2, 4, 8))  # 0.142
-        amplification = 1.0 + amp_per_lod * 2.0                # ~1.3x
+        # 1.0 (s0 read) + 1/8 (LOD 1 output) + ~2*1/8 (downsample scratch)
+        amplification = 1.0 + 1.0 / 8.0 + 2.0 / 8.0            # ~1.375x
 
         worker_mb = _estimate_block_target_mb_from_dask_config(
             "dask-config.yaml",
