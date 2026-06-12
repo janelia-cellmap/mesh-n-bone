@@ -252,6 +252,166 @@ def downsample_super_chunk(
 
 
 # ---------------------------------------------------------------------------
+# Dask-cluster worker: runs ONE super-chunk task in a dask worker process.
+# Module-level so the function reference is picklable for dask.
+# ---------------------------------------------------------------------------
+
+
+# Per-worker-process cache: tensorstore handles, keyed by path.
+# Open is non-trivial (info-file fetch) — caching saves time across the
+# many tasks a single dask worker processes.
+_PYRAMID_WORKER_TS_CACHE: dict[str, object] = {}
+
+
+def _ts_handle_for_input(dataset_path):
+    if dataset_path in _PYRAMID_WORKER_TS_CACHE:
+        return _PYRAMID_WORKER_TS_CACHE[dataset_path]
+    from mesh_n_bone.util.image_data_interface import open_ds_tensorstore
+    handle = open_ds_tensorstore(dataset_path)
+    _PYRAMID_WORKER_TS_CACHE[dataset_path] = handle
+    return handle
+
+
+def _ts_handle_for_output(path):
+    if path in _PYRAMID_WORKER_TS_CACHE:
+        return _PYRAMID_WORKER_TS_CACHE[path]
+    import tensorstore as ts
+    handle = ts.open({
+        "driver": "zarr",
+        "kvstore": {"driver": "file", "path": path},
+        "open": True,
+    }).result()
+    _PYRAMID_WORKER_TS_CACHE[path] = handle
+    return handle
+
+
+def process_super_chunk_for_dask(sc_origin_tuple, worker_config):
+    """Process ONE pyramid super-chunk inside a dask worker process.
+
+    Module-level + serialization-safe so dask can ship this to LSF workers.
+    ``worker_config`` is a plain dict of strings/tuples/numbers (no numpy
+    arrays, no closures, no opened handles).
+
+    Reads its s0 super-chunk, downsamples to each missing LOD via the
+    configured ``downsample_method``, writes each LOD's chunk to the
+    pre-created output zarr arrays under ``worker_config["pyramid_path"]``.
+
+    Returns ``None`` (dask bag collects None values; we don't aggregate).
+    """
+    from funlib.geometry import Coordinate, Roi
+    from mesh_n_bone.util.image_data_interface import to_ndarray_tensorstore
+    from mesh_n_bone.meshify.downsample import (
+        downsample_labels_3d,
+        downsample_binary_3d,
+        downsample_labels_3d_suppress_zero,
+    )
+
+    dispatch = {
+        "mode": downsample_labels_3d,
+        "mode_suppress_zero": downsample_labels_3d_suppress_zero,
+        "binary": downsample_binary_3d,
+    }
+    downsample_func = dispatch[worker_config["downsample_method"]]
+
+    sc_origin = np.array(sc_origin_tuple, dtype=np.int64)
+    out_origin = np.array(worker_config["out_origin"], dtype=np.int64)
+    super_chunk_shape = np.array(worker_config["super_chunk_shape"], dtype=np.int64)
+    dataset_shape = np.array(worker_config["dataset_shape"], dtype=np.int64)
+    factors_per_lod = [tuple(f) for f in worker_config["factors_per_lod"]]
+    missing_lods = list(worker_config["missing_lods"])
+
+    # Read s0 super-chunk in world coords (same pattern as the meshify worker)
+    ds_offset = Coordinate(worker_config["dataset_offset"])
+    voxel_size = Coordinate(worker_config["voxel_size"])
+    read_end_voxels = np.minimum(sc_origin + super_chunk_shape, dataset_shape)
+    read_size_voxels = read_end_voxels - sc_origin
+    if np.any(read_size_voxels <= 0):
+        return None
+    world_origin = ds_offset + Coordinate(sc_origin.tolist()) * voxel_size
+    world_shape = Coordinate(read_size_voxels.tolist()) * voxel_size
+    roi = Roi(world_origin, world_shape)
+
+    ts_s0 = _ts_handle_for_input(worker_config["s0_dataset_path"])
+    s0_block = to_ndarray_tensorstore(
+        ts_s0, roi, voxel_size, ds_offset,
+        swap_axes=worker_config["swap_axes"], fill_value=0,
+        source_path=worker_config["s0_dataset_path"],
+    )
+
+    # Downsample + write each LOD's chunk (streaming: drop the buffer after write)
+    for k in missing_lods:
+        f = np.asarray(factors_per_lod[k], dtype=int)
+        trim = (np.array(s0_block.shape) // f) * f
+        block = s0_block[: trim[0], : trim[1], : trim[2]]
+        if block.size == 0:
+            continue
+        ds_block, _ = downsample_func(block, tuple(f.tolist()))
+        ds_origin = sc_origin // f
+        local_origin = ds_origin - (out_origin // f)
+        out_path = os.path.join(worker_config["pyramid_path"], f"s{k}")
+        out_arr = _ts_handle_for_output(out_path)
+        z, y, x = local_origin.tolist()
+        arr_shape = out_arr.shape
+        zE = min(z + ds_block.shape[0], arr_shape[0])
+        yE = min(y + ds_block.shape[1], arr_shape[1])
+        xE = min(x + ds_block.shape[2], arr_shape[2])
+        out_arr[z:zE, y:yE, x:xE].write(
+            ds_block[: zE - z, : yE - y, : xE - x]
+        ).result()
+        del ds_block
+
+    return None
+
+
+def prepare_pyramid_metadata_and_arrays(
+    *,
+    output_zarr_path,
+    factors_per_lod,
+    missing_lods,
+    out_shape,
+    out_chunk_shape_voxels,
+    dtype,
+    s0_voxel_size_zyx,
+    s0_translation_zyx,
+    zarr_format=2,
+    s0_source_path=None,
+):
+    """Driver-side setup before dispatching pyramid super-chunks to dask.
+
+    Writes the OME-NGFF multiscales metadata, creates empty output zarr
+    arrays for each missing LOD, and optionally symlinks s0. Returns
+    ``(super_chunk_shape, max_factor)``.
+    """
+    os.makedirs(output_zarr_path, exist_ok=True)
+    metadata = build_multiscales_metadata(
+        s0_voxel_size_zyx=list(s0_voxel_size_zyx),
+        s0_translation_zyx=list(s0_translation_zyx),
+        per_lod_factors=factors_per_lod,
+        version="0.4",
+    )
+    write_multiscales_metadata(output_zarr_path, metadata, zarr_format=zarr_format)
+
+    out_chunk = np.asarray(out_chunk_shape_voxels, dtype=np.int64)
+    out_shape = np.asarray(out_shape, dtype=np.int64)
+    max_factor = np.max(np.array(factors_per_lod), axis=0)
+    for k in missing_lods:
+        f = np.asarray(factors_per_lod[k], dtype=np.int64)
+        lod_shape = ((out_shape + f - 1) // f).tolist()
+        ds_path = os.path.join(output_zarr_path, f"s{k}")
+        if os.path.exists(ds_path):
+            shutil.rmtree(ds_path)
+        _create_zarr_v2_array(
+            ds_path, shape=lod_shape, chunks=out_chunk.tolist(), dtype=dtype,
+        )
+
+    if s0_source_path is not None:
+        _try_symlink_s0(output_zarr_path, s0_source_path)
+
+    super_chunk_shape = out_chunk * max_factor
+    return super_chunk_shape, max_factor
+
+
+# ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
 

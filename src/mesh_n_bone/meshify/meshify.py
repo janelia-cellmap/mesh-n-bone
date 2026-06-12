@@ -2165,24 +2165,11 @@ class Meshify:
         # Dataset shape in voxels
         dataset_shape = np.asarray(seg_arr.data.shape[-3:], dtype=np.int64)
 
-        # Open a tensorstore handle for s0 (Meshify's segmentation_array.data is
-        # ArrayMetadata, not a tensorstore — to_ndarray_tensorstore needs the
-        # real handle).
-        from mesh_n_bone.util.image_data_interface import open_ds_tensorstore
+        # No driver-side tensorstore handle needed — workers re-open per-process.
         dataset_path = self._dataset_path
         swap_axes = self._swap_axes
         ds_offset_coord = Coordinate(seg_arr.roi.offset)
         vs_coord = Coordinate(seg_arr.voxel_size)
-        ts_dataset = open_ds_tensorstore(dataset_path)
-
-        def _s0_reader(origin_voxels, shape_voxels):
-            world_origin = ds_offset_coord + Coordinate(origin_voxels.tolist()) * vs_coord
-            world_shape = Coordinate(shape_voxels.tolist()) * vs_coord
-            roi = Roi(world_origin, world_shape)
-            return to_ndarray_tensorstore(
-                ts_dataset, roi, vs_coord, ds_offset_coord,
-                swap_axes=swap_axes, fill_value=0, source_path=dataset_path,
-            )
 
         # Downsample function dispatch
         from mesh_n_bone.meshify.downsample import (
@@ -2236,67 +2223,211 @@ class Meshify:
                 shape.append(max(1, super_side // mf))
             return shape
 
-        # Build, with OOM retry that halves thread count + re-sizes super-chunks
-        # if the worker runs out of memory. Mirrors run_with_oom_retry on the
-        # mesh side, scoped to the pyramid build.
+        # Resolve ROI alignment up-front (we need the aligned out_shape to
+        # build the output zarr arrays)
+        from mesh_n_bone.util.pyramid_builder import (
+            per_lod_factors_for_anisotropy,
+            align_roi_voxels,
+            prepare_pyramid_metadata_and_arrays,
+            process_super_chunk_for_dask,
+        )
+        max_factor_per_axis = max_factor  # alias
+        factors_per_lod_full = per_lod_factors_for_anisotropy(
+            self.true_voxel_size, num_lods,
+        )
+        aligned_out_origin, aligned_out_shape, _, _ = align_roi_voxels(
+            roi_voxel_origin, roi_voxel_shape,
+            max_factor_per_axis, self.pyramid_alignment_mode,
+        )
+        if not np.array_equal(aligned_out_origin, roi_voxel_origin) or \
+           not np.array_equal(aligned_out_shape, roi_voxel_shape):
+            logger.info(
+                "pyramid_builder: %s aligned ROI from origin=%s shape=%s to "
+                "origin=%s shape=%s (max per-axis factor=%s)",
+                self.pyramid_alignment_mode,
+                roi_voxel_origin.tolist(), roi_voxel_shape.tolist(),
+                aligned_out_origin.tolist(), aligned_out_shape.tolist(),
+                max_factor_per_axis.tolist(),
+            )
+
+        logger.info(
+            "pyramid_builder: %d missing scale(s) detected for downsample "
+            "multires (factors=%s); building under %s with alignment_mode=%s",
+            len(needed_uniform),
+            [factor for _, factor in needed_uniform],
+            pyramid_path, self.pyramid_alignment_mode,
+        )
+
+        # OOM retry loop. On MemoryError from any worker, we halve the worker
+        # count (giving each worker 2x memory) and recompute a bigger
+        # super-chunk size.
         max_retries = int(getattr(self, "memory_retry_max", 3))
         attempt_workers = max(1, int(self.num_workers))
-        last_exc = None
         for attempt in range(max_retries + 1):
             out_chunk_shape = _size_super_chunk(attempt_workers)
             super_voxels = int(np.prod(np.array(out_chunk_shape) * max_factor))
             super_bytes = super_voxels * itemsize
             logger.info(
-                "pyramid_builder: %sattempt %d: per-worker budget %d MB, "
-                "threads %d, dtype itemsize %d → out_chunk_shape=%s, "
-                "super_chunk_shape=%s (%.1f MB s0 read per task)",
+                "pyramid_builder: %sattempt %d: dask cluster workers=%d, "
+                "per-worker budget %d MB, dtype itemsize %d → "
+                "out_chunk_shape=%s, super_chunk_shape=%s "
+                "(%.1f MB s0 read per task)",
                 "" if attempt == 0 else "retry ",
-                attempt + 1, worker_mb, attempt_workers, itemsize,
+                attempt + 1, attempt_workers, worker_mb, itemsize,
                 out_chunk_shape,
                 (np.array(out_chunk_shape) * max_factor).tolist(),
                 super_bytes / 1e6,
             )
-            if attempt == 0:
-                logger.info(
-                    "pyramid_builder: %d missing scale(s) detected for "
-                    "downsample multires (factors=%s); building under %s "
-                    "with alignment_mode=%s",
-                    len(needed_uniform),
-                    [factor for _, factor in needed_uniform],
-                    pyramid_path, self.pyramid_alignment_mode,
-                )
+
+            # Driver-side: write OME metadata + create empty output arrays
+            super_chunk_shape, _ = prepare_pyramid_metadata_and_arrays(
+                output_zarr_path=pyramid_path,
+                factors_per_lod=factors_per_lod_full,
+                missing_lods=[k for k, _ in needed_uniform],
+                out_shape=aligned_out_shape,
+                out_chunk_shape_voxels=tuple(out_chunk_shape),
+                dtype=seg_arr.data.dtype,
+                s0_voxel_size_zyx=self.true_voxel_size.tolist(),
+                s0_translation_zyx=self.true_offset.tolist(),
+                s0_source_path=self._dataset_path,
+            )
+
+            # Build the super-chunk grid (in s0 voxels)
+            sc_grid = []
+            for z0 in range(int(aligned_out_origin[0]),
+                            int(aligned_out_origin[0] + aligned_out_shape[0]),
+                            int(super_chunk_shape[0])):
+                for y0 in range(int(aligned_out_origin[1]),
+                                int(aligned_out_origin[1] + aligned_out_shape[1]),
+                                int(super_chunk_shape[1])):
+                    for x0 in range(int(aligned_out_origin[2]),
+                                    int(aligned_out_origin[2] + aligned_out_shape[2]),
+                                    int(super_chunk_shape[2])):
+                        sc_grid.append((z0, y0, x0))
+            n_chunks = len(sc_grid)
+
+            # Worker config: must be picklable (no closures, no opened handles)
+            worker_config = {
+                "s0_dataset_path": dataset_path,
+                "dataset_offset": tuple(int(v) for v in seg_arr.roi.offset),
+                "voxel_size": tuple(int(v) for v in seg_arr.voxel_size),
+                "swap_axes": bool(swap_axes),
+                "dataset_shape": tuple(int(v) for v in dataset_shape.tolist()),
+                "factors_per_lod": [list(f) for f in factors_per_lod_full],
+                "missing_lods": [k for k, _ in needed_uniform],
+                "downsample_method": self.downsample_method,
+                "pyramid_path": pyramid_path,
+                "super_chunk_shape": tuple(int(v) for v in super_chunk_shape.tolist()),
+                "out_origin": tuple(int(v) for v in aligned_out_origin.tolist()),
+            }
+
+            # Smart dask sizing — match the assembly pipeline's pattern:
+            # estimate per-task peak memory, recommend processes-per-LSF-job
+            # so each worker has enough memory for one super-chunk, build the
+            # adjusted dask config up-front, then let run_with_oom_retry
+            # halve further on actual OOM.
+            #
+            # Tolerant of missing dask-config.yaml: tests (and runs that
+            # don't use LSF) can dispatch via a LocalCluster without a
+            # jobqueue config — in that case run_with_oom_retry gets
+            # config=None and starts a LocalCluster.
+            adjusted_dask_config = None
+            workers_with_adjusted = attempt_workers
             try:
-                build_missing_pyramid_levels(
-                    s0_reader=_s0_reader,
-                    s0_dataset_shape_voxels=dataset_shape,
-                    s0_voxel_size_zyx=self.true_voxel_size.tolist(),
-                    s0_translation_zyx=self.true_offset.tolist(),
-                    dtype=seg_arr.data.dtype,
-                    num_lods=num_lods,
-                    existing_factors=set(),
-                    output_zarr_path=pyramid_path,
-                    downsample_func=downsample_func,
-                    roi_origin_voxels=roi_voxel_origin,
-                    roi_shape_voxels=roi_voxel_shape,
-                    out_chunk_shape_voxels=tuple(out_chunk_shape),
-                    alignment_mode=self.pyramid_alignment_mode,
-                    s0_source_path=self._dataset_path,
-                    num_workers=attempt_workers,
+                base_dask_config = dask_util._load_dask_config()
+            except (FileNotFoundError, OSError):
+                base_dask_config = None
+            if base_dask_config:
+                cluster_type, settings = _jobqueue_settings(base_dask_config)
+                base_processes = int((settings or {}).get("processes", 1) or 1)
+                job_memory = _job_memory_bytes(settings)
+                per_task_peak_bytes = int(super_bytes * amplification)
+                recommended_processes = _recommended_assembly_processes(
+                    per_task_peak_bytes, job_memory, base_processes,
+                    memory_fraction=0.60,
+                )
+                adjusted_dask_config = _assembly_config_for_processes(
+                    base_dask_config, cluster_type, recommended_processes,
+                )
+                if recommended_processes < base_processes:
+                    # Each LSF job now hosts fewer processes (= workers), so
+                    # we need MORE jobs to keep the requested total worker
+                    # count. dask-jobqueue spins one LSF job per "worker" in
+                    # the user's request, with `processes` workers in each
+                    # job. Increase the requested-job count proportionally.
+                    workers_with_adjusted = max(
+                        1,
+                        attempt_workers * base_processes // recommended_processes,
+                    )
+                if recommended_processes != base_processes:
+                    logger.info(
+                        "pyramid_builder: super-chunk peak %.1f MB per task vs "
+                        "job memory %.1f MB / %d base processes = %.1f MB each → "
+                        "reducing processes/job to %d (2x memory per worker)",
+                        per_task_peak_bytes / 1e6,
+                        (job_memory or 0) / 1e6, base_processes,
+                        (job_memory or 0) / max(1, base_processes) / 1e6,
+                        recommended_processes,
+                    )
+
+            # Diagnostic: show the driver process's actual file-descriptor
+            # limit. The earlier crash at ~576 workers with EMFILE was
+            # surprising given the shell's ulimit -n = 1M; if we see a
+            # different number here, that's the root cause.
+            try:
+                import resource as _resource
+                soft, hard = _resource.getrlimit(_resource.RLIMIT_NOFILE)
+                if hard > soft:
+                    _resource.setrlimit(_resource.RLIMIT_NOFILE, (hard, hard))
+                    logger.info(
+                        "pyramid_builder: FD soft limit raised %d → %d "
+                        "(hard cap)", soft, hard,
+                    )
+                else:
+                    logger.info(
+                        "pyramid_builder: FD soft limit %d, hard %d (no raise needed)",
+                        soft, hard,
+                    )
+            except (ImportError, ValueError, OSError) as _e:
+                logger.warning("pyramid_builder: could not adjust FD limit: %s", _e)
+
+            effective_workers = dask_util.effective_num_workers(
+                workers_with_adjusted, n_chunks, logger, "pyramid build",
+            )
+
+            def _run(workers, dask_config):
+                import dask.bag as db
+                npartitions = dask_util.guesstimate_npartitions(n_chunks, workers)
+                bag = db.from_sequence(sc_grid, npartitions=npartitions).map(
+                    process_super_chunk_for_dask, worker_config=worker_config,
+                )
+                with dask_util.start_dask(
+                    workers, "pyramid build", logger, config=dask_config,
+                ):
+                    with Timing_Messager(
+                        f"Building pyramid ({n_chunks} super-chunks)", logger,
+                    ):
+                        bag.compute()
+
+            try:
+                dask_util.run_with_oom_retry(
+                    _run, effective_workers, "pyramid build", logger,
+                    max_retries=self.memory_retry_max,
+                    retry_on_oom=self.retry_on_oom,
+                    config=adjusted_dask_config,
                 )
                 break
-            except MemoryError as e:
-                last_exc = e
+            except MemoryError:
                 if attempt_workers == 1 or attempt >= max_retries:
                     raise
                 new_workers = max(1, attempt_workers // 2)
                 logger.warning(
-                    "pyramid_builder: MemoryError on attempt %d with %d threads. "
-                    "Halving to %d threads and retrying with larger per-thread "
-                    "memory budget (which means bigger super-chunks).",
+                    "pyramid_builder: MemoryError on attempt %d with %d workers. "
+                    "Halving to %d workers and retrying with a larger per-worker "
+                    "memory budget.",
                     attempt + 1, attempt_workers, new_workers,
                 )
                 attempt_workers = new_workers
-                # Tear down whatever partial pyramid landed before retrying
                 if os.path.isdir(pyramid_path):
                     _safely_remove_pyramid(pyramid_path, num_workers=attempt_workers)
 
