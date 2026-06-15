@@ -461,6 +461,65 @@ def _write_assembly_memory_plan(output_directory, estimates, waves):
         json.dump(plan, f, indent=2)
 
 
+def _existing_pyramid_scales(pyramid_path):
+    """Return ``{lod_index: uniform_factor}`` of usable scales on disk, or
+    ``None`` if the pyramid isn't readable.
+
+    Parses the OME-NGFF v0.4 multiscales metadata at
+    ``{pyramid_path}/.zattrs`` and returns the per-LOD uniform downsample
+    factor (relative to s0) for each dataset whose corresponding
+    ``s_k/.zarray`` actually exists on disk. Used to skip a fresh build
+    when a prior run already wrote the pyramid (e.g. debug re-runs).
+
+    Returns ``None`` when the file is missing, malformed, or doesn't
+    expose multiscales in the expected shape.
+    """
+    zattrs_path = os.path.join(pyramid_path, ".zattrs")
+    if not os.path.isfile(zattrs_path):
+        return None
+    try:
+        with open(zattrs_path) as f:
+            attrs = json.load(f)
+        datasets = attrs["multiscales"][0]["datasets"]
+        # s0's scale per-axis defines the base; s_k's factor = s_k/s_0
+        s0_scale = None
+        for ds in datasets:
+            if ds.get("path") == "s0":
+                for tr in ds.get("coordinateTransformations", []):
+                    if tr.get("type") == "scale":
+                        s0_scale = tr["scale"]
+                        break
+                break
+        if s0_scale is None:
+            return None
+        result = {}
+        for ds in datasets:
+            name = ds.get("path", "")
+            if not name.startswith("s") or not name[1:].isdigit():
+                continue
+            k = int(name[1:])
+            if k == 0:
+                continue
+            scale = None
+            for tr in ds.get("coordinateTransformations", []):
+                if tr.get("type") == "scale":
+                    scale = tr["scale"]
+                    break
+            if scale is None:
+                continue
+            factors = [scale[i] / s0_scale[i] for i in range(3)]
+            if not (factors[0] == factors[1] == factors[2]):
+                continue
+            factor = int(round(factors[0]))
+            # Verify the underlying zarr array actually exists
+            if not os.path.isfile(os.path.join(pyramid_path, name, ".zarray")):
+                continue
+            result[k] = factor
+        return result
+    except (KeyError, IndexError, ValueError, json.JSONDecodeError, OSError):
+        return None
+
+
 def _safely_remove_pyramid(pyramid_path, num_workers=8):
     """Delete the auto-built pyramid zarr with chunk-level parallelism.
 
@@ -989,6 +1048,7 @@ class Meshify:
         delete_unsharded_files: bool = True,
         smooth_before_simplify: bool = True,
         target_ids: int | list[int] | None = None,
+        keep_chunked_meshes: bool = False,
     ):
         filename, dataset_name = split_dataset_path(input_path)
         self.segmentation_array = open_dataset(filename, dataset_name)
@@ -1160,6 +1220,7 @@ class Meshify:
         self.delete_unsharded_files = delete_unsharded_files
         self.smooth_before_simplify = smooth_before_simplify
         self.target_ids = _normalize_target_ids(target_ids)
+        self.keep_chunked_meshes = keep_chunked_meshes
         self.coordinate_units = coordinate_units
         self.retry_on_oom = retry_on_oom
         self.memory_retry_max = memory_retry_max
@@ -1661,7 +1722,8 @@ class Meshify:
                     f"{len(mesh_files)}>{self.max_num_blocks}. Skipping.\n"
                 )
                 f.write(", ".join(mesh_files))
-            shutil.rmtree(f"{self.dirname}/{mesh_id}")
+            if not self.keep_chunked_meshes:
+                shutil.rmtree(f"{self.dirname}/{mesh_id}")
             return
 
         block_meshes = []
@@ -1687,7 +1749,8 @@ class Meshify:
                     "fixed-edge simplification).",
                     mesh_id, len(mesh_files),
                 )
-                shutil.rmtree(f"{self.dirname}/{mesh_id}", ignore_errors=True)
+                if not self.keep_chunked_meshes:
+                    shutil.rmtree(f"{self.dirname}/{mesh_id}", ignore_errors=True)
                 return
             chunk_size = (
                 self.read_write_block_shape_pixels * self.base_voxel_size_funlib
@@ -1726,7 +1789,8 @@ class Meshify:
                 "zero vertices.",
                 mesh_id,
             )
-            shutil.rmtree(f"{self.dirname}/{mesh_id}", ignore_errors=True)
+            if not self.keep_chunked_meshes:
+                shutil.rmtree(f"{self.dirname}/{mesh_id}", ignore_errors=True)
             return
 
         if check_validity or self.has_custom_roi:
@@ -1828,7 +1892,8 @@ class Meshify:
             )
         else:
             _ = mesh.export(f"{self.output_directory}/meshes/{mesh_id}.ply")
-        shutil.rmtree(f"{self.dirname}/{mesh_id}")
+        if not self.keep_chunked_meshes:
+            shutil.rmtree(f"{self.dirname}/{mesh_id}")
 
     def _assemble_mesh_batch(self, mesh_ids):
         """Assemble a memory-balanced batch of segment ids sequentially."""
@@ -1930,7 +1995,8 @@ class Meshify:
             write_ngmesh_metadata(f"{self.output_directory}/meshes")
         elif self.do_singleres_multires_neuroglancer:
             write_singleres_multires_metadata(f"{self.output_directory}/meshes")
-        shutil.rmtree(dirname)
+        if not self.keep_chunked_meshes:
+            shutil.rmtree(dirname)
 
     def _generate_meshes_at_scale(self, output_mesh_dir, downsample_factor=None,
                                    target_reduction_override=None,
@@ -2016,11 +2082,21 @@ class Meshify:
                 self.target_reduction = target_reduction_override
 
             os.makedirs(self.output_directory, exist_ok=True)
-            tmp_chunked_dir = self.output_directory + "/tmp_chunked"
+            scale_tag = (
+                f"s{int(np.log2(self.downsample_factor))}"
+                if self.downsample_factor
+                else "s0"
+            )
+            tmp_chunked_dir = (
+                self.output_directory
+                + ("/tmp_chunked_" + scale_tag if self.keep_chunked_meshes
+                   else "/tmp_chunked")
+            )
             os.makedirs(tmp_chunked_dir, exist_ok=True)
             self.get_chunked_meshes(tmp_chunked_dir)
             self.assemble_meshes(tmp_chunked_dir)
-            shutil.rmtree(tmp_chunked_dir, ignore_errors=True)
+            if not self.keep_chunked_meshes:
+                shutil.rmtree(tmp_chunked_dir, ignore_errors=True)
         finally:
             self.output_directory = orig_output
             self.downsample_factor = orig_downsample
@@ -2152,6 +2228,21 @@ class Meshify:
         pyramid_path = os.path.join(
             self.output_directory, "_intermediate_scales.zarr",
         )
+
+        # If the pyramid already exists on disk with all the needed scales,
+        # skip the rebuild and reuse what's there. Useful when re-running a
+        # job in the same output dir (e.g. for debugging) so we don't redo
+        # the (potentially slow) downsample pass each time.
+        existing_pyramid = _existing_pyramid_scales(pyramid_path)
+        if existing_pyramid is not None:
+            available = {f: f"{pyramid_path}/s{k}" for k, f in existing_pyramid.items()}
+            need_factors = {int(factor[0]) for _, factor in needed_uniform}
+            if need_factors.issubset(set(available.keys())):
+                logger.info(
+                    "pyramid_builder: reusing existing %s (scales %s)",
+                    pyramid_path, sorted(need_factors),
+                )
+                return {f: available[f] for f in need_factors}
 
         # ROI in voxel coordinates relative to the dataset's own (0, 0, 0)
         seg_arr = self.segmentation_array
@@ -2801,7 +2892,8 @@ class Meshify:
         os.makedirs(tmp_chunked_dir, exist_ok=True)
         self.get_chunked_meshes(tmp_chunked_dir)
         self.assemble_meshes(tmp_chunked_dir)
-        shutil.rmtree(tmp_chunked_dir, ignore_errors=True)
+        if not self.keep_chunked_meshes:
+            shutil.rmtree(tmp_chunked_dir, ignore_errors=True)
 
         if self.do_analysis:
             from mesh_n_bone.analyze.analyze import AnalyzeMeshes
