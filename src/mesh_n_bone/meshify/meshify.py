@@ -2296,15 +2296,24 @@ class Meshify:
         #                     per-worker memory budget.
         max_factor = np.max(np.array([f for _, f in needed_uniform]), axis=0)
         itemsize = int(np.dtype(seg_arr.data.dtype).itemsize)
-        # 1.0 (s0 read) + 1/8 (LOD 1 output) + ~2*1/8 (downsample scratch)
-        amplification = 1.0 + 1.0 / 8.0 + 2.0 / 8.0            # ~1.375x
+        # 1.0 (s0 read) + 1/8 (LOD 1 output) + ~1/8 (downsample scratch)
+        # plus ~1x slack for tensorstore decode/encode buffers, output-handle
+        # cache_pool retention across cascaded LODs (s1, s2, s3), and
+        # glibc malloc fragmentation across the 8+ sequential super-chunks
+        # a worker processes before exit. Underestimating this was the root
+        # cause of OOMs on bw-1 mito even at processes=1 / 180 GB/worker.
+        amplification = 2.5
 
         # Sane output chunk shape: inherit s0's chunk shape, clamped to
-        # the [32, 256] range and rounded to a multiple of max_factor per
-        # axis. 32 is the lower bound for "not silly small"; 256 caps
-        # the file size to ~16 MiB at uint8.
+        # the [32, 128] range and rounded to a multiple of max_factor per
+        # axis. The upper bound caps super_chunk_shape (= out_chunk *
+        # max_factor) at 128*8 = 1024 voxels per axis, i.e. ~1-2 GB per
+        # task. Higher than 128 here can produce a 1792³ super-chunk
+        # (11.5 GB at uint16) that OOMs workers, since the realistic
+        # amplification (above) plus tensorstore caches puts the per-task
+        # peak well over the 30 GB/worker budget at default processes=6.
         SANE_CHUNK_MIN = 32
-        SANE_CHUNK_MAX = 256
+        SANE_CHUNK_MAX = 128
         src_chunk = np.asarray(seg_arr.chunk_shape, dtype=np.int64)
         out_chunk_shape = []
         for ax in range(3):

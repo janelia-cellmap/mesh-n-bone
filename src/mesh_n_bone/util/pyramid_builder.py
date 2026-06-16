@@ -276,10 +276,17 @@ def _ts_handle_for_output(path):
     if path in _PYRAMID_WORKER_TS_CACHE:
         return _PYRAMID_WORKER_TS_CACHE[path]
     import tensorstore as ts
+    from mesh_n_bone.util.image_data_interface import (
+        _capped_tensorstore_context_spec,
+    )
     handle = ts.open({
         "driver": "zarr",
         "kvstore": {"driver": "file", "path": path},
         "open": True,
+        # Cap thread pools + disable decoded-chunk cache. Without this
+        # the output handle's cache_pool accumulates encoded chunks for
+        # the worker's lifetime, OOMing on large super-chunk runs.
+        "context": _capped_tensorstore_context_spec(),
     }).result()
     _PYRAMID_WORKER_TS_CACHE[path] = handle
     return handle
@@ -359,6 +366,20 @@ def process_super_chunk_for_dask(sc_origin_tuple, worker_config):
             ds_block[: zE - z, : yE - y, : xE - x]
         ).result()
         del ds_block
+
+    # Release the big s0 read buffer + force allocator release. Without this
+    # the worker accumulates s0 read residue across the 8+ super-chunks it
+    # processes before exit (cached tensorstore handles in
+    # _PYRAMID_WORKER_TS_CACHE don't release on their own, and glibc malloc
+    # doesn't munmap freed pages without an explicit trim).
+    del s0_block
+    import gc
+    gc.collect()
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except (OSError, AttributeError):
+        pass
 
     return None
 
