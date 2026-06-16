@@ -1722,7 +1722,7 @@ class Meshify:
                     f"{len(mesh_files)}>{self.max_num_blocks}. Skipping.\n"
                 )
                 f.write(", ".join(mesh_files))
-            if not self.keep_chunked_meshes:
+            if not getattr(self, "keep_chunked_meshes", False):
                 shutil.rmtree(f"{self.dirname}/{mesh_id}")
             return
 
@@ -1749,7 +1749,7 @@ class Meshify:
                     "fixed-edge simplification).",
                     mesh_id, len(mesh_files),
                 )
-                if not self.keep_chunked_meshes:
+                if not getattr(self, "keep_chunked_meshes", False):
                     shutil.rmtree(f"{self.dirname}/{mesh_id}", ignore_errors=True)
                 return
             chunk_size = (
@@ -1789,7 +1789,7 @@ class Meshify:
                 "zero vertices.",
                 mesh_id,
             )
-            if not self.keep_chunked_meshes:
+            if not getattr(self, "keep_chunked_meshes", False):
                 shutil.rmtree(f"{self.dirname}/{mesh_id}", ignore_errors=True)
             return
 
@@ -1892,7 +1892,7 @@ class Meshify:
             )
         else:
             _ = mesh.export(f"{self.output_directory}/meshes/{mesh_id}.ply")
-        if not self.keep_chunked_meshes:
+        if not getattr(self, "keep_chunked_meshes", False):
             shutil.rmtree(f"{self.dirname}/{mesh_id}")
 
     def _assemble_mesh_batch(self, mesh_ids):
@@ -1995,7 +1995,7 @@ class Meshify:
             write_ngmesh_metadata(f"{self.output_directory}/meshes")
         elif self.do_singleres_multires_neuroglancer:
             write_singleres_multires_metadata(f"{self.output_directory}/meshes")
-        if not self.keep_chunked_meshes:
+        if not getattr(self, "keep_chunked_meshes", False):
             shutil.rmtree(dirname)
 
     def _generate_meshes_at_scale(self, output_mesh_dir, downsample_factor=None,
@@ -2089,13 +2089,14 @@ class Meshify:
             )
             tmp_chunked_dir = (
                 self.output_directory
-                + ("/tmp_chunked_" + scale_tag if self.keep_chunked_meshes
+                + ("/tmp_chunked_" + scale_tag
+                   if getattr(self, "keep_chunked_meshes", False)
                    else "/tmp_chunked")
             )
             os.makedirs(tmp_chunked_dir, exist_ok=True)
             self.get_chunked_meshes(tmp_chunked_dir)
             self.assemble_meshes(tmp_chunked_dir)
-            if not self.keep_chunked_meshes:
+            if not getattr(self, "keep_chunked_meshes", False):
                 shutil.rmtree(tmp_chunked_dir, ignore_errors=True)
         finally:
             self.output_directory = orig_output
@@ -2901,7 +2902,7 @@ class Meshify:
         os.makedirs(tmp_chunked_dir, exist_ok=True)
         self.get_chunked_meshes(tmp_chunked_dir)
         self.assemble_meshes(tmp_chunked_dir)
-        if not self.keep_chunked_meshes:
+        if not getattr(self, "keep_chunked_meshes", False):
             shutil.rmtree(tmp_chunked_dir, ignore_errors=True)
 
         if self.do_analysis:
