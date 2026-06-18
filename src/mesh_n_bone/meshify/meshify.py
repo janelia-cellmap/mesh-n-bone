@@ -2708,6 +2708,7 @@ class Meshify:
             with Timing_Messager("Writing sharded info file", logger):
                 sharded_mesh_util.write_sharded_info_file(
                     multires_path, spec, vertex_quantization_bits=16,
+                    lod_scale_multiplier=float(self.base_voxel_size_funlib[0]),
                 )
 
             if self.delete_unsharded_files:
@@ -2719,7 +2720,10 @@ class Meshify:
                     )
         else:
             with Timing_Messager("Writing info file", logger):
-                neuroglancer.write_info_file(multires_path)
+                neuroglancer.write_info_file(
+                    multires_path,
+                    lod_scale_multiplier=float(self.base_voxel_size_funlib[0]),
+                )
 
         if self.delete_decimated_meshes:
             with Timing_Messager("Cleaning up intermediate mesh files", logger):

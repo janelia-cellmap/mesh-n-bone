@@ -68,6 +68,13 @@ def read_multires_config(config_path):
             optional_decimation_settings["target_faces_per_lod0_chunk"] = (
                 DEFAULT_TARGET_FACES_PER_LOD0_CHUNK
             )
+        # voxel_size_nm controls the info file's `lod_scale_multiplier` so
+        # NG sees per-LOD spatial resolutions in physical units (voxel_size,
+        # 2*voxel_size, 4*voxel_size, ...). Set to the dataset's source
+        # voxel size in nm. Default 1.0 = NG sees scales as raw [1,2,4,8]
+        # (the historical buggy behavior — NG aggressively picks coarse LODs).
+        if "voxel_size_nm" not in optional_decimation_settings:
+            optional_decimation_settings["voxel_size_nm"] = 1.0
 
         optional_properties_settings = config.get("optional_properties_settings", {})
         if "segment_properties_csv" not in optional_properties_settings:

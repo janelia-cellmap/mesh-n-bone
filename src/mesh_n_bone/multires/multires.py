@@ -382,6 +382,7 @@ def run_multires(config_path, num_workers, roi=None):
     aggressiveness = optional_decimation_settings["aggressiveness"]
     delete_decimated_meshes_flag = optional_decimation_settings["delete_decimated_meshes"]
     target_faces_per_lod0_chunk = optional_decimation_settings["target_faces_per_lod0_chunk"]
+    voxel_size_nm = float(optional_decimation_settings.get("voxel_size_nm", 1.0))
     retry_on_oom = optional_decimation_settings.get("retry_on_oom", True)
     memory_retry_max = optional_decimation_settings.get("memory_retry_max", 3)
 
@@ -526,6 +527,7 @@ def run_multires(config_path, num_workers, roi=None):
                 with Timing_Messager("Writing sharded info file", logger):
                     sharded_mesh_util.write_sharded_info_file(
                         multires_output_path, spec, vertex_quantization_bits=16,
+                        lod_scale_multiplier=voxel_size_nm,
                     )
 
                 if sharding_settings["delete_unsharded_files"]:
@@ -539,6 +541,7 @@ def run_multires(config_path, num_workers, roi=None):
                 with Timing_Messager("Writing info file", logger):
                     neuroglancer.write_info_file(
                         multires_output_path, vertex_quantization_bits=16,
+                        lod_scale_multiplier=voxel_size_nm,
                     )
 
             if not skip_decimation and delete_decimated_meshes_flag:
