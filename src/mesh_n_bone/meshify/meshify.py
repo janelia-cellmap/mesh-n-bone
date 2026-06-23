@@ -2658,6 +2658,7 @@ class Meshify:
                         np.array(file_sizes, dtype=float),
                         self.lod_0_box_size,
                         target_faces_per_lod0_chunk=self.target_faces_per_lod0_chunk,
+                        voxel_size_nm=float(self.base_voxel_size_funlib[0]),
                     )
 
         dask_util.run_with_oom_retry(
