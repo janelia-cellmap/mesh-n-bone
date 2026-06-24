@@ -36,6 +36,7 @@ def generate_neuroglancer_multires_mesh(
     target_faces_per_lod0_chunk=DEFAULT_TARGET_FACES_PER_LOD0_CHUNK,
     voxel_size_nm=1.0,
     min_useful_faces=MIN_USEFUL_FACES_PER_LOD,
+    center_octree=True,
 ):
     """Create a complete multiresolution mesh for a single segment.
 
@@ -179,22 +180,39 @@ def generate_neuroglancer_multires_mesh(
             np.ceil(mesh_extent / lod_0_box_size).astype(int), 1
         )
 
-        # Center the mesh within the full octree grid so that
-        # Neuroglancer's bounding-box center matches the actual mesh
-        # center.
+        # Position the octree relative to the mesh bbox.
+        #
+        # center_octree=True (default): the mesh sits in the middle of
+        # the LOD-(top) chunk. NG's "double-click to focus" uses the
+        # top-LOD chunk center as the segment's centroid — centering
+        # makes that land on the mesh. The cost is that meshes which
+        # would otherwise fit in a single LOD-0 chunk straddle the
+        # octree's center boundary, producing 2×2×2 = 8 LOD-0 fragments
+        # and visible chunk seams at high zoom.
+        #
+        # center_octree=False: align the octree to floor(bbox_min).
+        # No internal-seam subdivision for sub-octree-sized meshes
+        # (they fit in 1 LOD-0 chunk). Click-to-focus may land off the
+        # mesh — toward the LOD-(top) chunk center, which is at the
+        # mesh's near corner for sub-chunk meshes. Choose this when
+        # seam-free rendering matters more than precise click-to-center
+        # (e.g. dense-organelle visualization).
         octree_unit = 2 ** (len(lods) - 1)
         total_chunks_per_axis = (
             np.ceil(num_chunks_per_axis / octree_unit).astype(int)
             * octree_unit
         )
         full_grid_extent = total_chunks_per_axis * lod_0_box_size
-        bbox_center = (vertex_min + vertex_max) / 2
-        grid_origin = np.floor(bbox_center - full_grid_extent / 2)
-        grid_origin = np.clip(
-            grid_origin,
-            np.ceil(vertex_max - full_grid_extent),
-            np.floor(vertex_min),
-        )
+        if center_octree:
+            bbox_center = (vertex_min + vertex_max) / 2
+            grid_origin = np.floor(bbox_center - full_grid_extent / 2)
+            grid_origin = np.clip(
+                grid_origin,
+                np.ceil(vertex_max - full_grid_extent),
+                np.floor(vertex_min),
+            )
+        else:
+            grid_origin = np.floor(vertex_min)
 
         results = []
         for idx, current_lod in enumerate(lods):
@@ -328,6 +346,7 @@ def generate_all_neuroglancer_multires_meshes(
     target_faces_per_lod0_chunk=DEFAULT_TARGET_FACES_PER_LOD0_CHUNK,
     voxel_size_nm=1.0,
     min_useful_faces=MIN_USEFUL_FACES_PER_LOD,
+    center_octree=True,
 ):
     """Generate Neuroglancer multiresolution meshes for all segments.
 
@@ -365,7 +384,7 @@ def generate_all_neuroglancer_multires_meshes(
     fixed_args_list = [
         output_path, lods, original_ext, lod_0_box_size,
         vertex_quantization_bits, target_faces_per_lod0_chunk,
-        voxel_size_nm, min_useful_faces,
+        voxel_size_nm, min_useful_faces, center_octree,
     ]
     for idx, id in enumerate(ids):
         variable_args_list.append((id, num_subtask_workers[idx]))
@@ -414,6 +433,7 @@ def run_multires(config_path, num_workers, roi=None):
     delete_decimated_meshes_flag = optional_decimation_settings["delete_decimated_meshes"]
     target_faces_per_lod0_chunk = optional_decimation_settings["target_faces_per_lod0_chunk"]
     voxel_size_nm = float(optional_decimation_settings.get("voxel_size_nm", 1.0))
+    center_octree = bool(optional_decimation_settings.get("center_octree", True))
     retry_on_oom = optional_decimation_settings.get("retry_on_oom", True)
     memory_retry_max = optional_decimation_settings.get("memory_retry_max", 3)
 
@@ -512,6 +532,7 @@ def run_multires(config_path, num_workers, roi=None):
                             vertex_quantization_bits=16,
                             target_faces_per_lod0_chunk=target_faces_per_lod0_chunk,
                             voxel_size_nm=voxel_size_nm,
+                            center_octree=center_octree,
                         )
             dask_util.run_with_oom_retry(
                 _run_multires, effective_workers, "multires creation", logger,

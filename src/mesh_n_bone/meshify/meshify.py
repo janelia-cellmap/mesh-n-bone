@@ -1049,6 +1049,7 @@ class Meshify:
         smooth_before_simplify: bool = True,
         target_ids: int | list[int] | None = None,
         keep_chunked_meshes: bool = False,
+        center_octree: bool = True,
     ):
         filename, dataset_name = split_dataset_path(input_path)
         self.segmentation_array = open_dataset(filename, dataset_name)
@@ -1221,6 +1222,7 @@ class Meshify:
         self.smooth_before_simplify = smooth_before_simplify
         self.target_ids = _normalize_target_ids(target_ids)
         self.keep_chunked_meshes = keep_chunked_meshes
+        self.center_octree = center_octree
         self.coordinate_units = coordinate_units
         self.retry_on_oom = retry_on_oom
         self.memory_retry_max = memory_retry_max
@@ -2659,6 +2661,7 @@ class Meshify:
                         self.lod_0_box_size,
                         target_faces_per_lod0_chunk=self.target_faces_per_lod0_chunk,
                         voxel_size_nm=float(self.base_voxel_size_funlib[0]),
+                        center_octree=self.center_octree,
                     )
 
         dask_util.run_with_oom_retry(

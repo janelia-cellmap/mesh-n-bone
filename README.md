@@ -155,6 +155,14 @@ decimation_factor: 6             # Per-LOD face reduction factor. In decimate st
                                  # per-LOD target_reduction so the LOD-to-LOD face count drops by this
                                  # factor. (default: 6, hemibrain-matched)
 delete_decimated_meshes: true    # Remove intermediate LOD mesh files after Draco output (default: true)
+center_octree: true              # Position the mesh in the middle of the multires octree. NG uses the
+                                 # top-LOD chunk center for double-click-to-focus, so centering keeps
+                                 # click-to-center accurate. Cost: meshes that would fit in a single
+                                 # LOD-0 chunk straddle the octree's center boundary instead,
+                                 # producing visible chunk seams at high zoom. Set false to align the
+                                 # octree to the mesh bbox corner — sub-chunk meshes then fit in 1
+                                 # fragment with no internal seams, but click-to-focus lands near the
+                                 # mesh's near corner instead of its center. (default: true)
 
 # ── Sharded output (recommended for thousands of meshes) ──
 sharded: true                    # Pack all meshes into a few <n>.shard files
