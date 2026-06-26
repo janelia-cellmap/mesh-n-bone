@@ -127,7 +127,15 @@ class AnalyzeMeshes:
         Distributes work across Dask workers and writes
         ``mesh_metrics.csv`` to the output directory.
         """
-        mesh_ids = os.listdir(self.meshes_dirname)
+        # Filter to actual mesh files: skip subdirectories (e.g. the
+        # `assembly_metadata` dir written by the multires pipeline) and
+        # keep only files whose extension trimesh can load.
+        _MESH_EXTS = {".ply", ".obj", ".stl", ".off", ".glb", ".gltf"}
+        mesh_ids = [
+            f for f in os.listdir(self.meshes_dirname)
+            if os.path.isfile(os.path.join(self.meshes_dirname, f))
+            and os.path.splitext(f)[1].lower() in _MESH_EXTS
+        ]
 
         metrics = ["volume (nm^3)", "surface_area (nm^2)"]
         for axis in range(3):
