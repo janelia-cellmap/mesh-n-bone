@@ -2729,6 +2729,25 @@ class Meshify:
                     lod_scale_multiplier=float(self.base_voxel_size_funlib[0]),
                 )
 
+        # Run mesh metrics on the LOD-0 per-segment PLYs BEFORE they get
+        # cleaned up. AnalyzeMeshes reads PLYs from a directory; the LOD-0
+        # outputs live at mesh_lods/s0/ at this point in the multires flow.
+        # (Previously, do_analysis was unreachable when do_multires=true
+        # because get_meshes early-returns after get_multiscale_meshes —
+        # this restores it as a no-multires-required option.)
+        if self.do_analysis:
+            from mesh_n_bone.analyze.analyze import AnalyzeMeshes
+
+            lod0_dir = f"{mesh_lods_dir}/s0"
+            with Timing_Messager(
+                f"Analyzing meshes at {lod0_dir}", logger,
+            ):
+                AnalyzeMeshes(
+                    lod0_dir,
+                    f"{self.output_directory}/metrics",
+                    num_workers=self.num_workers,
+                ).analyze()
+
         if self.delete_decimated_meshes:
             with Timing_Messager("Cleaning up intermediate mesh files", logger):
                 shutil.rmtree(mesh_lods_dir, ignore_errors=True)
