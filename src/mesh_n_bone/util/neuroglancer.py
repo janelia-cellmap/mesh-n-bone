@@ -6,7 +6,7 @@ import struct
 import numpy as np
 
 
-def write_info_file(path, vertex_quantization_bits=16):
+def write_info_file(path, vertex_quantization_bits=16, lod_scale_multiplier=1.0):
     """Write the ``info`` JSON file for a Neuroglancer multi-LOD Draco mesh layer.
 
     The generated file uses the specified vertex quantization, an identity
@@ -19,13 +19,21 @@ def write_info_file(path, vertex_quantization_bits=16):
     vertex_quantization_bits : int, optional
         Number of quantization bits per vertex coordinate.  Default is
         ``16``.
+    lod_scale_multiplier : float, optional
+        Multiplied into each segment manifest's `lod_scales` to give NG
+        the true per-LOD spatial resolution in physical units. Should be
+        set to the dataset's LOD-0 voxel size (e.g. 16 for 16 nm voxels)
+        so the per-LOD scales `[1, 2, 4, 8]` stored in manifests become
+        `[16, 32, 64, 128]` nm in NG's eyes. With the default 1.0, NG
+        would treat LOD-0 as 1-unit-resolution and aggressively pick
+        coarse LODs for any view (the historical buggy default).
     """
     with open(f"{path}/info", "w") as f:
         info = {
             "@type": "neuroglancer_multilod_draco",
             "vertex_quantization_bits": vertex_quantization_bits,
             "transform": [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0],
-            "lod_scale_multiplier": 1,
+            "lod_scale_multiplier": float(lod_scale_multiplier),
             "segment_properties": "segment_properties",
         }
         json.dump(info, f)

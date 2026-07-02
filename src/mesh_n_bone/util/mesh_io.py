@@ -283,8 +283,20 @@ def rewrite_index_with_empty_fragments(path, current_lod_fragments):
         set(map(tuple, p[s > 0].tolist())) for (p, s) in existing_per_lod
     ]
 
-    # Descent: reachable positions are sub-octants of REAL reachable
-    # positions one level up. The root is reachable by definition.
+    # Reachability is the union of two passes:
+    #   1. Top-down descent through REAL parents, which adds empty
+    #      placeholders under each real parent so NG's octree carve-out
+    #      stays complete (this was the only pass before).
+    #   2. Bottom-up ancestor walk from every REAL position, which
+    #      keeps real leaves listed even when an intermediate LOD is
+    #      empty in their cell. Independently-meshed LODs disagree:
+    #      mode-downsampling can drop a thin edge at LOD k+1 that still
+    #      exists at LOD k. Without the bottom-up pass, the real LOD-k
+    #      leaf is dropped as an "orphan" (no real parent chain) and
+    #      NG can't reach it — the user sees a chunk-shaped hole at
+    #      the finest LOD. With it, the empty intermediates are listed
+    #      as 0-byte placeholders and NG's fall-back-to-parent rule
+    #      lets it traverse down to the real leaf.
     reachable = [set() for _ in range(num_lods)]
     if real_pos_per_lod[top]:
         reachable[top] = real_pos_per_lod[top].copy()
@@ -294,6 +306,13 @@ def rewrite_index_with_empty_fragments(path, current_lod_fragments):
                     for b in (0, 1):
                         for c in (0, 1):
                             reachable[k].add((2 * X + a, 2 * Y + b, 2 * Z + c))
+    for k in range(num_lods):
+        for (X, Y, Z) in real_pos_per_lod[k]:
+            reachable[k].add((X, Y, Z))
+            x, y, z = X, Y, Z
+            for kk in range(k + 1, num_lods):
+                x, y, z = x // 2, y // 2, z // 2
+                reachable[kk].add((x, y, z))
 
     # Walk the existing data blob LOD-by-LOD in its current listed
     # order, extracting bytes for reachable real fragments. Drop bytes

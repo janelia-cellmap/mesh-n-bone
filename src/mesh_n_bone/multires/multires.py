@@ -20,12 +20,23 @@ logger = logging.getLogger(__name__)
 
 
 DEFAULT_TARGET_FACES_PER_LOD0_CHUNK = 25_000
+# Hemibrain uses 1024 voxels per LOD-0 chunk (= 16 μm at their 16-nm
+# meshing scale). Same number used here as a sensible dataset-level
+# default: 1024 × voxel_size for a single isotropic chunk size that
+# behaves consistently across mesh sizes.
+DEFAULT_BOX_SIZE_VOXELS = 1024
+# A LOD whose decimated face count would fall below this is dropped from
+# per-segment output — further decimation produces degenerate meshes.
+MIN_USEFUL_FACES_PER_LOD = 50
 
 
 def generate_neuroglancer_multires_mesh(
     id, num_subtask_workers, output_path, lods, original_ext, lod_0_box_size=None,
     vertex_quantization_bits=16,
     target_faces_per_lod0_chunk=DEFAULT_TARGET_FACES_PER_LOD0_CHUNK,
+    voxel_size_nm=1.0,
+    min_useful_faces=MIN_USEFUL_FACES_PER_LOD,
+    center_octree=True,
 ):
     """Create a complete multiresolution mesh for a single segment.
 
@@ -98,6 +109,15 @@ def generate_neuroglancer_multires_mesh(
                     f"{previous_lod} ({previous_faces} faces)."
                 )
                 break
+            if current_lod > 0 and num_faces < min_useful_faces:
+                lod_truncation_reason = (
+                    f"Segment {id} using {idx}/{requested_lod_count} requested "
+                    f"LODs; dropping LOD {current_lod} and later because it "
+                    f"has {num_faces} faces, below the useful-detail "
+                    f"threshold ({min_useful_faces}) — further decimation "
+                    f"produces degenerate meshes."
+                )
+                break
             lod_face_counts.append((current_lod, num_faces))
             # LOD-0 bounds drive the chunk grid.
             if current_lod == 0 and vertices is not None:
@@ -132,18 +152,27 @@ def generate_neuroglancer_multires_mesh(
             return
 
         if lod_0_box_size is None:
-            # Surface-area scaling: triangles distribute across the
-            # mesh's 2-D surface, so total chunks ∝ N²-on-axis. Use
-            # sqrt for the per-axis count.
-            heuristic_num_chunks = np.ceil(
-                lod0_num_faces / target_faces_per_lod0_chunk
-            )
-            num_chunks_per_axis = max(
-                1, int(np.ceil(np.sqrt(heuristic_num_chunks)))
-            )
-            lod_0_box_size = (
-                np.ceil(lod0_distances_per_axis / num_chunks_per_axis) + 1
-            )
+            if target_faces_per_lod0_chunk != DEFAULT_TARGET_FACES_PER_LOD0_CHUNK:
+                # User explicitly tuned target_faces_per_lod0_chunk →
+                # use the adaptive surface-area heuristic.
+                heuristic_num_chunks = np.ceil(
+                    lod0_num_faces / target_faces_per_lod0_chunk
+                )
+                num_chunks_per_axis = max(
+                    1, int(np.ceil(np.sqrt(heuristic_num_chunks)))
+                )
+                lod_0_box_size = (
+                    np.ceil(lod0_distances_per_axis / num_chunks_per_axis) + 1
+                )
+            else:
+                # Dataset-level default: fixed N voxels per chunk side
+                # (matches hemibrain's setup at 1024 voxels). Gives
+                # consistent LOD-transition zoom thresholds across mesh
+                # sizes — a 1 μm mito and a 100 μm neuron get the same
+                # physical chunk size, just different chunk counts.
+                lod_0_box_size = np.full(
+                    3, DEFAULT_BOX_SIZE_VOXELS * voxel_size_nm, dtype=float,
+                )
 
         # Compute the LOD 0 chunk grid from the s0 mesh extent.
         mesh_extent = vertex_max - vertex_min
@@ -151,22 +180,39 @@ def generate_neuroglancer_multires_mesh(
             np.ceil(mesh_extent / lod_0_box_size).astype(int), 1
         )
 
-        # Center the mesh within the full octree grid so that
-        # Neuroglancer's bounding-box center matches the actual mesh
-        # center.
+        # Position the octree relative to the mesh bbox.
+        #
+        # center_octree=True (default): the mesh sits in the middle of
+        # the LOD-(top) chunk. NG's "double-click to focus" uses the
+        # top-LOD chunk center as the segment's centroid — centering
+        # makes that land on the mesh. The cost is that meshes which
+        # would otherwise fit in a single LOD-0 chunk straddle the
+        # octree's center boundary, producing 2×2×2 = 8 LOD-0 fragments
+        # and visible chunk seams at high zoom.
+        #
+        # center_octree=False: align the octree to floor(bbox_min).
+        # No internal-seam subdivision for sub-octree-sized meshes
+        # (they fit in 1 LOD-0 chunk). Click-to-focus may land off the
+        # mesh — toward the LOD-(top) chunk center, which is at the
+        # mesh's near corner for sub-chunk meshes. Choose this when
+        # seam-free rendering matters more than precise click-to-center
+        # (e.g. dense-organelle visualization).
         octree_unit = 2 ** (len(lods) - 1)
         total_chunks_per_axis = (
             np.ceil(num_chunks_per_axis / octree_unit).astype(int)
             * octree_unit
         )
         full_grid_extent = total_chunks_per_axis * lod_0_box_size
-        bbox_center = (vertex_min + vertex_max) / 2
-        grid_origin = np.floor(bbox_center - full_grid_extent / 2)
-        grid_origin = np.clip(
-            grid_origin,
-            np.ceil(vertex_max - full_grid_extent),
-            np.floor(vertex_min),
-        )
+        if center_octree:
+            bbox_center = (vertex_min + vertex_max) / 2
+            grid_origin = np.floor(bbox_center - full_grid_extent / 2)
+            grid_origin = np.clip(
+                grid_origin,
+                np.ceil(vertex_max - full_grid_extent),
+                np.floor(vertex_min),
+            )
+        else:
+            grid_origin = np.floor(vertex_min)
 
         results = []
         for idx, current_lod in enumerate(lods):
@@ -298,6 +344,9 @@ def generate_all_neuroglancer_multires_meshes(
     output_path, num_workers, ids, lods, original_ext, file_sizes,
     lod_0_box_size=None, vertex_quantization_bits=16,
     target_faces_per_lod0_chunk=DEFAULT_TARGET_FACES_PER_LOD0_CHUNK,
+    voxel_size_nm=1.0,
+    min_useful_faces=MIN_USEFUL_FACES_PER_LOD,
+    center_octree=True,
 ):
     """Generate Neuroglancer multiresolution meshes for all segments.
 
@@ -335,6 +384,7 @@ def generate_all_neuroglancer_multires_meshes(
     fixed_args_list = [
         output_path, lods, original_ext, lod_0_box_size,
         vertex_quantization_bits, target_faces_per_lod0_chunk,
+        voxel_size_nm, min_useful_faces, center_octree,
     ]
     for idx, id in enumerate(ids):
         variable_args_list.append((id, num_subtask_workers[idx]))
@@ -382,6 +432,8 @@ def run_multires(config_path, num_workers, roi=None):
     aggressiveness = optional_decimation_settings["aggressiveness"]
     delete_decimated_meshes_flag = optional_decimation_settings["delete_decimated_meshes"]
     target_faces_per_lod0_chunk = optional_decimation_settings["target_faces_per_lod0_chunk"]
+    voxel_size_nm = float(optional_decimation_settings.get("voxel_size_nm", 1.0))
+    center_octree = bool(optional_decimation_settings.get("center_octree", True))
     retry_on_oom = optional_decimation_settings.get("retry_on_oom", True)
     memory_retry_max = optional_decimation_settings.get("memory_retry_max", 3)
 
@@ -479,6 +531,8 @@ def run_multires(config_path, num_workers, roi=None):
                             np.array(file_sizes), lod_0_box_size,
                             vertex_quantization_bits=16,
                             target_faces_per_lod0_chunk=target_faces_per_lod0_chunk,
+                            voxel_size_nm=voxel_size_nm,
+                            center_octree=center_octree,
                         )
             dask_util.run_with_oom_retry(
                 _run_multires, effective_workers, "multires creation", logger,
@@ -526,6 +580,7 @@ def run_multires(config_path, num_workers, roi=None):
                 with Timing_Messager("Writing sharded info file", logger):
                     sharded_mesh_util.write_sharded_info_file(
                         multires_output_path, spec, vertex_quantization_bits=16,
+                        lod_scale_multiplier=voxel_size_nm,
                     )
 
                 if sharding_settings["delete_unsharded_files"]:
@@ -539,6 +594,7 @@ def run_multires(config_path, num_workers, roi=None):
                 with Timing_Messager("Writing info file", logger):
                     neuroglancer.write_info_file(
                         multires_output_path, vertex_quantization_bits=16,
+                        lod_scale_multiplier=voxel_size_nm,
                     )
 
             if not skip_decimation and delete_decimated_meshes_flag:

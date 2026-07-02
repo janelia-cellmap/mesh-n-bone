@@ -83,6 +83,13 @@ def _capped_tensorstore_context_spec():
         "gcs_request_concurrency": {"limit": 1},
         "s3_request_concurrency": {"limit": 1},
         "http_request_concurrency": {"limit": 1},
+        # Disable tensorstore's decoded-chunk cache. Default is unbounded,
+        # so for long-lived worker processes (e.g. dask LSF workers that
+        # cache opened handles in _PYRAMID_WORKER_TS_CACHE across multiple
+        # super-chunks), the cache accumulates decoded chunks until the
+        # worker is OOM-killed. We don't benefit from caching anyway —
+        # each super-chunk reads/writes a non-overlapping region.
+        "cache_pool": {"total_bytes_limit": 0},
     }
 
 

@@ -461,6 +461,153 @@ def _write_assembly_memory_plan(output_directory, estimates, waves):
         json.dump(plan, f, indent=2)
 
 
+def _existing_pyramid_scales(pyramid_path):
+    """Return ``{lod_index: uniform_factor}`` of usable scales on disk, or
+    ``None`` if the pyramid isn't readable.
+
+    Parses the OME-NGFF v0.4 multiscales metadata at
+    ``{pyramid_path}/.zattrs`` and returns the per-LOD uniform downsample
+    factor (relative to s0) for each dataset whose corresponding
+    ``s_k/.zarray`` actually exists on disk. Used to skip a fresh build
+    when a prior run already wrote the pyramid (e.g. debug re-runs).
+
+    Returns ``None`` when the file is missing, malformed, or doesn't
+    expose multiscales in the expected shape.
+    """
+    zattrs_path = os.path.join(pyramid_path, ".zattrs")
+    if not os.path.isfile(zattrs_path):
+        return None
+    try:
+        with open(zattrs_path) as f:
+            attrs = json.load(f)
+        datasets = attrs["multiscales"][0]["datasets"]
+        # s0's scale per-axis defines the base; s_k's factor = s_k/s_0
+        s0_scale = None
+        for ds in datasets:
+            if ds.get("path") == "s0":
+                for tr in ds.get("coordinateTransformations", []):
+                    if tr.get("type") == "scale":
+                        s0_scale = tr["scale"]
+                        break
+                break
+        if s0_scale is None:
+            return None
+        result = {}
+        for ds in datasets:
+            name = ds.get("path", "")
+            if not name.startswith("s") or not name[1:].isdigit():
+                continue
+            k = int(name[1:])
+            if k == 0:
+                continue
+            scale = None
+            for tr in ds.get("coordinateTransformations", []):
+                if tr.get("type") == "scale":
+                    scale = tr["scale"]
+                    break
+            if scale is None:
+                continue
+            factors = [scale[i] / s0_scale[i] for i in range(3)]
+            if not (factors[0] == factors[1] == factors[2]):
+                continue
+            factor = int(round(factors[0]))
+            # Verify the underlying zarr array actually exists
+            if not os.path.isfile(os.path.join(pyramid_path, name, ".zarray")):
+                continue
+            result[k] = factor
+        return result
+    except (KeyError, IndexError, ValueError, json.JSONDecodeError, OSError):
+        return None
+
+
+def _safely_remove_pyramid(pyramid_path, num_workers=8):
+    """Delete the auto-built pyramid zarr with chunk-level parallelism.
+
+    The pyramid's ``s0`` is a symlink to the USER'S INPUT data on local
+    filesystems — under no circumstances should the cleanup follow it
+    into the target. Process:
+
+    1. Refuse to act when ``pyramid_path`` itself is a symlink.
+    2. Walk the tree top-down WITHOUT following symlinks. Unlink every
+       symlink encountered immediately (the s0 link disappears here
+       BEFORE any parallel worker can race for it). Collect real files
+       (zarr chunk files + metadata) and real directories separately.
+    3. Partition the collected real files across ``num_workers`` threads;
+       each thread ``os.unlink``s its batch. This is where the chunk-
+       level parallelism happens — on shared filesystems
+       (Lustre/NFS/GPFS) where unlink throughput is metadata-server-
+       bound, parallel threads scale linearly up to the MDS cap.
+    4. Remove now-empty real directories bottom-up.
+
+    Adapted from cellmap-analyze's depth-based blockwise delete pattern
+    in dask_util.py:delete_tmp_dir_blockwise.
+    """
+    if not os.path.isdir(pyramid_path):
+        return
+    if os.path.islink(pyramid_path):
+        logger.warning(
+            "Refusing to delete %s: it is itself a symlink. Manual cleanup required.",
+            pyramid_path,
+        )
+        return
+
+    # Step 1: walk and inventory. Unlink symlinks IMMEDIATELY at each
+    # level so the parallel batch below never sees a path that could
+    # follow into user data.
+    real_files = []
+    real_dirs = []
+    for root, dirs, files in os.walk(pyramid_path, topdown=True, followlinks=False):
+        real_dirs.append(root)
+        # Symlinks may appear as either files or dirs depending on target type.
+        surviving_files = []
+        for name in files:
+            full = os.path.join(root, name)
+            if os.path.islink(full):
+                try:
+                    os.unlink(full)
+                except OSError:
+                    pass
+            else:
+                surviving_files.append(full)
+        real_files.extend(surviving_files)
+        # Prune symlinked directories from descent + unlink them right now
+        surviving_dirs = []
+        for name in dirs:
+            full = os.path.join(root, name)
+            if os.path.islink(full):
+                try:
+                    os.unlink(full)
+                except OSError:
+                    pass
+            else:
+                surviving_dirs.append(name)
+        dirs[:] = surviving_dirs
+
+    # Step 2: parallel unlink of all real files (the chunk-level work)
+    def _safe_unlink(path):
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+    if real_files:
+        max_workers = max(1, int(num_workers))
+        if max_workers > 1 and len(real_files) > max_workers:
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=max_workers) as ex:
+                list(ex.map(_safe_unlink, real_files))
+        else:
+            for f in real_files:
+                _safe_unlink(f)
+
+    # Step 3: rmdir empty real directories bottom-up
+    for d in reversed(real_dirs):
+        try:
+            os.rmdir(d)
+        except OSError:
+            pass
+
+
 def _estimate_block_target_mb_from_dask_config(
     config_path="dask-config.yaml",
     fallback_mb=128,
@@ -882,6 +1029,8 @@ class Meshify:
         downsample_method: str = "mode",
         multires_strategy: str = "downsample",
         use_existing_scales: bool = True,
+        delete_intermediate_scales: bool = True,
+        pyramid_alignment_mode: str = "halo",
         decimation_factor: int = 6,
         decimation_aggressiveness: int = 7,
         delete_decimated_meshes: bool = True,
@@ -899,6 +1048,8 @@ class Meshify:
         delete_unsharded_files: bool = True,
         smooth_before_simplify: bool = True,
         target_ids: int | list[int] | None = None,
+        keep_chunked_meshes: bool = False,
+        center_octree: bool = True,
     ):
         filename, dataset_name = split_dataset_path(input_path)
         self.segmentation_array = open_dataset(filename, dataset_name)
@@ -1055,6 +1206,8 @@ class Meshify:
         self.input_path = input_path
         self.multires_strategy = multires_strategy
         self.use_existing_scales = use_existing_scales
+        self.delete_intermediate_scales = delete_intermediate_scales
+        self.pyramid_alignment_mode = pyramid_alignment_mode
         self.decimation_factor = decimation_factor
         self.decimation_aggressiveness = decimation_aggressiveness
         self.delete_decimated_meshes = delete_decimated_meshes
@@ -1068,6 +1221,8 @@ class Meshify:
         self.delete_unsharded_files = delete_unsharded_files
         self.smooth_before_simplify = smooth_before_simplify
         self.target_ids = _normalize_target_ids(target_ids)
+        self.keep_chunked_meshes = keep_chunked_meshes
+        self.center_octree = center_octree
         self.coordinate_units = coordinate_units
         self.retry_on_oom = retry_on_oom
         self.memory_retry_max = memory_retry_max
@@ -1569,7 +1724,8 @@ class Meshify:
                     f"{len(mesh_files)}>{self.max_num_blocks}. Skipping.\n"
                 )
                 f.write(", ".join(mesh_files))
-            shutil.rmtree(f"{self.dirname}/{mesh_id}")
+            if not getattr(self, "keep_chunked_meshes", False):
+                shutil.rmtree(f"{self.dirname}/{mesh_id}")
             return
 
         block_meshes = []
@@ -1595,7 +1751,8 @@ class Meshify:
                     "fixed-edge simplification).",
                     mesh_id, len(mesh_files),
                 )
-                shutil.rmtree(f"{self.dirname}/{mesh_id}", ignore_errors=True)
+                if not getattr(self, "keep_chunked_meshes", False):
+                    shutil.rmtree(f"{self.dirname}/{mesh_id}", ignore_errors=True)
                 return
             chunk_size = (
                 self.read_write_block_shape_pixels * self.base_voxel_size_funlib
@@ -1634,7 +1791,8 @@ class Meshify:
                 "zero vertices.",
                 mesh_id,
             )
-            shutil.rmtree(f"{self.dirname}/{mesh_id}", ignore_errors=True)
+            if not getattr(self, "keep_chunked_meshes", False):
+                shutil.rmtree(f"{self.dirname}/{mesh_id}", ignore_errors=True)
             return
 
         if check_validity or self.has_custom_roi:
@@ -1736,7 +1894,8 @@ class Meshify:
             )
         else:
             _ = mesh.export(f"{self.output_directory}/meshes/{mesh_id}.ply")
-        shutil.rmtree(f"{self.dirname}/{mesh_id}")
+        if not getattr(self, "keep_chunked_meshes", False):
+            shutil.rmtree(f"{self.dirname}/{mesh_id}")
 
     def _assemble_mesh_batch(self, mesh_ids):
         """Assemble a memory-balanced batch of segment ids sequentially."""
@@ -1838,7 +1997,8 @@ class Meshify:
             write_ngmesh_metadata(f"{self.output_directory}/meshes")
         elif self.do_singleres_multires_neuroglancer:
             write_singleres_multires_metadata(f"{self.output_directory}/meshes")
-        shutil.rmtree(dirname)
+        if not getattr(self, "keep_chunked_meshes", False):
+            shutil.rmtree(dirname)
 
     def _generate_meshes_at_scale(self, output_mesh_dir, downsample_factor=None,
                                    target_reduction_override=None,
@@ -1924,11 +2084,22 @@ class Meshify:
                 self.target_reduction = target_reduction_override
 
             os.makedirs(self.output_directory, exist_ok=True)
-            tmp_chunked_dir = self.output_directory + "/tmp_chunked"
+            scale_tag = (
+                f"s{int(np.log2(self.downsample_factor))}"
+                if self.downsample_factor
+                else "s0"
+            )
+            tmp_chunked_dir = (
+                self.output_directory
+                + ("/tmp_chunked_" + scale_tag
+                   if getattr(self, "keep_chunked_meshes", False)
+                   else "/tmp_chunked")
+            )
             os.makedirs(tmp_chunked_dir, exist_ok=True)
             self.get_chunked_meshes(tmp_chunked_dir)
             self.assemble_meshes(tmp_chunked_dir)
-            shutil.rmtree(tmp_chunked_dir, ignore_errors=True)
+            if not getattr(self, "keep_chunked_meshes", False):
+                shutil.rmtree(tmp_chunked_dir, ignore_errors=True)
         finally:
             self.output_directory = orig_output
             self.downsample_factor = orig_downsample
@@ -2012,6 +2183,370 @@ class Meshify:
 
         self._existing_scales_cache = result
         return result
+
+    def _build_missing_pyramid_scales(self, num_lods):
+        """Auto-build missing OME-NGFF multiscale levels for the
+        downsample multires strategy.
+
+        Looks at what the source group exposes, computes the per-axis
+        cumulative factors needed for ``num_lods``, and builds whatever's
+        missing under ``{output_directory}/_intermediate_scales.zarr``.
+
+        Returns ``{int_factor: dataset_path}`` mapping ONLY the
+        newly-built scales (so the caller can merge with the source's
+        existing scales). The mapping key is a single int — only valid
+        for isotropic-factor levels — to match the existing
+        ``_discover_existing_scales`` cache shape. Anisotropic factor
+        tuples aren't yet honored by the downstream LOD dispatch, so
+        the builder skips emitting them into the cache (they still get
+        written to disk for future use); falls back to in-worker
+        downsampling for those LODs.
+        """
+        from mesh_n_bone.util.pyramid_builder import (
+            per_lod_factors_for_anisotropy,
+            build_missing_pyramid_levels,
+        )
+        from mesh_n_bone.util.image_data_interface import to_ndarray_tensorstore
+        from funlib.geometry import Coordinate, Roi
+
+        voxel_size = np.asarray(self.true_voxel_size, dtype=float)
+        factors_per_lod = per_lod_factors_for_anisotropy(voxel_size, num_lods)
+
+        existing = self._discover_existing_scales() if self.use_existing_scales else {}
+        # Only build levels where the factor is "uniform" — i.e. (k,k,k) —
+        # since downstream LOD dispatch is by single int factor. Anisotropic
+        # output is still written to disk (useful for future runs or external
+        # tools) but isn't fed back into the cache.
+        needed_uniform = []
+        for k, factor in enumerate(factors_per_lod):
+            if k == 0:
+                continue
+            if factor[0] == factor[1] == factor[2]:
+                if factor[0] not in existing:
+                    needed_uniform.append((k, factor))
+        if not needed_uniform:
+            # Nothing to build OR everything is anisotropic (no cache benefit)
+            return {}
+
+        pyramid_path = os.path.join(
+            self.output_directory, "_intermediate_scales.zarr",
+        )
+
+        # If the pyramid already exists on disk with all the needed scales,
+        # skip the rebuild and reuse what's there. Useful when re-running a
+        # job in the same output dir (e.g. for debugging) so we don't redo
+        # the (potentially slow) downsample pass each time.
+        existing_pyramid = _existing_pyramid_scales(pyramid_path)
+        if existing_pyramid is not None:
+            available = {f: f"{pyramid_path}/s{k}" for k, f in existing_pyramid.items()}
+            need_factors = {int(factor[0]) for _, factor in needed_uniform}
+            if need_factors.issubset(set(available.keys())):
+                logger.info(
+                    "pyramid_builder: reusing existing %s (scales %s)",
+                    pyramid_path, sorted(need_factors),
+                )
+                return {f: available[f] for f in need_factors}
+
+        # ROI in voxel coordinates relative to the dataset's own (0, 0, 0)
+        seg_arr = self.segmentation_array
+        ds_offset = np.asarray(seg_arr.roi.offset, dtype=np.int64)
+        vs_int = np.asarray(seg_arr.voxel_size, dtype=np.int64)
+        roi_world_origin = np.asarray(self.roi.offset, dtype=np.int64)
+        roi_world_shape = np.asarray(self.roi.shape, dtype=np.int64)
+        roi_voxel_origin = (roi_world_origin - ds_offset) // vs_int
+        roi_voxel_shape = roi_world_shape // vs_int
+
+        # Dataset shape in voxels
+        dataset_shape = np.asarray(seg_arr.data.shape[-3:], dtype=np.int64)
+
+        # No driver-side tensorstore handle needed — workers re-open per-process.
+        dataset_path = self._dataset_path
+        swap_axes = self._swap_axes
+        ds_offset_coord = Coordinate(seg_arr.roi.offset)
+        vs_coord = Coordinate(seg_arr.voxel_size)
+
+        # Downsample function dispatch
+        from mesh_n_bone.meshify.downsample import (
+            downsample_labels_3d,
+            downsample_binary_3d,
+            downsample_labels_3d_suppress_zero,
+        )
+        downsample_dispatch = {
+            "mode": downsample_labels_3d,
+            "mode_suppress_zero": downsample_labels_3d_suppress_zero,
+            "binary": downsample_binary_3d,
+        }
+        if self.downsample_method == "nearest":
+            # Striding is free at the worker; no point caching a pyramid.
+            return {}
+        if self.downsample_method not in downsample_dispatch:
+            raise ValueError(
+                f"Unknown downsample_method '{self.downsample_method}'. "
+                f"Choose from: {list(downsample_dispatch.keys()) + ['nearest']}"
+            )
+        downsample_func = downsample_dispatch[self.downsample_method]
+
+        # Two decoupled sizes:
+        #   out_chunk_shape:  on-disk chunk shape of the s_k zarr arrays.
+        #                     Should be a SANE chunk size (~64-128) so
+        #                     subsequent reads from the s_k arrays
+        #                     produce a manageable number of files.
+        #                     Independent of memory budget.
+        #   super_chunk_shape:  region of s0 each worker task reads. Must
+        #                     be a multiple of out_chunk_shape * max_factor
+        #                     (so each task fills an integer number of
+        #                     output chunks at every LOD). Sized to fit
+        #                     per-worker memory budget.
+        max_factor = np.max(np.array([f for _, f in needed_uniform]), axis=0)
+        itemsize = int(np.dtype(seg_arr.data.dtype).itemsize)
+        # 1.0 (s0 read) + 1/8 (LOD 1 output) + ~1/8 (downsample scratch)
+        # plus ~1x slack for tensorstore decode/encode buffers, output-handle
+        # cache_pool retention across cascaded LODs (s1, s2, s3), and
+        # glibc malloc fragmentation across the 8+ sequential super-chunks
+        # a worker processes before exit. Underestimating this was the root
+        # cause of OOMs on bw-1 mito even at processes=1 / 180 GB/worker.
+        amplification = 2.5
+
+        # Sane output chunk shape: inherit s0's chunk shape, clamped to
+        # the [32, 128] range and rounded to a multiple of max_factor per
+        # axis. The upper bound caps super_chunk_shape (= out_chunk *
+        # max_factor) at 128*8 = 1024 voxels per axis, i.e. ~1-2 GB per
+        # task. Higher than 128 here can produce a 1792³ super-chunk
+        # (11.5 GB at uint16) that OOMs workers, since the realistic
+        # amplification (above) plus tensorstore caches puts the per-task
+        # peak well over the 30 GB/worker budget at default processes=6.
+        SANE_CHUNK_MIN = 32
+        SANE_CHUNK_MAX = 128
+        src_chunk = np.asarray(seg_arr.chunk_shape, dtype=np.int64)
+        out_chunk_shape = []
+        for ax in range(3):
+            mf = int(max_factor[ax])
+            ch = int(src_chunk[ax])
+            ch = max(SANE_CHUNK_MIN, min(SANE_CHUNK_MAX, ch))
+            # round to multiple of mf (so super-chunk * mf = out chunk)
+            ch = max(mf, (ch // mf) * mf)
+            out_chunk_shape.append(ch)
+        out_chunk_arr = np.asarray(out_chunk_shape, dtype=np.int64)
+
+        worker_mb = _estimate_block_target_mb_from_dask_config(
+            "dask-config.yaml",
+            fallback_mb=2048,
+        )
+
+        # super_chunk_shape is FIXED at out_chunk * max_factor — the smallest
+        # super-chunk that fills exactly one output chunk per LOD. Growing
+        # super-chunks past this point reduces task count (= parallelism)
+        # without any real benefit for label data (mode downsamples are
+        # CPU-bounded, not I/O-amortization-bounded). Memory tuning is done
+        # by adjusting processes-per-LSF-job (= memory per worker), not by
+        # growing super-chunks.
+        super_chunk_shape = (out_chunk_arr * max_factor).tolist()
+        super_chunk_arr = np.asarray(super_chunk_shape, dtype=np.int64)
+        super_bytes = int(np.prod(super_chunk_arr)) * itemsize
+
+        def _per_worker_mb_for(processes):
+            if job_memory is not None and processes > 0:
+                return (job_memory / processes) / 1e6
+            return fallback_per_worker_mb
+
+        # Resolve ROI alignment up-front (we need the aligned out_shape to
+        # build the output zarr arrays)
+        from mesh_n_bone.util.pyramid_builder import (
+            per_lod_factors_for_anisotropy,
+            align_roi_voxels,
+            prepare_pyramid_metadata_and_arrays,
+            process_super_chunk_for_dask,
+        )
+        max_factor_per_axis = max_factor  # alias
+        factors_per_lod_full = per_lod_factors_for_anisotropy(
+            self.true_voxel_size, num_lods,
+        )
+        aligned_out_origin, aligned_out_shape, _, _ = align_roi_voxels(
+            roi_voxel_origin, roi_voxel_shape,
+            max_factor_per_axis, self.pyramid_alignment_mode,
+        )
+        if not np.array_equal(aligned_out_origin, roi_voxel_origin) or \
+           not np.array_equal(aligned_out_shape, roi_voxel_shape):
+            logger.info(
+                "pyramid_builder: %s aligned ROI from origin=%s shape=%s to "
+                "origin=%s shape=%s (max per-axis factor=%s)",
+                self.pyramid_alignment_mode,
+                roi_voxel_origin.tolist(), roi_voxel_shape.tolist(),
+                aligned_out_origin.tolist(), aligned_out_shape.tolist(),
+                max_factor_per_axis.tolist(),
+            )
+
+        logger.info(
+            "pyramid_builder: %d missing scale(s) detected for downsample "
+            "multires (factors=%s); building under %s with alignment_mode=%s",
+            len(needed_uniform),
+            [factor for _, factor in needed_uniform],
+            pyramid_path, self.pyramid_alignment_mode,
+        )
+
+        # Load dask config once. We use it to compute per-worker memory
+        # budget (= job_memory / processes_per_job).
+        try:
+            base_dask_config = dask_util._load_dask_config()
+        except (FileNotFoundError, OSError):
+            base_dask_config = None
+        cluster_type, settings = _jobqueue_settings(base_dask_config) if base_dask_config else (None, None)
+        base_processes = int((settings or {}).get("processes", 1) or 1)
+        job_memory = _job_memory_bytes(settings)
+        fallback_per_worker_mb = 2048
+
+        # Proactive sizing — mirror assembly's _plan_assembly_waves pattern.
+        # With super_chunk_shape fixed at the minimum, this reduces to:
+        # if super_chunk + scratch wouldn't fit per-worker at base_processes,
+        # halve processes-per-job upfront.
+        peak_bytes = int(super_bytes * amplification)
+        starting_processes = base_processes
+        if job_memory is not None:
+            starting_processes = _recommended_assembly_processes(
+                peak_bytes, job_memory, base_processes,
+                memory_fraction=0.60,
+            )
+            if starting_processes != base_processes:
+                logger.info(
+                    "pyramid_builder: super-chunk peak %.1f MB > 60%% of "
+                    "(job_memory %.1f GB / %d procs = %.1f GB per worker); "
+                    "reducing processes/job %d → %d (more memory per worker)",
+                    peak_bytes / 1e6, job_memory / 1e9, base_processes,
+                    job_memory / base_processes / 1e9,
+                    base_processes, starting_processes,
+                )
+
+        # OOM retry loop. On MemoryError, halve processes-per-job (gives
+        # each worker another 2× memory).
+        max_retries = int(getattr(self, "memory_retry_max", 3))
+        attempt_processes = starting_processes
+        for attempt in range(max_retries + 1):
+            per_worker_mb = _per_worker_mb_for(attempt_processes)
+            logger.info(
+                "pyramid_builder: %sattempt %d: per-worker budget %.0f MB, "
+                "processes/job=%d → out_chunk_shape=%s, super_chunk_shape=%s "
+                "(%.1f MB s0 read per task)",
+                "" if attempt == 0 else "retry ",
+                attempt + 1, per_worker_mb, attempt_processes,
+                out_chunk_shape, super_chunk_shape, super_bytes / 1e6,
+            )
+
+            # Driver-side: write OME metadata + create empty output arrays
+            prepare_pyramid_metadata_and_arrays(
+                output_zarr_path=pyramid_path,
+                factors_per_lod=factors_per_lod_full,
+                missing_lods=[k for k, _ in needed_uniform],
+                out_shape=aligned_out_shape,
+                out_chunk_shape_voxels=tuple(out_chunk_shape),
+                dtype=seg_arr.data.dtype,
+                s0_voxel_size_zyx=self.true_voxel_size.tolist(),
+                s0_translation_zyx=self.true_offset.tolist(),
+                s0_source_path=self._dataset_path,
+            )
+
+            # Super-chunk grid (in s0 voxels)
+            sc_grid = []
+            for z0 in range(int(aligned_out_origin[0]),
+                            int(aligned_out_origin[0] + aligned_out_shape[0]),
+                            int(super_chunk_arr[0])):
+                for y0 in range(int(aligned_out_origin[1]),
+                                int(aligned_out_origin[1] + aligned_out_shape[1]),
+                                int(super_chunk_arr[1])):
+                    for x0 in range(int(aligned_out_origin[2]),
+                                    int(aligned_out_origin[2] + aligned_out_shape[2]),
+                                    int(super_chunk_arr[2])):
+                        sc_grid.append((z0, y0, x0))
+            n_chunks = len(sc_grid)
+
+            worker_config = {
+                "s0_dataset_path": dataset_path,
+                "dataset_offset": tuple(int(v) for v in seg_arr.roi.offset),
+                "voxel_size": tuple(int(v) for v in seg_arr.voxel_size),
+                "swap_axes": bool(swap_axes),
+                "dataset_shape": tuple(int(v) for v in dataset_shape.tolist()),
+                "factors_per_lod": [list(f) for f in factors_per_lod_full],
+                "missing_lods": [k for k, _ in needed_uniform],
+                "downsample_method": self.downsample_method,
+                "pyramid_path": pyramid_path,
+                "super_chunk_shape": tuple(int(v) for v in super_chunk_arr.tolist()),
+                "out_origin": tuple(int(v) for v in aligned_out_origin.tolist()),
+            }
+
+            # Build adjusted dask config when processes/job has changed
+            if base_dask_config and attempt_processes != base_processes:
+                adjusted_dask_config = _assembly_config_for_processes(
+                    base_dask_config, cluster_type, attempt_processes,
+                )
+                # When we shrink processes-per-job, we need MORE jobs to
+                # keep the requested total worker count.
+                workers_with_adjusted = max(
+                    1,
+                    int(self.num_workers) * base_processes // attempt_processes,
+                )
+            else:
+                adjusted_dask_config = base_dask_config
+                workers_with_adjusted = max(1, int(self.num_workers))
+
+            # Raise the FD soft limit to the hard cap so dask's
+            # scheduler↔worker sockets don't trip EMFILE at high worker
+            # counts. Silent: log only on actual failure.
+            try:
+                import resource as _resource
+                soft, hard = _resource.getrlimit(_resource.RLIMIT_NOFILE)
+                if hard > soft:
+                    _resource.setrlimit(_resource.RLIMIT_NOFILE, (hard, hard))
+            except (ImportError, ValueError, OSError) as _e:
+                logger.warning("pyramid_builder: could not adjust FD limit: %s", _e)
+
+            effective_workers = dask_util.effective_num_workers(
+                workers_with_adjusted, n_chunks, logger, "pyramid build",
+            )
+            logger.info(
+                "pyramid_builder: dispatching %d super-chunks across %d "
+                "dask workers", n_chunks, effective_workers,
+            )
+
+            def _run(workers, dask_config):
+                import dask.bag as db
+                npartitions = dask_util.guesstimate_npartitions(n_chunks, workers)
+                bag = db.from_sequence(sc_grid, npartitions=npartitions).map(
+                    process_super_chunk_for_dask, worker_config=worker_config,
+                )
+                with dask_util.start_dask(
+                    workers, "pyramid build", logger, config=dask_config,
+                ):
+                    with Timing_Messager(
+                        f"Building pyramid ({n_chunks} super-chunks)", logger,
+                    ):
+                        bag.compute()
+
+            try:
+                dask_util.run_with_oom_retry(
+                    _run, effective_workers, "pyramid build", logger,
+                    max_retries=self.memory_retry_max,
+                    retry_on_oom=self.retry_on_oom,
+                    config=adjusted_dask_config,
+                )
+                break
+            except MemoryError:
+                if attempt_processes == 1 or attempt >= max_retries:
+                    raise
+                new_processes = max(1, attempt_processes // 2)
+                logger.warning(
+                    "pyramid_builder: MemoryError on attempt %d with "
+                    "processes/job=%d. Halving processes/job to %d (2x memory "
+                    "per worker) and retrying.",
+                    attempt + 1, attempt_processes, new_processes,
+                )
+                attempt_processes = new_processes
+                if os.path.isdir(pyramid_path):
+                    _safely_remove_pyramid(pyramid_path, num_workers=max(1, int(self.num_workers)))
+
+        # Return mapping of newly-built factors -> path within the pyramid
+        return {
+            factor[0]: os.path.join(pyramid_path, f"s{k}")
+            for k, factor in needed_uniform
+        }
 
     def _per_lod_target_reduction(self, lod: int) -> float:
         """Per-LOD target_reduction for the downsample multires strategy.
@@ -2125,6 +2660,8 @@ class Meshify:
                         np.array(file_sizes, dtype=float),
                         self.lod_0_box_size,
                         target_faces_per_lod0_chunk=self.target_faces_per_lod0_chunk,
+                        voxel_size_nm=float(self.base_voxel_size_funlib[0]),
+                        center_octree=self.center_octree,
                     )
 
         dask_util.run_with_oom_retry(
@@ -2175,6 +2712,7 @@ class Meshify:
             with Timing_Messager("Writing sharded info file", logger):
                 sharded_mesh_util.write_sharded_info_file(
                     multires_path, spec, vertex_quantization_bits=16,
+                    lod_scale_multiplier=float(self.base_voxel_size_funlib[0]),
                 )
 
             if self.delete_unsharded_files:
@@ -2186,11 +2724,52 @@ class Meshify:
                     )
         else:
             with Timing_Messager("Writing info file", logger):
-                neuroglancer.write_info_file(multires_path)
+                neuroglancer.write_info_file(
+                    multires_path,
+                    lod_scale_multiplier=float(self.base_voxel_size_funlib[0]),
+                )
+
+        # Run mesh metrics on the LOD-0 per-segment PLYs BEFORE they get
+        # cleaned up. AnalyzeMeshes reads PLYs from a directory; the LOD-0
+        # outputs live at mesh_lods/s0/ at this point in the multires flow.
+        # (Previously, do_analysis was unreachable when do_multires=true
+        # because get_meshes early-returns after get_multiscale_meshes —
+        # this restores it as a no-multires-required option.)
+        if self.do_analysis:
+            from mesh_n_bone.analyze.analyze import AnalyzeMeshes
+
+            lod0_dir = f"{mesh_lods_dir}/s0"
+            with Timing_Messager(
+                f"Analyzing meshes at {lod0_dir}", logger,
+            ):
+                AnalyzeMeshes(
+                    lod0_dir,
+                    f"{self.output_directory}/metrics",
+                    num_workers=self.num_workers,
+                ).analyze()
 
         if self.delete_decimated_meshes:
             with Timing_Messager("Cleaning up intermediate mesh files", logger):
                 shutil.rmtree(mesh_lods_dir, ignore_errors=True)
+
+        # Pyramid scale cache: keep when explicitly requested for reuse,
+        # otherwise tear down so the output dir doesn't accumulate the
+        # downsampled-segmentation zarrs.
+        #
+        # CRITICAL: s0 inside the pyramid is a symlink to the user's
+        # original input array. shutil.rmtree on its own does the right
+        # thing (unlinks the symlink, doesn't follow it into the target),
+        # but we explicitly unlink every symlink first BEFORE the
+        # recursive tree walk runs — defensive coding around a
+        # destructive operation. Worst case if shutil.rmtree ever
+        # regressed: it would walk into the user's input and delete
+        # their data.
+        pyramid_path = os.path.join(self.output_directory, "_intermediate_scales.zarr")
+        if os.path.isdir(pyramid_path) and self.delete_intermediate_scales:
+            with Timing_Messager("Cleaning up intermediate scale zarr", logger):
+                _safely_remove_pyramid(
+                    pyramid_path, num_workers=max(1, int(self.num_workers)),
+                )
 
         logger.info("Multires pipeline complete")
 
@@ -2276,6 +2855,27 @@ class Meshify:
             self._discover_existing_scales() if self.use_existing_scales else {}
         )
         base_ds = self.downsample_factor or 1
+
+        # If any LOD's required factor is missing from the input zarr's
+        # OME-NGFF multiscales, build the missing scales upfront into an
+        # intermediate pyramid zarr. This avoids the slow per-LOD
+        # in-worker fallback (reads s0 once instead of N times).
+        if self.use_existing_scales and base_ds == 1 and self.num_lods > 1:
+            needed_uniform = [2 ** lod for lod in lods if lod > 0]
+            if any(f not in existing_scales for f in needed_uniform):
+                try:
+                    new_scales = self._build_missing_pyramid_scales(self.num_lods)
+                    existing_scales = {**existing_scales, **new_scales}
+                except ValueError:
+                    # User-config errors (e.g. invalid downsample_method) must
+                    # propagate — the in-worker path would raise the same error.
+                    raise
+                except Exception as e:
+                    logger.warning(
+                        "pyramid_builder: failed to pre-build missing scales "
+                        "(%s); falling back to in-worker downsampling per LOD.", e,
+                    )
+
         for lod in lods:
             scale_dir = f"{mesh_lods_dir}/s{lod}"
             target_factor = 2 ** lod
@@ -2329,7 +2929,8 @@ class Meshify:
         os.makedirs(tmp_chunked_dir, exist_ok=True)
         self.get_chunked_meshes(tmp_chunked_dir)
         self.assemble_meshes(tmp_chunked_dir)
-        shutil.rmtree(tmp_chunked_dir, ignore_errors=True)
+        if not getattr(self, "keep_chunked_meshes", False):
+            shutil.rmtree(tmp_chunked_dir, ignore_errors=True)
 
         if self.do_analysis:
             from mesh_n_bone.analyze.analyze import AnalyzeMeshes

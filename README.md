@@ -137,11 +137,32 @@ use_existing_scales: true        # Set false to FORCE in-worker downsampling at 
                                  # when you don't trust the source's downsampling and want
                                  # consistent `downsample_method` behavior at every LOD.
                                  # (default: true)
+# When the input zarr exposes only s0 (no pre-built coarser levels),
+# the downsample multires strategy auto-builds the missing s_k arrays
+# into `{output_directory}/_intermediate_scales.zarr` in a single
+# parallel super-chunk pass over s0. Each LOD then reads from the
+# pre-built pyramid instead of repeatedly re-reading s0.
+delete_intermediate_scales: true # Delete the auto-built `_intermediate_scales.zarr` once the
+                                 # multires pipeline finishes. Set false to keep the pyramid
+                                 # around for re-running with different mesh params on the same
+                                 # data. (default: true)
+pyramid_alignment_mode: snap     # "snap" rounds an unaligned ROI INWARD to multiples of the
+                                 # max per-axis factor (drops up to max_factor-1 voxels per edge);
+                                 # "halo" rounds OUTWARD and reads beyond the ROI to complete the
+                                 # boundary cubes (no data loss). (default: snap)
 decimation_factor: 6             # Per-LOD face reduction factor. In decimate strategy: literal ratio
                                  # between LODs. In downsample strategy: target ratio used to derive
                                  # per-LOD target_reduction so the LOD-to-LOD face count drops by this
                                  # factor. (default: 6, hemibrain-matched)
 delete_decimated_meshes: true    # Remove intermediate LOD mesh files after Draco output (default: true)
+center_octree: true              # Position the mesh in the middle of the multires octree. NG uses the
+                                 # top-LOD chunk center for double-click-to-focus, so centering keeps
+                                 # click-to-center accurate. Cost: meshes that would fit in a single
+                                 # LOD-0 chunk straddle the octree's center boundary instead,
+                                 # producing visible chunk seams at high zoom. Set false to align the
+                                 # octree to the mesh bbox corner — sub-chunk meshes then fit in 1
+                                 # fragment with no internal seams, but click-to-focus lands near the
+                                 # mesh's near corner instead of its center. (default: true)
 
 # ── Sharded output (recommended for thousands of meshes) ──
 sharded: true                    # Pack all meshes into a few <n>.shard files

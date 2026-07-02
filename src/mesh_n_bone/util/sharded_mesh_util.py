@@ -163,7 +163,10 @@ def pack_one_shard(
 
 
 def write_sharded_info_file(
-    path: str, spec: ShardingSpecification, vertex_quantization_bits: int = 16
+    path: str,
+    spec: ShardingSpecification,
+    vertex_quantization_bits: int = 16,
+    lod_scale_multiplier: float = 1.0,
 ) -> None:
     """Write the top-level `info` for sharded multi-resolution Draco meshes.
 
@@ -172,6 +175,13 @@ def write_sharded_info_file(
     the unsharded `write_info_file`. The value MUST equal whatever the
     encoder used, or Neuroglancer will decode vertices at the wrong scale
     and the mesh geometry will appear stretched or shrunk by a power of 2.
+
+    ``lod_scale_multiplier`` is multiplied into the per-LOD `lod_scales`
+    values stored in each segment's manifest. The manifest stores
+    `[1, 2, 4, ...]`, and the multiplier should equal the dataset's
+    voxel size in physical units so NG sees true per-LOD spatial
+    resolutions. With the default 1.0, NG would treat LOD-0 as
+    1-unit-resolution and aggressively pick coarse LODs for any view.
     """
 
     # spec.to_dict() may contain numpy uint64 — coerce to plain ints for JSON.
@@ -183,7 +193,7 @@ def write_sharded_info_file(
         "@type": "neuroglancer_multilod_draco",
         "vertex_quantization_bits": int(vertex_quantization_bits),
         "transform": [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0],
-        "lod_scale_multiplier": 1,
+        "lod_scale_multiplier": float(lod_scale_multiplier),
         "segment_properties": "segment_properties",
         "sharding": sharding,
     }
