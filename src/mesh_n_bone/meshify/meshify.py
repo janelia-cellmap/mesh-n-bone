@@ -303,16 +303,63 @@ def _scan_one_assembly_mesh_dir(mesh_dir, mesh_id, amplification):
     )
 
 
-def _scan_assembly_mesh_estimates(dirname, amplification):
-    """Scan chunked mesh PLYs and estimate assembly memory per segment id."""
-    estimates = []
-    for mesh_id in sorted(os.listdir(dirname)):
-        mesh_dir = os.path.join(dirname, mesh_id)
-        if not os.path.isdir(mesh_dir):
-            continue
-        estimate = _scan_one_assembly_mesh_dir(mesh_dir, mesh_id, amplification)
-        if estimate is not None:
-            estimates.append(estimate)
+def _scan_assembly_mesh_estimates(dirname, amplification, num_workers=1):
+    """Scan chunked mesh PLYs and estimate assembly memory per segment id.
+
+    Parallelized with threads (I/O-bound directory listings + small PLY
+    header reads) and logs periodic progress, since this can iterate over
+    hundreds of thousands of segment directories on large datasets with no
+    other feedback before the assembly Dask cluster starts.
+    """
+    mesh_ids = [
+        mesh_id for mesh_id in sorted(os.listdir(dirname))
+        if os.path.isdir(os.path.join(dirname, mesh_id))
+    ]
+    total = len(mesh_ids)
+    if total == 0:
+        return []
+
+    done = 0
+    report_every = max(1, total // 20)
+
+    def _log_progress():
+        nonlocal done
+        done += 1
+        if done % report_every == 0 or done == total:
+            logger.info("Assembly scan: %d/%d chunked meshes scanned", done, total)
+
+    max_workers = max(1, int(num_workers))
+    if max_workers > 1 and total > max_workers:
+        from concurrent.futures import ThreadPoolExecutor
+        import threading
+
+        lock = threading.Lock()
+
+        def _log_progress_locked():
+            with lock:
+                _log_progress()
+
+        def _scan(mesh_id):
+            result = _scan_one_assembly_mesh_dir(
+                os.path.join(dirname, mesh_id), mesh_id, amplification,
+            )
+            _log_progress_locked()
+            return result
+
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            results = list(ex.map(_scan, mesh_ids))
+    else:
+        results = []
+        for mesh_id in mesh_ids:
+            results.append(
+                _scan_one_assembly_mesh_dir(
+                    os.path.join(dirname, mesh_id), mesh_id, amplification,
+                )
+            )
+            _log_progress()
+
+    estimates = [r for r in results if r is not None]
+    estimates.sort(key=lambda e: e.mesh_id)
     return estimates
 
 
