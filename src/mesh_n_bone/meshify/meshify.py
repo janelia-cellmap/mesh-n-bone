@@ -1974,7 +1974,10 @@ class Meshify:
             check_mesh_validity=self.check_mesh_validity,
             has_custom_roi=self.has_custom_roi,
         )
-        estimates = _scan_assembly_mesh_estimates(dirname, amplification)
+        with Timing_Messager("Scanning chunked meshes for assembly planning", logger):
+            estimates = _scan_assembly_mesh_estimates(
+                dirname, amplification, num_workers=self.num_workers,
+            )
         if not estimates:
             logger.warning("No chunked mesh PLYs found in %s; skipping assembly.", dirname)
             shutil.rmtree(dirname, ignore_errors=True)
