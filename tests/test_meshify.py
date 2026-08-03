@@ -167,6 +167,32 @@ class TestAssemblyMemoryPlanning:
         assert estimate.raw_mesh_bytes == 12 * 3 * 8 + 24 * 3 * 4
         assert estimate.estimated_peak_bytes > estimate.raw_mesh_bytes
 
+    @pytest.mark.parametrize(
+        "num_workers",
+        [
+            1,   # sequential path: max_workers > 1 is false
+            2,   # threaded path: total (10) > max_workers
+            32,  # more workers requested than mesh dirs exist: falls back to
+                 # sequential since total (10) > max_workers is false
+        ],
+    )
+    def test_scan_result_is_independent_of_num_workers(
+        self, tmp_output_dir, num_workers,
+    ):
+        from mesh_n_bone.meshify.meshify import _scan_assembly_mesh_estimates
+
+        tmp_chunked = os.path.join(tmp_output_dir, "tmp_chunked")
+        mesh_ids = [str(i) for i in range(10)]
+        for mesh_id in mesh_ids:
+            mesh_dir = os.path.join(tmp_chunked, mesh_id)
+            os.makedirs(mesh_dir)
+            self._write_binary_ply(os.path.join(mesh_dir, "block_0.ply"), 1, 1)
+
+        estimates = _scan_assembly_mesh_estimates(
+            tmp_chunked, amplification=16, num_workers=num_workers,
+        )
+        assert [e.mesh_id for e in estimates] == sorted(mesh_ids)
+
     def test_balanced_batches_leave_giant_mesh_alone(self):
         from mesh_n_bone.meshify.meshify import (
             AssemblyMeshEstimate,
