@@ -267,6 +267,42 @@ def _estimate_assembly_peak_bytes(
     return raw_mesh_bytes, int(baseline_bytes + amplification * effective_mesh_bytes)
 
 
+def _scan_one_assembly_mesh_dir(mesh_dir, mesh_id, amplification):
+    """Scan one segment's chunked PLYs and return its estimate, or ``None``."""
+    num_files = 0
+    ply_bytes = 0
+    vertex_count = 0
+    face_count = 0
+    for name in os.listdir(mesh_dir):
+        if not name.endswith(".ply"):
+            continue
+        num_files += 1
+        path = os.path.join(mesh_dir, name)
+        try:
+            ply_bytes += os.path.getsize(path)
+            vertices, faces = _read_ply_header_counts(path)
+        except (OSError, ValueError) as e:
+            logger.debug("Could not read PLY header for %s: %s", path, e)
+            continue
+        vertex_count += vertices
+        face_count += faces
+
+    if num_files == 0:
+        return None
+    raw_mesh_bytes, estimated_peak_bytes = _estimate_assembly_peak_bytes(
+        ply_bytes, vertex_count, face_count, amplification,
+    )
+    return AssemblyMeshEstimate(
+        mesh_id=str(mesh_id),
+        num_files=num_files,
+        ply_bytes=int(ply_bytes),
+        vertex_count=int(vertex_count),
+        face_count=int(face_count),
+        raw_mesh_bytes=int(raw_mesh_bytes),
+        estimated_peak_bytes=int(estimated_peak_bytes),
+    )
+
+
 def _scan_assembly_mesh_estimates(dirname, amplification):
     """Scan chunked mesh PLYs and estimate assembly memory per segment id."""
     estimates = []
@@ -274,41 +310,9 @@ def _scan_assembly_mesh_estimates(dirname, amplification):
         mesh_dir = os.path.join(dirname, mesh_id)
         if not os.path.isdir(mesh_dir):
             continue
-
-        num_files = 0
-        ply_bytes = 0
-        vertex_count = 0
-        face_count = 0
-        for name in os.listdir(mesh_dir):
-            if not name.endswith(".ply"):
-                continue
-            num_files += 1
-            path = os.path.join(mesh_dir, name)
-            try:
-                ply_bytes += os.path.getsize(path)
-                vertices, faces = _read_ply_header_counts(path)
-            except (OSError, ValueError) as e:
-                logger.debug("Could not read PLY header for %s: %s", path, e)
-                continue
-            vertex_count += vertices
-            face_count += faces
-
-        if num_files == 0:
-            continue
-        raw_mesh_bytes, estimated_peak_bytes = _estimate_assembly_peak_bytes(
-            ply_bytes, vertex_count, face_count, amplification,
-        )
-        estimates.append(
-            AssemblyMeshEstimate(
-                mesh_id=str(mesh_id),
-                num_files=num_files,
-                ply_bytes=int(ply_bytes),
-                vertex_count=int(vertex_count),
-                face_count=int(face_count),
-                raw_mesh_bytes=int(raw_mesh_bytes),
-                estimated_peak_bytes=int(estimated_peak_bytes),
-            )
-        )
+        estimate = _scan_one_assembly_mesh_dir(mesh_dir, mesh_id, amplification)
+        if estimate is not None:
+            estimates.append(estimate)
     return estimates
 
 
