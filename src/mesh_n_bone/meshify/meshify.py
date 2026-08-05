@@ -267,48 +267,99 @@ def _estimate_assembly_peak_bytes(
     return raw_mesh_bytes, int(baseline_bytes + amplification * effective_mesh_bytes)
 
 
-def _scan_assembly_mesh_estimates(dirname, amplification):
-    """Scan chunked mesh PLYs and estimate assembly memory per segment id."""
-    estimates = []
-    for mesh_id in sorted(os.listdir(dirname)):
-        mesh_dir = os.path.join(dirname, mesh_id)
-        if not os.path.isdir(mesh_dir):
+def _scan_one_assembly_mesh_dir(mesh_dir, mesh_id, amplification):
+    """Scan one segment's chunked PLYs and return its estimate, or ``None``."""
+    num_files = 0
+    ply_bytes = 0
+    vertex_count = 0
+    face_count = 0
+    for name in os.listdir(mesh_dir):
+        if not name.endswith(".ply"):
             continue
-
-        num_files = 0
-        ply_bytes = 0
-        vertex_count = 0
-        face_count = 0
-        for name in os.listdir(mesh_dir):
-            if not name.endswith(".ply"):
-                continue
-            num_files += 1
-            path = os.path.join(mesh_dir, name)
-            try:
-                ply_bytes += os.path.getsize(path)
-                vertices, faces = _read_ply_header_counts(path)
-            except (OSError, ValueError) as e:
-                logger.debug("Could not read PLY header for %s: %s", path, e)
-                continue
-            vertex_count += vertices
-            face_count += faces
-
-        if num_files == 0:
+        num_files += 1
+        path = os.path.join(mesh_dir, name)
+        try:
+            ply_bytes += os.path.getsize(path)
+            vertices, faces = _read_ply_header_counts(path)
+        except (OSError, ValueError) as e:
+            logger.debug("Could not read PLY header for %s: %s", path, e)
             continue
-        raw_mesh_bytes, estimated_peak_bytes = _estimate_assembly_peak_bytes(
-            ply_bytes, vertex_count, face_count, amplification,
-        )
-        estimates.append(
-            AssemblyMeshEstimate(
-                mesh_id=str(mesh_id),
-                num_files=num_files,
-                ply_bytes=int(ply_bytes),
-                vertex_count=int(vertex_count),
-                face_count=int(face_count),
-                raw_mesh_bytes=int(raw_mesh_bytes),
-                estimated_peak_bytes=int(estimated_peak_bytes),
+        vertex_count += vertices
+        face_count += faces
+
+    if num_files == 0:
+        return None
+    raw_mesh_bytes, estimated_peak_bytes = _estimate_assembly_peak_bytes(
+        ply_bytes, vertex_count, face_count, amplification,
+    )
+    return AssemblyMeshEstimate(
+        mesh_id=str(mesh_id),
+        num_files=num_files,
+        ply_bytes=int(ply_bytes),
+        vertex_count=int(vertex_count),
+        face_count=int(face_count),
+        raw_mesh_bytes=int(raw_mesh_bytes),
+        estimated_peak_bytes=int(estimated_peak_bytes),
+    )
+
+
+def _scan_assembly_mesh_estimates(dirname, amplification, num_workers=1):
+    """Scan chunked mesh PLYs and estimate assembly memory per segment id.
+
+    Parallelized with threads (I/O-bound directory listings + small PLY
+    header reads) and logs periodic progress, since this can iterate over
+    hundreds of thousands of segment directories on large datasets with no
+    other feedback before the assembly Dask cluster starts.
+    """
+    mesh_ids = [
+        mesh_id for mesh_id in sorted(os.listdir(dirname))
+        if os.path.isdir(os.path.join(dirname, mesh_id))
+    ]
+    total = len(mesh_ids)
+    if total == 0:
+        return []
+
+    done = 0
+    report_every = max(1, total // 20)
+
+    def _log_progress():
+        nonlocal done
+        done += 1
+        if done % report_every == 0 or done == total:
+            logger.info("Assembly scan: %d/%d chunked meshes scanned", done, total)
+
+    max_workers = max(1, int(num_workers))
+    if max_workers > 1 and total > max_workers:
+        from concurrent.futures import ThreadPoolExecutor
+        import threading
+
+        lock = threading.Lock()
+
+        def _log_progress_locked():
+            with lock:
+                _log_progress()
+
+        def _scan(mesh_id):
+            result = _scan_one_assembly_mesh_dir(
+                os.path.join(dirname, mesh_id), mesh_id, amplification,
             )
-        )
+            _log_progress_locked()
+            return result
+
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            results = list(ex.map(_scan, mesh_ids))
+    else:
+        results = []
+        for mesh_id in mesh_ids:
+            results.append(
+                _scan_one_assembly_mesh_dir(
+                    os.path.join(dirname, mesh_id), mesh_id, amplification,
+                )
+            )
+            _log_progress()
+
+    estimates = [r for r in results if r is not None]
+    estimates.sort(key=lambda e: e.mesh_id)
     return estimates
 
 
@@ -1923,7 +1974,10 @@ class Meshify:
             check_mesh_validity=self.check_mesh_validity,
             has_custom_roi=self.has_custom_roi,
         )
-        estimates = _scan_assembly_mesh_estimates(dirname, amplification)
+        with Timing_Messager("Scanning chunked meshes for assembly planning", logger):
+            estimates = _scan_assembly_mesh_estimates(
+                dirname, amplification, num_workers=self.num_workers,
+            )
         if not estimates:
             logger.warning("No chunked mesh PLYs found in %s; skipping assembly.", dirname)
             shutil.rmtree(dirname, ignore_errors=True)
