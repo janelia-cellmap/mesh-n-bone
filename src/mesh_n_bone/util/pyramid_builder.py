@@ -384,6 +384,74 @@ def process_super_chunk_for_dask(sc_origin_tuple, worker_config):
     return None
 
 
+def process_cascade_chunk_for_dask(sc_origin_tuple, worker_config):
+    """Process ONE cascade super-chunk in a dask worker process.
+
+    Unlike ``process_super_chunk_for_dask`` (which always reads a
+    world-coordinate region of the *original* source array, with its own
+    offset/voxel-size/``swap_axes`` bookkeeping), this downsamples a single
+    per-axis ``step_factor`` from the immediately preceding pyramid level —
+    a plain, already ZYX-native zarr v2 array starting at voxel (0, 0, 0),
+    since it was written by this same pyramid builder.
+
+    Module-level so the function reference is picklable for dask.
+    """
+    from mesh_n_bone.meshify.downsample import (
+        downsample_labels_3d,
+        downsample_binary_3d,
+        downsample_labels_3d_suppress_zero,
+    )
+
+    dispatch = {
+        "mode": downsample_labels_3d,
+        "mode_suppress_zero": downsample_labels_3d_suppress_zero,
+        "binary": downsample_binary_3d,
+    }
+    downsample_func = dispatch[worker_config["downsample_method"]]
+
+    sc_origin = np.array(sc_origin_tuple, dtype=np.int64)
+    step = np.asarray(worker_config["step_factor"], dtype=np.int64)
+    chunk_step = np.asarray(worker_config["super_chunk_shape"], dtype=np.int64)
+
+    read_arr = _ts_handle_for_output(worker_config["read_path"])
+    read_shape = np.array(read_arr.shape, dtype=np.int64)
+    read_end = np.minimum(sc_origin + chunk_step, read_shape)
+    read_size = read_end - sc_origin
+    if np.any(read_size <= 0):
+        return None
+    z, y, x = sc_origin.tolist()
+    zE, yE, xE = read_end.tolist()
+    block = read_arr[z:zE, y:yE, x:xE].read().result()
+
+    trim = (np.array(block.shape) // step) * step
+    block = block[: trim[0], : trim[1], : trim[2]]
+    if block.size == 0:
+        return None
+    ds_block, _ = downsample_func(block, tuple(step.tolist()))
+
+    write_origin = sc_origin // step
+    out_arr = _ts_handle_for_output(worker_config["write_path"])
+    oz, oy, ox = write_origin.tolist()
+    arr_shape = out_arr.shape
+    ozE = min(oz + ds_block.shape[0], arr_shape[0])
+    oyE = min(oy + ds_block.shape[1], arr_shape[1])
+    oxE = min(ox + ds_block.shape[2], arr_shape[2])
+    out_arr[oz:ozE, oy:oyE, ox:oxE].write(
+        ds_block[: ozE - oz, : oyE - oy, : oxE - ox]
+    ).result()
+    del block, ds_block
+
+    import gc
+    gc.collect()
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except (OSError, AttributeError):
+        pass
+
+    return None
+
+
 def prepare_pyramid_metadata_and_arrays(
     *,
     output_zarr_path,
@@ -457,6 +525,7 @@ def build_missing_pyramid_levels(
     s0_source_path: str | None = None,
     dispatch=None,
     num_workers: int = 1,
+    cascade: bool = False,
 ) -> str:
     """Build missing OME-NGFF pyramid levels and return the group path.
 
@@ -473,6 +542,22 @@ def build_missing_pyramid_levels(
     ``dispatch`` is an optional ``callable(func, args_iter) -> results``
     for parallelizing the super-chunk pass. If ``None``, the pass is
     sequential.
+
+    ``cascade``: when ``False`` (default), every missing level is
+    downsampled directly from s0 by its cumulative factor (as described
+    above). When ``True``, each missing level is instead downsampled from
+    the immediately preceding level ``s_{k-1}`` — but only when that
+    predecessor was ALSO just built by this call (i.e. ``k-1`` is missing
+    and directly precedes ``k``); if there's a gap (e.g. ``s_{k-1}`` was
+    already present in ``existing_factors``, so this driver has no reader
+    for its contents), the chain resets and that level is built directly
+    from s0 instead. This keeps peak per-task memory bounded by the
+    largest *step* between consecutive missing levels rather than the
+    largest *cumulative* factor — the win grows with ``num_lods``. Cascade
+    composition is exact for associative reducers (e.g. ``np.any``-based
+    binary downsampling) and an approximation for majority-vote reducers
+    (``mode``, ``mode_suppress_zero``, ``binary``): mode-of-modes can
+    differ from the true global mode at label-boundary voxels.
 
     Returns the path to the pyramid group.
     """
@@ -544,77 +629,148 @@ def build_missing_pyramid_levels(
     if s0_source_path is not None:
         _try_symlink_s0(output_zarr_path, s0_source_path)
 
-    # Super-chunk grid in s0 voxels
-    super_chunk_shape = out_chunk * max_factor
-    sc_grid = []
-    for z0 in range(int(out_origin[0]), int(out_origin[0] + out_shape[0]), int(super_chunk_shape[0])):
-        for y0 in range(int(out_origin[1]), int(out_origin[1] + out_shape[1]), int(super_chunk_shape[1])):
-            for x0 in range(int(out_origin[2]), int(out_origin[2] + out_shape[2]), int(super_chunk_shape[2])):
-                sc_grid.append(np.array([z0, y0, x0], dtype=np.int64))
+    def _run_chunk_grid(sc_grid, process_one, label):
+        n_chunks = len(sc_grid)
+        if n_chunks == 0:
+            return
+        if dispatch is not None:
+            dispatch(process_one, sc_grid)
+            return
+        if num_workers > 1 and n_chunks > 1:
+            from concurrent.futures import ThreadPoolExecutor
+            import threading
+            workers = min(num_workers, n_chunks)
+            logger.info(
+                "pyramid_builder: dispatching %d super-chunks across %d "
+                "threads (%s)", n_chunks, workers, label,
+            )
+            done = [0]
+            report_every = max(1, n_chunks // 20)
+            lock = threading.Lock()
 
-    def _process_super_chunk(sc_origin):
-        # Read range in s0 voxels — clip to dataset bounds for halo / dataset edge
-        read_end = np.minimum(sc_origin + super_chunk_shape, dataset_shape)
-        read_size = read_end - sc_origin
-        s0_block = s0_reader(sc_origin, read_size)
+            def _worker(sc):
+                process_one(sc)
+                with lock:
+                    done[0] += 1
+                    if done[0] % report_every == 0 or done[0] == n_chunks:
+                        logger.info(
+                            "pyramid_builder: %d/%d super-chunks done", done[0], n_chunks,
+                        )
 
-        def _write_one(k, ds_block, ds_origin):
-            if k not in out_arrays:
-                return
-            arr = out_arrays[k]
-            f = np.asarray(factors_per_lod[k], dtype=np.int64)
-            local_origin = ds_origin - (out_origin // f)
-            _write_zarr_v2_region(arr, local_origin, ds_block)
-
-        # Stream each LOD's output: compute → write → drop the buffer.
-        # Peak memory per task ≈ s0_block + one_lod_output.
-        downsample_super_chunk(
-            s0_block, sc_origin, factors_per_lod,
-            downsample_func, out_chunk,
-            write_chunk=_write_one,
-        )
-
-    n_chunks = len(sc_grid)
-    if dispatch is not None:
-        dispatch(_process_super_chunk, sc_grid)
-    elif num_workers > 1 and n_chunks > 1:
-        from concurrent.futures import ThreadPoolExecutor
-        import threading
-        workers = min(num_workers, n_chunks)
-        logger.info(
-            "pyramid_builder: dispatching %d super-chunks across %d threads "
-            "(super_chunk_shape=%s s0 voxels)",
-            n_chunks, workers, super_chunk_shape.tolist(),
-        )
-        done = [0]
-        report_every = max(1, n_chunks // 20)
-        lock = threading.Lock()
-
-        def _worker(sc):
-            _process_super_chunk(sc)
-            with lock:
-                done[0] += 1
-                if done[0] % report_every == 0 or done[0] == n_chunks:
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                list(ex.map(_worker, sc_grid))
+        else:
+            logger.info(
+                "pyramid_builder: processing %d super-chunks sequentially "
+                "(%s)", n_chunks, label,
+            )
+            report_every = max(1, n_chunks // 20)
+            for i, sc in enumerate(sc_grid):
+                process_one(sc)
+                done = i + 1
+                if done % report_every == 0 or done == n_chunks:
                     logger.info(
-                        "pyramid_builder: %d/%d super-chunks done", done[0], n_chunks,
+                        "pyramid_builder: %d/%d super-chunks done", done, n_chunks,
                     )
 
-        with ThreadPoolExecutor(max_workers=workers) as ex:
-            list(ex.map(_worker, sc_grid))
-    else:
-        logger.info(
-            "pyramid_builder: processing %d super-chunks sequentially "
-            "(super_chunk_shape=%s s0 voxels)",
-            n_chunks, super_chunk_shape.tolist(),
+    if not cascade:
+        # Direct: one super-chunk pass computes EVERY missing LOD from a
+        # single s0 read.
+        super_chunk_shape = out_chunk * max_factor
+        sc_grid = []
+        for z0 in range(int(out_origin[0]), int(out_origin[0] + out_shape[0]), int(super_chunk_shape[0])):
+            for y0 in range(int(out_origin[1]), int(out_origin[1] + out_shape[1]), int(super_chunk_shape[1])):
+                for x0 in range(int(out_origin[2]), int(out_origin[2] + out_shape[2]), int(super_chunk_shape[2])):
+                    sc_grid.append(np.array([z0, y0, x0], dtype=np.int64))
+
+        def _process_super_chunk(sc_origin):
+            read_end = np.minimum(sc_origin + super_chunk_shape, dataset_shape)
+            read_size = read_end - sc_origin
+            s0_block = s0_reader(sc_origin, read_size)
+
+            def _write_one(k, ds_block, ds_origin):
+                if k not in out_arrays:
+                    return
+                arr = out_arrays[k]
+                f = np.asarray(factors_per_lod[k], dtype=np.int64)
+                local_origin = ds_origin - (out_origin // f)
+                _write_zarr_v2_region(arr, local_origin, ds_block)
+
+            # Stream each LOD's output: compute → write → drop the buffer.
+            # Peak memory per task ≈ s0_block + one_lod_output.
+            downsample_super_chunk(
+                s0_block, sc_origin, factors_per_lod,
+                downsample_func, out_chunk,
+                write_chunk=_write_one,
+            )
+
+        _run_chunk_grid(
+            sc_grid, _process_super_chunk,
+            f"super_chunk_shape={super_chunk_shape.tolist()} s0 voxels",
         )
-        report_every = max(1, n_chunks // 20)
-        for i, sc in enumerate(sc_grid):
-            _process_super_chunk(sc)
-            done = i + 1
-            if done % report_every == 0 or done == n_chunks:
-                logger.info(
-                    "pyramid_builder: %d/%d super-chunks done", done, n_chunks,
+    else:
+        # Cascade: build missing levels sequentially, each from the
+        # nearest predecessor this call ALSO just built. A gap (the
+        # predecessor was already present in existing_factors, so we have
+        # no reader for it here) resets the chain to read s0 directly.
+        import zarr as _zarr
+
+        prev_k, prev_factor = None, (1, 1, 1)
+        for k, factor in missing:
+            read_from_s0 = not (prev_k is not None and k == prev_k + 1)
+            step = factor if read_from_s0 else tuple(
+                int(a // b) for a, b in zip(factor, prev_factor)
+            )
+            step_arr = np.asarray(step, dtype=np.int64)
+            chunk_step = out_chunk * step_arr
+            out_arr = out_arrays[k]
+
+            if read_from_s0:
+                grid_origin, grid_shape, bound_shape = out_origin, out_shape, dataset_shape
+                prev_arr = None
+            else:
+                grid_origin = np.zeros(3, dtype=np.int64)
+                prev_arr = _zarr.open_array(
+                    os.path.join(output_zarr_path, f"s{prev_k}"), mode="r",
                 )
+                grid_shape = np.asarray(prev_arr.shape, dtype=np.int64)
+                bound_shape = grid_shape
+
+            sc_grid = []
+            for z0 in range(int(grid_origin[0]), int(grid_origin[0] + grid_shape[0]), int(chunk_step[0])):
+                for y0 in range(int(grid_origin[1]), int(grid_origin[1] + grid_shape[1]), int(chunk_step[1])):
+                    for x0 in range(int(grid_origin[2]), int(grid_origin[2] + grid_shape[2]), int(chunk_step[2])):
+                        sc_grid.append(np.array([z0, y0, x0], dtype=np.int64))
+
+            def _process_cascade_chunk(sc_origin, chunk_step=chunk_step, bound_shape=bound_shape,
+                                        read_from_s0=read_from_s0, prev_arr=prev_arr,
+                                        step_arr=step_arr, out_origin_for_read=out_origin,
+                                        out_arr=out_arr):
+                read_end = np.minimum(sc_origin + chunk_step, bound_shape)
+                read_size = read_end - sc_origin
+                if np.any(read_size <= 0):
+                    return
+                if read_from_s0:
+                    block = s0_reader(sc_origin, read_size)
+                    write_origin = (sc_origin // step_arr) - (out_origin_for_read // step_arr)
+                else:
+                    z, y, x = sc_origin.tolist()
+                    zE, yE, xE = read_end.tolist()
+                    block = np.asarray(prev_arr[z:zE, y:yE, x:xE])
+                    write_origin = sc_origin // step_arr
+
+                trim = (np.array(block.shape) // step_arr) * step_arr
+                block = block[: trim[0], : trim[1], : trim[2]]
+                if block.size == 0:
+                    return
+                ds_block, _ = downsample_func(block, tuple(step_arr.tolist()))
+                _write_zarr_v2_region(out_arr, write_origin, ds_block)
+
+            _run_chunk_grid(
+                sc_grid, _process_cascade_chunk,
+                f"s{k} from {'s0' if read_from_s0 else f's{prev_k}'}, step={step}",
+            )
+            prev_k, prev_factor = k, factor
 
     logger.info(
         "pyramid_builder: built %d new scales at %s (factors=%s)",

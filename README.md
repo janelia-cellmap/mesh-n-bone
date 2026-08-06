@@ -139,17 +139,34 @@ use_existing_scales: true        # Set false to FORCE in-worker downsampling at 
                                  # (default: true)
 # When the input zarr exposes only s0 (no pre-built coarser levels),
 # the downsample multires strategy auto-builds the missing s_k arrays
-# into `{output_directory}/_intermediate_scales.zarr` in a single
-# parallel super-chunk pass over s0. Each LOD then reads from the
-# pre-built pyramid instead of repeatedly re-reading s0.
+# into `{output_directory}/_intermediate_scales.zarr`. This is automatic
+# and transparent — whenever a scale a LOD needs isn't already present
+# on the input, it gets built on the fly; no separate pre-processing
+# step is required.
 delete_intermediate_scales: true # Delete the auto-built `_intermediate_scales.zarr` once the
                                  # multires pipeline finishes. Set false to keep the pyramid
                                  # around for re-running with different mesh params on the same
                                  # data. (default: true)
-pyramid_alignment_mode: snap     # "snap" rounds an unaligned ROI INWARD to multiples of the
+# How the auto-built s_k arrays above are computed:
+#   false (default): every missing scale is downsampled directly from s0 by
+#     its cumulative factor — one parallel super-chunk pass, but per-task
+#     memory and total work both grow with num_lods.
+#   true: each missing scale is downsampled from the immediately coarser
+#     one (s_{k-1} -> s_k), chaining forward. ~O(source_size) total work
+#     instead of O(num_lods * source_size), and per-task memory stays
+#     bounded by a small step factor (~2x/axis) instead of growing with
+#     num_lods — prefer this for num_lods roughly 5-10+, or when direct
+#     downsampling runs out of memory. Manual choice only — it does not
+#     auto-switch based on memory pressure mid-run. Caveat: exact for
+#     associative reducers, an approximation (small mismatch at label
+#     boundaries) for the majority-vote reducers (mode, mode_suppress_zero,
+#     binary) — the same class of approximation most OME-NGFF pyramid
+#     generators already accept for label data.
+downsample_cascade: false        # (default: false)
+pyramid_alignment_mode: halo     # "snap" rounds an unaligned ROI INWARD to multiples of the
                                  # max per-axis factor (drops up to max_factor-1 voxels per edge);
                                  # "halo" rounds OUTWARD and reads beyond the ROI to complete the
-                                 # boundary cubes (no data loss). (default: snap)
+                                 # boundary cubes (no data loss). (default: halo)
 decimation_factor: 6             # Per-LOD face reduction factor. In decimate strategy: literal ratio
                                  # between LODs. In downsample strategy: target ratio used to derive
                                  # per-LOD target_reduction so the LOD-to-LOD face count drops by this

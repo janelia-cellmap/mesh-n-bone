@@ -91,6 +91,29 @@ class TestDownsampleStrategy:
             ply_files = [f for f in os.listdir(scale_dir) if f.endswith(".ply")]
             assert len(ply_files) > 0
 
+    def test_downsample_cascade_generates_lod_directories(self, zarr_segmentation, tmp_output_dir):
+        """downsample_cascade=True should produce the same valid LOD
+        directory structure as the direct (default) strategy — this
+        exercises the full Meshify -> _build_missing_pyramid_scales ->
+        cascade auto-build path end-to-end (the fixture's input is
+        single-scale, so every LOD beyond 0 must be auto-built)."""
+        from mesh_n_bone.meshify.meshify import Meshify
+
+        output_dir = os.path.join(tmp_output_dir, "ds_cascade")
+        meshify = Meshify(
+            input_path=zarr_segmentation, output_directory=output_dir,
+            do_multires=True, num_lods=3, multires_strategy="downsample",
+            delete_decimated_meshes=False, downsample_cascade=True, **_BASE_KWARGS,
+        )
+        meshify.get_meshes()
+
+        mesh_lods_dir = os.path.join(output_dir, "mesh_lods")
+        for lod in range(3):
+            scale_dir = os.path.join(mesh_lods_dir, f"s{lod}")
+            assert os.path.isdir(scale_dir), f"s{lod} directory should exist"
+            ply_files = [f for f in os.listdir(scale_dir) if f.endswith(".ply")]
+            assert len(ply_files) > 0, f"s{lod} should contain PLY files"
+
     def test_downsample_with_simplification_face_count_monotonic(
         self, zarr_segmentation, tmp_output_dir
     ):

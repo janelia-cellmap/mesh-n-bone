@@ -14,7 +14,10 @@ import os
 import numpy as np
 import pytest
 
-from mesh_n_bone.meshify.downsample import downsample_labels_3d
+from mesh_n_bone.meshify.downsample import (
+    downsample_labels_3d,
+    downsample_binary_3d_suppress_zero,
+)
 from mesh_n_bone.util.pyramid_builder import (
     align_roi_voxels,
     build_missing_pyramid_levels,
@@ -329,6 +332,111 @@ class TestEndToEndPyramidBuild:
         # s1 should NOT have been written, but s2 should
         assert not os.path.isdir(os.path.join(out_path, "s1"))
         assert os.path.isdir(os.path.join(out_path, "s2"))
+
+
+class TestCascadeDownsampling:
+    """``cascade=True`` builds each missing level from the immediately
+    preceding one instead of always downsampling straight from s0."""
+
+    def test_cascade_matches_direct_for_associative_reducer(self, tmp_path):
+        """np.any-based downsampling is associative — cascade (s1 then
+        s2-from-s1) must match direct (s2-from-s0) bit-for-bit."""
+        rng = np.random.default_rng(3)
+        vol = rng.integers(low=0, high=2, size=(32, 32, 32), dtype=np.uint8)
+
+        def reader(o, s):
+            return vol[o[0]:o[0]+s[0], o[1]:o[1]+s[1], o[2]:o[2]+s[2]].copy()
+
+        common = dict(
+            s0_reader=reader,
+            s0_dataset_shape_voxels=np.array(vol.shape),
+            s0_voxel_size_zyx=[1.0, 1.0, 1.0],
+            s0_translation_zyx=[0.5, 0.5, 0.5],
+            dtype=vol.dtype,
+            num_lods=3,
+            existing_factors=set(),
+            downsample_func=downsample_binary_3d_suppress_zero,
+            out_chunk_shape_voxels=(4, 4, 4),
+        )
+        direct_path = str(tmp_path / "direct.zarr")
+        cascade_path = str(tmp_path / "cascade.zarr")
+        build_missing_pyramid_levels(output_zarr_path=direct_path, cascade=False, **common)
+        build_missing_pyramid_levels(output_zarr_path=cascade_path, cascade=True, **common)
+
+        import zarr
+        for lvl in ("s1", "s2"):
+            direct_arr = zarr.open_array(os.path.join(direct_path, lvl), mode="r")[:]
+            cascade_arr = zarr.open_array(os.path.join(cascade_path, lvl), mode="r")[:]
+            np.testing.assert_array_equal(direct_arr, cascade_arr)
+
+    def test_cascade_approximates_mode_reducer(self, tmp_path):
+        """Mode (majority-vote) downsampling is NOT associative — s1
+        (a single step, nothing composed yet) still matches exactly, but
+        s2 (mode-of-modes under cascade) is only a close approximation of
+        the direct/global reference. Uses a block-structured label volume
+        (contiguous 4-voxel regions) since that's representative of real
+        segmentation data — per-voxel random labels disagree almost
+        everywhere and wouldn't demonstrate the "small fraction of
+        boundary voxels" caveat this test documents."""
+        rng = np.random.default_rng(11)
+        coarse = rng.integers(low=0, high=6, size=(8, 8, 8), dtype=np.uint8)
+        vol = np.kron(coarse, np.ones((4, 4, 4), dtype=np.uint8))
+
+        def reader(o, s):
+            return vol[o[0]:o[0]+s[0], o[1]:o[1]+s[1], o[2]:o[2]+s[2]].copy()
+
+        common = dict(
+            s0_reader=reader,
+            s0_dataset_shape_voxels=np.array(vol.shape),
+            s0_voxel_size_zyx=[1.0, 1.0, 1.0],
+            s0_translation_zyx=[0.5, 0.5, 0.5],
+            dtype=vol.dtype,
+            num_lods=3,
+            existing_factors=set(),
+            downsample_func=downsample_labels_3d,
+            out_chunk_shape_voxels=(4, 4, 4),
+        )
+        direct_path = str(tmp_path / "direct.zarr")
+        cascade_path = str(tmp_path / "cascade.zarr")
+        build_missing_pyramid_levels(output_zarr_path=direct_path, cascade=False, **common)
+        build_missing_pyramid_levels(output_zarr_path=cascade_path, cascade=True, **common)
+
+        import zarr
+        direct_s1 = zarr.open_array(os.path.join(direct_path, "s1"), mode="r")[:]
+        cascade_s1 = zarr.open_array(os.path.join(cascade_path, "s1"), mode="r")[:]
+        np.testing.assert_array_equal(direct_s1, cascade_s1)
+
+        direct_s2 = zarr.open_array(os.path.join(direct_path, "s2"), mode="r")[:]
+        cascade_s2 = zarr.open_array(os.path.join(cascade_path, "s2"), mode="r")[:]
+        agreement = np.mean(direct_s2 == cascade_s2)
+        assert agreement > 0.8, f"expected high agreement, got {agreement:.2%}"
+
+    def test_cascade_resets_chain_at_existing_gap(self, tmp_path):
+        """If s1 is 'existing' (skipped, so cascade has no reader for its
+        contents), s2 must be built directly from s0 rather than
+        incorrectly chaining through a non-existent s1 array."""
+        rng = np.random.default_rng(5)
+        vol = rng.integers(low=0, high=4, size=(16, 16, 16), dtype=np.uint8)
+        out_path = str(tmp_path / "pyramid.zarr")
+        build_missing_pyramid_levels(
+            s0_reader=lambda o, s: vol[o[0]:o[0]+s[0], o[1]:o[1]+s[1], o[2]:o[2]+s[2]].copy(),
+            s0_dataset_shape_voxels=np.array(vol.shape),
+            s0_voxel_size_zyx=[1.0, 1.0, 1.0],
+            s0_translation_zyx=[0.5, 0.5, 0.5],
+            dtype=vol.dtype,
+            num_lods=3,
+            existing_factors={(2, 2, 2)},  # pretend s1 already exists
+            output_zarr_path=out_path,
+            downsample_func=downsample_labels_3d,
+            out_chunk_shape_voxels=(4, 4, 4),
+            cascade=True,
+        )
+        assert not os.path.isdir(os.path.join(out_path, "s1"))
+
+        import zarr
+        s2 = zarr.open_array(os.path.join(out_path, "s2"), mode="r")[:]
+        ref_s2, _ = downsample_labels_3d(vol, (4, 4, 4))
+        np.testing.assert_array_equal(s2, ref_s2)
 
 
 class TestSymlinkSafeCleanup:
