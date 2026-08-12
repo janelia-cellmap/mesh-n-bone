@@ -14,7 +14,10 @@ import os
 import numpy as np
 import pytest
 
-from mesh_n_bone.meshify.downsample import downsample_labels_3d
+from mesh_n_bone.meshify.downsample import (
+    downsample_labels_3d,
+    downsample_binary_3d_suppress_zero,
+)
 from mesh_n_bone.util.pyramid_builder import (
     align_roi_voxels,
     build_missing_pyramid_levels,
@@ -307,6 +310,99 @@ class TestEndToEndPyramidBuild:
         assert os.path.islink(s0_link)
         assert os.path.exists(os.path.join(s0_link, "marker.txt"))
 
+    def test_no_symlink_when_source_is_zarr_v3(self, tmp_path):
+        """This pyramid's own group metadata and its s1+ arrays are
+        written in whatever ``zarr_format`` the caller asks for
+        (default 2). A zarr v3 source symlinked in as s0 when the
+        pyramid is v2 (the default) would be format-inconsistent —
+        generic OME-zarr readers (e.g. neuroglancer) resolve the group
+        by its declared format then fail to find matching metadata
+        inside the differently-formatted s0 array. s0 must stay absent
+        instead (see test_symlinks_when_zarr_format_matches_source for
+        the case where the caller matches the format up front)."""
+        s0_src = tmp_path / "source_s0"
+        s0_src.mkdir()
+        (s0_src / "zarr.json").write_text('{"zarr_format": 3, "node_type": "array"}')
+
+        rng = np.random.default_rng(0)
+        vol = rng.integers(low=0, high=2, size=(16, 16, 16), dtype=np.uint8)
+
+        out_path = str(tmp_path / "pyramid.zarr")
+        build_missing_pyramid_levels(
+            s0_reader=lambda o, s: vol[o[0]:o[0]+s[0], o[1]:o[1]+s[1], o[2]:o[2]+s[2]].copy(),
+            s0_dataset_shape_voxels=np.array(vol.shape),
+            s0_voxel_size_zyx=[1.0, 1.0, 1.0],
+            s0_translation_zyx=[0.5, 0.5, 0.5],
+            dtype=vol.dtype,
+            num_lods=2,
+            existing_factors=set(),
+            output_zarr_path=out_path,
+            downsample_func=downsample_labels_3d,
+            out_chunk_shape_voxels=(4, 4, 4),
+            s0_source_path=str(s0_src),
+            # zarr_format defaults to 2 — mismatched against the v3 source above.
+        )
+
+        s0_link = os.path.join(out_path, "s0")
+        assert not os.path.exists(s0_link)
+        assert not os.path.islink(s0_link)
+        # s1 (a genuine v2 array this builder wrote) is unaffected.
+        assert os.path.isdir(os.path.join(out_path, "s1"))
+
+    def test_symlinks_when_zarr_format_matches_source(self, tmp_path):
+        """When the caller matches zarr_format to the source's real
+        format (zarr v3 here), s0 CAN be symlinked in safely, and s1/s2
+        are themselves real, readable v3 arrays — the whole point of
+        detecting the source format up front (Meshify does this via
+        self._driver) instead of always hardcoding v2."""
+        import tensorstore as ts
+
+        rng = np.random.default_rng(0)
+        vol = rng.integers(low=0, high=4, size=(16, 16, 16), dtype=np.uint8)
+        s0_src = tmp_path / "source_s0"
+        ts.open({
+            "driver": "zarr3",
+            "kvstore": {"driver": "file", "path": str(s0_src)},
+            "metadata": {
+                "shape": list(vol.shape),
+                "data_type": "uint8",
+                "chunk_grid": {"name": "regular",
+                               "configuration": {"chunk_shape": [4, 4, 4]}},
+            },
+            "create": True, "delete_existing": True,
+        }).result().write(vol).result()
+
+        out_path = str(tmp_path / "pyramid.zarr")
+        build_missing_pyramid_levels(
+            s0_reader=lambda o, s: vol[o[0]:o[0]+s[0], o[1]:o[1]+s[1], o[2]:o[2]+s[2]].copy(),
+            s0_dataset_shape_voxels=np.array(vol.shape),
+            s0_voxel_size_zyx=[1.0, 1.0, 1.0],
+            s0_translation_zyx=[0.5, 0.5, 0.5],
+            dtype=vol.dtype,
+            num_lods=3,
+            existing_factors=set(),
+            output_zarr_path=out_path,
+            downsample_func=downsample_labels_3d,
+            out_chunk_shape_voxels=(4, 4, 4),
+            s0_source_path=str(s0_src),
+            zarr_format=3,
+        )
+
+        s0_link = os.path.join(out_path, "s0")
+        assert os.path.islink(s0_link)
+        assert os.path.isfile(os.path.join(s0_link, "zarr.json"))
+        # Group metadata is zarr.json (v3), not .zattrs/.zgroup (v2).
+        assert os.path.isfile(os.path.join(out_path, "zarr.json"))
+        assert not os.path.exists(os.path.join(out_path, ".zattrs"))
+
+        s1 = ts.open({
+            "driver": "zarr3",
+            "kvstore": {"driver": "file", "path": os.path.join(out_path, "s1")},
+            "open": True,
+        }).result().read().result()
+        ref_s1, _ = downsample_labels_3d(vol, (2, 2, 2))
+        np.testing.assert_array_equal(s1, ref_s1)
+
     def test_existing_factor_skipped(self, tmp_path):
         """If a factor is already present (existing_factors), it shouldn't
         be re-built."""
@@ -329,6 +425,111 @@ class TestEndToEndPyramidBuild:
         # s1 should NOT have been written, but s2 should
         assert not os.path.isdir(os.path.join(out_path, "s1"))
         assert os.path.isdir(os.path.join(out_path, "s2"))
+
+
+class TestCascadeDownsampling:
+    """``cascade=True`` builds each missing level from the immediately
+    preceding one instead of always downsampling straight from s0."""
+
+    def test_cascade_matches_direct_for_associative_reducer(self, tmp_path):
+        """np.any-based downsampling is associative — cascade (s1 then
+        s2-from-s1) must match direct (s2-from-s0) bit-for-bit."""
+        rng = np.random.default_rng(3)
+        vol = rng.integers(low=0, high=2, size=(32, 32, 32), dtype=np.uint8)
+
+        def reader(o, s):
+            return vol[o[0]:o[0]+s[0], o[1]:o[1]+s[1], o[2]:o[2]+s[2]].copy()
+
+        common = dict(
+            s0_reader=reader,
+            s0_dataset_shape_voxels=np.array(vol.shape),
+            s0_voxel_size_zyx=[1.0, 1.0, 1.0],
+            s0_translation_zyx=[0.5, 0.5, 0.5],
+            dtype=vol.dtype,
+            num_lods=3,
+            existing_factors=set(),
+            downsample_func=downsample_binary_3d_suppress_zero,
+            out_chunk_shape_voxels=(4, 4, 4),
+        )
+        direct_path = str(tmp_path / "direct.zarr")
+        cascade_path = str(tmp_path / "cascade.zarr")
+        build_missing_pyramid_levels(output_zarr_path=direct_path, cascade=False, **common)
+        build_missing_pyramid_levels(output_zarr_path=cascade_path, cascade=True, **common)
+
+        import zarr
+        for lvl in ("s1", "s2"):
+            direct_arr = zarr.open_array(os.path.join(direct_path, lvl), mode="r")[:]
+            cascade_arr = zarr.open_array(os.path.join(cascade_path, lvl), mode="r")[:]
+            np.testing.assert_array_equal(direct_arr, cascade_arr)
+
+    def test_cascade_approximates_mode_reducer(self, tmp_path):
+        """Mode (majority-vote) downsampling is NOT associative — s1
+        (a single step, nothing composed yet) still matches exactly, but
+        s2 (mode-of-modes under cascade) is only a close approximation of
+        the direct/global reference. Uses a block-structured label volume
+        (contiguous 4-voxel regions) since that's representative of real
+        segmentation data — per-voxel random labels disagree almost
+        everywhere and wouldn't demonstrate the "small fraction of
+        boundary voxels" caveat this test documents."""
+        rng = np.random.default_rng(11)
+        coarse = rng.integers(low=0, high=6, size=(8, 8, 8), dtype=np.uint8)
+        vol = np.kron(coarse, np.ones((4, 4, 4), dtype=np.uint8))
+
+        def reader(o, s):
+            return vol[o[0]:o[0]+s[0], o[1]:o[1]+s[1], o[2]:o[2]+s[2]].copy()
+
+        common = dict(
+            s0_reader=reader,
+            s0_dataset_shape_voxels=np.array(vol.shape),
+            s0_voxel_size_zyx=[1.0, 1.0, 1.0],
+            s0_translation_zyx=[0.5, 0.5, 0.5],
+            dtype=vol.dtype,
+            num_lods=3,
+            existing_factors=set(),
+            downsample_func=downsample_labels_3d,
+            out_chunk_shape_voxels=(4, 4, 4),
+        )
+        direct_path = str(tmp_path / "direct.zarr")
+        cascade_path = str(tmp_path / "cascade.zarr")
+        build_missing_pyramid_levels(output_zarr_path=direct_path, cascade=False, **common)
+        build_missing_pyramid_levels(output_zarr_path=cascade_path, cascade=True, **common)
+
+        import zarr
+        direct_s1 = zarr.open_array(os.path.join(direct_path, "s1"), mode="r")[:]
+        cascade_s1 = zarr.open_array(os.path.join(cascade_path, "s1"), mode="r")[:]
+        np.testing.assert_array_equal(direct_s1, cascade_s1)
+
+        direct_s2 = zarr.open_array(os.path.join(direct_path, "s2"), mode="r")[:]
+        cascade_s2 = zarr.open_array(os.path.join(cascade_path, "s2"), mode="r")[:]
+        agreement = np.mean(direct_s2 == cascade_s2)
+        assert agreement > 0.8, f"expected high agreement, got {agreement:.2%}"
+
+    def test_cascade_resets_chain_at_existing_gap(self, tmp_path):
+        """If s1 is 'existing' (skipped, so cascade has no reader for its
+        contents), s2 must be built directly from s0 rather than
+        incorrectly chaining through a non-existent s1 array."""
+        rng = np.random.default_rng(5)
+        vol = rng.integers(low=0, high=4, size=(16, 16, 16), dtype=np.uint8)
+        out_path = str(tmp_path / "pyramid.zarr")
+        build_missing_pyramid_levels(
+            s0_reader=lambda o, s: vol[o[0]:o[0]+s[0], o[1]:o[1]+s[1], o[2]:o[2]+s[2]].copy(),
+            s0_dataset_shape_voxels=np.array(vol.shape),
+            s0_voxel_size_zyx=[1.0, 1.0, 1.0],
+            s0_translation_zyx=[0.5, 0.5, 0.5],
+            dtype=vol.dtype,
+            num_lods=3,
+            existing_factors={(2, 2, 2)},  # pretend s1 already exists
+            output_zarr_path=out_path,
+            downsample_func=downsample_labels_3d,
+            out_chunk_shape_voxels=(4, 4, 4),
+            cascade=True,
+        )
+        assert not os.path.isdir(os.path.join(out_path, "s1"))
+
+        import zarr
+        s2 = zarr.open_array(os.path.join(out_path, "s2"), mode="r")[:]
+        ref_s2, _ = downsample_labels_3d(vol, (4, 4, 4))
+        np.testing.assert_array_equal(s2, ref_s2)
 
 
 class TestSymlinkSafeCleanup:
@@ -542,3 +743,43 @@ class TestUnalignedRoiSnap:
         # Compare to global downsample of the snapped region
         ref_s1, _ = downsample_labels_3d(vol[4:36, 4:36, 4:36], (2, 2, 2))
         np.testing.assert_array_equal(s1[:], ref_s1)
+
+
+class TestExistingPyramidScalesBothFormats:
+    """``_existing_pyramid_scales`` (the "reuse a prior run's pyramid"
+    shortcut) must parse group metadata from EITHER a zarr v2 pyramid
+    (.zattrs) or a zarr v3 one (zarr.json, attributes nested under
+    "attributes") — otherwise a v3-formatted pyramid (built once the
+    source's own format is matched) would silently never be recognized
+    for reuse on a second run, always rebuilding from scratch."""
+
+    def _build(self, tmp_path, zarr_format):
+        from mesh_n_bone.meshify.meshify import _existing_pyramid_scales
+
+        rng = np.random.default_rng(1)
+        vol = rng.integers(low=0, high=4, size=(16, 16, 16), dtype=np.uint8)
+        out_path = str(tmp_path / f"pyramid_v{zarr_format}.zarr")
+        build_missing_pyramid_levels(
+            s0_reader=lambda o, s: vol[o[0]:o[0]+s[0], o[1]:o[1]+s[1], o[2]:o[2]+s[2]].copy(),
+            s0_dataset_shape_voxels=np.array(vol.shape),
+            s0_voxel_size_zyx=[1.0, 1.0, 1.0],
+            s0_translation_zyx=[0.5, 0.5, 0.5],
+            dtype=vol.dtype,
+            num_lods=3,
+            existing_factors=set(),
+            output_zarr_path=out_path,
+            downsample_func=downsample_labels_3d,
+            out_chunk_shape_voxels=(4, 4, 4),
+            zarr_format=zarr_format,
+        )
+        return out_path, _existing_pyramid_scales(out_path)
+
+    def test_parses_zarr_v2_pyramid(self, tmp_path):
+        out_path, result = self._build(tmp_path, zarr_format=2)
+        assert os.path.isfile(os.path.join(out_path, ".zattrs"))
+        assert result == {1: 2, 2: 4}
+
+    def test_parses_zarr_v3_pyramid(self, tmp_path):
+        out_path, result = self._build(tmp_path, zarr_format=3)
+        assert os.path.isfile(os.path.join(out_path, "zarr.json"))
+        assert result == {1: 2, 2: 4}

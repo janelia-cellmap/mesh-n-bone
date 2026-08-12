@@ -189,10 +189,6 @@ def start_dask(num_workers, msg, logger, config=None):
             logger,
         ):
             client = Client(cluster)
-            try:
-                client.wait_for_workers(num_workers, timeout=300)
-            except TimeoutError:
-                pass
 
         dashboard_link = client.cluster.dashboard_link
         if cluster_type == "local":
