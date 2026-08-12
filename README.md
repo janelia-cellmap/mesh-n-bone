@@ -142,7 +142,11 @@ use_existing_scales: true        # Set false to FORCE in-worker downsampling at 
 # into `{output_directory}/_intermediate_scales.zarr`. This is automatic
 # and transparent — whenever a scale a LOD needs isn't already present
 # on the input, it gets built on the fly; no separate pre-processing
-# step is required.
+# step is required. The pyramid is written in the SAME zarr format
+# (v2 or v3) as the input, and s0 is symlinked in (not copied) when the
+# formats match — so `_intermediate_scales.zarr` is directly browsable
+# as one consistent OME-NGFF group (e.g. in neuroglancer), not just
+# usable internally by mesh-n-bone.
 delete_intermediate_scales: true # Delete the auto-built `_intermediate_scales.zarr` once the
                                  # multires pipeline finishes. Set false to keep the pyramid
                                  # around for re-running with different mesh params on the same
