@@ -743,3 +743,43 @@ class TestUnalignedRoiSnap:
         # Compare to global downsample of the snapped region
         ref_s1, _ = downsample_labels_3d(vol[4:36, 4:36, 4:36], (2, 2, 2))
         np.testing.assert_array_equal(s1[:], ref_s1)
+
+
+class TestExistingPyramidScalesBothFormats:
+    """``_existing_pyramid_scales`` (the "reuse a prior run's pyramid"
+    shortcut) must parse group metadata from EITHER a zarr v2 pyramid
+    (.zattrs) or a zarr v3 one (zarr.json, attributes nested under
+    "attributes") — otherwise a v3-formatted pyramid (built once the
+    source's own format is matched) would silently never be recognized
+    for reuse on a second run, always rebuilding from scratch."""
+
+    def _build(self, tmp_path, zarr_format):
+        from mesh_n_bone.meshify.meshify import _existing_pyramid_scales
+
+        rng = np.random.default_rng(1)
+        vol = rng.integers(low=0, high=4, size=(16, 16, 16), dtype=np.uint8)
+        out_path = str(tmp_path / f"pyramid_v{zarr_format}.zarr")
+        build_missing_pyramid_levels(
+            s0_reader=lambda o, s: vol[o[0]:o[0]+s[0], o[1]:o[1]+s[1], o[2]:o[2]+s[2]].copy(),
+            s0_dataset_shape_voxels=np.array(vol.shape),
+            s0_voxel_size_zyx=[1.0, 1.0, 1.0],
+            s0_translation_zyx=[0.5, 0.5, 0.5],
+            dtype=vol.dtype,
+            num_lods=3,
+            existing_factors=set(),
+            output_zarr_path=out_path,
+            downsample_func=downsample_labels_3d,
+            out_chunk_shape_voxels=(4, 4, 4),
+            zarr_format=zarr_format,
+        )
+        return out_path, _existing_pyramid_scales(out_path)
+
+    def test_parses_zarr_v2_pyramid(self, tmp_path):
+        out_path, result = self._build(tmp_path, zarr_format=2)
+        assert os.path.isfile(os.path.join(out_path, ".zattrs"))
+        assert result == {1: 2, 2: 4}
+
+    def test_parses_zarr_v3_pyramid(self, tmp_path):
+        out_path, result = self._build(tmp_path, zarr_format=3)
+        assert os.path.isfile(os.path.join(out_path, "zarr.json"))
+        assert result == {1: 2, 2: 4}

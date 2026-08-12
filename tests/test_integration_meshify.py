@@ -570,7 +570,13 @@ class TestMeshifyDownsampleAutoBuildPyramid:
     def test_auto_builds_pyramid_via_cascade_for_single_scale_input(self, tmp_output_dir):
         """Same auto-build path as test_auto_builds_pyramid_for_single_scale_input,
         but with downsample_cascade=True — s1 is built from s0 and s2 is
-        built from s1 (rather than both directly from s0)."""
+        built from s1 (rather than both directly from s0).
+
+        This fixture's source is zarr v3, so the pyramid's own arrays and
+        s0 symlink must also be v3 (see Meshify._build_missing_pyramid_scales's
+        zarr_format detection) — a v2 pyramid here would silently fail to
+        symlink s0 (format mismatch) and even fail to CREATE s1/s2 the way
+        this test reads them back."""
         s0_path, _ = self._create_single_scale_ome_zarr(tmp_output_dir)
         output_dir = os.path.join(tmp_output_dir, "out_autobuild_cascade")
         m = Meshify(
@@ -595,6 +601,12 @@ class TestMeshifyDownsampleAutoBuildPyramid:
             assert os.path.isdir(os.path.join(pyramid_root, f"s{k}")), (
                 f"Expected pyramid s{k} array on disk"
             )
+        # s0 IS symlinked in this time: source is zarr v3 and so is the
+        # pyramid (format-matched), unlike the v2-pyramid-vs-v3-source
+        # mismatch this whole feature exists to avoid.
+        s0_link = os.path.join(pyramid_root, "s0")
+        assert os.path.islink(s0_link)
+        assert os.path.isfile(os.path.join(s0_link, "zarr.json"))
 
         import tensorstore as ts
         from mesh_n_bone.meshify.downsample import downsample_labels_3d
@@ -603,11 +615,11 @@ class TestMeshifyDownsampleAutoBuildPyramid:
             "open": True,
         }).result().read().result()
         s1 = ts.open({
-            "driver": "zarr", "kvstore": {"driver": "file",
+            "driver": "zarr3", "kvstore": {"driver": "file",
             "path": os.path.join(pyramid_root, "s1")}, "open": True,
         }).result().read().result()
         s2 = ts.open({
-            "driver": "zarr", "kvstore": {"driver": "file",
+            "driver": "zarr3", "kvstore": {"driver": "file",
             "path": os.path.join(pyramid_root, "s2")}, "open": True,
         }).result().read().result()
         ref_s1, _ = downsample_labels_3d(s0_arr, (2, 2, 2))

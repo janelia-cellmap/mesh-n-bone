@@ -516,21 +516,30 @@ def _existing_pyramid_scales(pyramid_path):
     """Return ``{lod_index: uniform_factor}`` of usable scales on disk, or
     ``None`` if the pyramid isn't readable.
 
-    Parses the OME-NGFF v0.4 multiscales metadata at
-    ``{pyramid_path}/.zattrs`` and returns the per-LOD uniform downsample
-    factor (relative to s0) for each dataset whose corresponding
-    ``s_k/.zarray`` actually exists on disk. Used to skip a fresh build
-    when a prior run already wrote the pyramid (e.g. debug re-runs).
+    Parses the OME-NGFF v0.4 multiscales metadata — from
+    ``{pyramid_path}/.zattrs`` (zarr v2) or ``{pyramid_path}/zarr.json``
+    (zarr v3, metadata under ``attributes``) — and returns the per-LOD
+    uniform downsample factor (relative to s0) for each dataset whose
+    corresponding array actually exists on disk (``s_k/.zarray`` for v2,
+    ``s_k/zarr.json`` for v3). Used to skip a fresh build when a prior
+    run already wrote the pyramid (e.g. debug re-runs).
 
-    Returns ``None`` when the file is missing, malformed, or doesn't
-    expose multiscales in the expected shape.
+    Returns ``None`` when neither metadata file is present/parseable, or
+    doesn't expose multiscales in the expected shape.
     """
     zattrs_path = os.path.join(pyramid_path, ".zattrs")
-    if not os.path.isfile(zattrs_path):
-        return None
+    zarr_json_path = os.path.join(pyramid_path, "zarr.json")
     try:
-        with open(zattrs_path) as f:
-            attrs = json.load(f)
+        if os.path.isfile(zattrs_path):
+            with open(zattrs_path) as f:
+                attrs = json.load(f)
+            array_metadata_name = ".zarray"
+        elif os.path.isfile(zarr_json_path):
+            with open(zarr_json_path) as f:
+                attrs = json.load(f).get("attributes", {})
+            array_metadata_name = "zarr.json"
+        else:
+            return None
         datasets = attrs["multiscales"][0]["datasets"]
         # s0's scale per-axis defines the base; s_k's factor = s_k/s_0
         s0_scale = None
@@ -563,7 +572,7 @@ def _existing_pyramid_scales(pyramid_path):
                 continue
             factor = int(round(factors[0]))
             # Verify the underlying zarr array actually exists
-            if not os.path.isfile(os.path.join(pyramid_path, name, ".zarray")):
+            if not os.path.isfile(os.path.join(pyramid_path, name, array_metadata_name)):
                 continue
             result[k] = factor
         return result
@@ -1150,6 +1159,7 @@ class Meshify:
         # Both N5 and neuroglancer precomputed store voxels in XYZ order
         # with no per-axis labels, so we need to swap to ZYX at read time.
         driver = _detect_zarr_driver(self._dataset_path)
+        self._driver = driver
         self._swap_axes = driver in ("n5", "neuroglancer_precomputed")
 
         # Get true (possibly non-integer) voxel size and offset from
@@ -2378,6 +2388,17 @@ class Meshify:
             )
         downsample_func = downsample_dispatch[self.downsample_method]
 
+        # Write the pyramid's own group metadata + s1+ arrays in the SAME
+        # zarr format as the real source, so s0 can be symlinked in
+        # without a version mismatch (see _try_symlink_s0's docstring —
+        # neuroglancer resolves the whole group by its declared format,
+        # and a symlinked-in array in a different format fails to open
+        # even though it's perfectly readable on its own). n5/precomputed
+        # sources can't be represented as a zarr array either way, so
+        # they fall back to the zarr v2 default (s0 just won't be
+        # symlinked in for those, same as before).
+        zarr_format = 3 if self._driver == "zarr3" else 2
+
         # Two decoupled sizes:
         #   out_chunk_shape:  on-disk chunk shape of the s_k zarr arrays.
         #                     Should be a SANE chunk size (~64-128) so
@@ -2525,6 +2546,7 @@ class Meshify:
                 "pyramid_path": pyramid_path,
                 "super_chunk_shape": tuple(int(v) for v in super_chunk_arr.tolist()),
                 "out_origin": tuple(int(v) for v in aligned_out_origin.tolist()),
+                "zarr_format": zarr_format,
             }
             return [(process_super_chunk_for_dask, sc_grid, worker_config, "pyramid (direct)")]
 
@@ -2560,6 +2582,7 @@ class Meshify:
                         "pyramid_path": pyramid_path,
                         "super_chunk_shape": tuple(int(v) for v in chunk_step.tolist()),
                         "out_origin": tuple(int(v) for v in aligned_out_origin.tolist()),
+                        "zarr_format": zarr_format,
                     }
                     label = f"s{k} (from s0, step={step})"
                 else:
@@ -2568,6 +2591,7 @@ class Meshify:
                         "read_path": os.path.join(pyramid_path, f"s{k - 1}"),
                         "write_path": os.path.join(pyramid_path, f"s{k}"),
                         "step_factor": list(step),
+                        "zarr_format": zarr_format,
                         "super_chunk_shape": tuple(int(v) for v in chunk_step.tolist()),
                         "downsample_method": self.downsample_method,
                     }
@@ -2638,6 +2662,7 @@ class Meshify:
                 s0_voxel_size_zyx=self.true_voxel_size.tolist(),
                 s0_translation_zyx=self.true_offset.tolist(),
                 s0_source_path=self._dataset_path,
+                zarr_format=zarr_format,
             )
 
             # Build adjusted dask config when processes/job has changed
