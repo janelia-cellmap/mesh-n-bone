@@ -310,6 +310,99 @@ class TestEndToEndPyramidBuild:
         assert os.path.islink(s0_link)
         assert os.path.exists(os.path.join(s0_link, "marker.txt"))
 
+    def test_no_symlink_when_source_is_zarr_v3(self, tmp_path):
+        """This pyramid's own group metadata and its s1+ arrays are
+        written in whatever ``zarr_format`` the caller asks for
+        (default 2). A zarr v3 source symlinked in as s0 when the
+        pyramid is v2 (the default) would be format-inconsistent —
+        generic OME-zarr readers (e.g. neuroglancer) resolve the group
+        by its declared format then fail to find matching metadata
+        inside the differently-formatted s0 array. s0 must stay absent
+        instead (see test_symlinks_when_zarr_format_matches_source for
+        the case where the caller matches the format up front)."""
+        s0_src = tmp_path / "source_s0"
+        s0_src.mkdir()
+        (s0_src / "zarr.json").write_text('{"zarr_format": 3, "node_type": "array"}')
+
+        rng = np.random.default_rng(0)
+        vol = rng.integers(low=0, high=2, size=(16, 16, 16), dtype=np.uint8)
+
+        out_path = str(tmp_path / "pyramid.zarr")
+        build_missing_pyramid_levels(
+            s0_reader=lambda o, s: vol[o[0]:o[0]+s[0], o[1]:o[1]+s[1], o[2]:o[2]+s[2]].copy(),
+            s0_dataset_shape_voxels=np.array(vol.shape),
+            s0_voxel_size_zyx=[1.0, 1.0, 1.0],
+            s0_translation_zyx=[0.5, 0.5, 0.5],
+            dtype=vol.dtype,
+            num_lods=2,
+            existing_factors=set(),
+            output_zarr_path=out_path,
+            downsample_func=downsample_labels_3d,
+            out_chunk_shape_voxels=(4, 4, 4),
+            s0_source_path=str(s0_src),
+            # zarr_format defaults to 2 — mismatched against the v3 source above.
+        )
+
+        s0_link = os.path.join(out_path, "s0")
+        assert not os.path.exists(s0_link)
+        assert not os.path.islink(s0_link)
+        # s1 (a genuine v2 array this builder wrote) is unaffected.
+        assert os.path.isdir(os.path.join(out_path, "s1"))
+
+    def test_symlinks_when_zarr_format_matches_source(self, tmp_path):
+        """When the caller matches zarr_format to the source's real
+        format (zarr v3 here), s0 CAN be symlinked in safely, and s1/s2
+        are themselves real, readable v3 arrays — the whole point of
+        detecting the source format up front (Meshify does this via
+        self._driver) instead of always hardcoding v2."""
+        import tensorstore as ts
+
+        rng = np.random.default_rng(0)
+        vol = rng.integers(low=0, high=4, size=(16, 16, 16), dtype=np.uint8)
+        s0_src = tmp_path / "source_s0"
+        ts.open({
+            "driver": "zarr3",
+            "kvstore": {"driver": "file", "path": str(s0_src)},
+            "metadata": {
+                "shape": list(vol.shape),
+                "data_type": "uint8",
+                "chunk_grid": {"name": "regular",
+                               "configuration": {"chunk_shape": [4, 4, 4]}},
+            },
+            "create": True, "delete_existing": True,
+        }).result().write(vol).result()
+
+        out_path = str(tmp_path / "pyramid.zarr")
+        build_missing_pyramid_levels(
+            s0_reader=lambda o, s: vol[o[0]:o[0]+s[0], o[1]:o[1]+s[1], o[2]:o[2]+s[2]].copy(),
+            s0_dataset_shape_voxels=np.array(vol.shape),
+            s0_voxel_size_zyx=[1.0, 1.0, 1.0],
+            s0_translation_zyx=[0.5, 0.5, 0.5],
+            dtype=vol.dtype,
+            num_lods=3,
+            existing_factors=set(),
+            output_zarr_path=out_path,
+            downsample_func=downsample_labels_3d,
+            out_chunk_shape_voxels=(4, 4, 4),
+            s0_source_path=str(s0_src),
+            zarr_format=3,
+        )
+
+        s0_link = os.path.join(out_path, "s0")
+        assert os.path.islink(s0_link)
+        assert os.path.isfile(os.path.join(s0_link, "zarr.json"))
+        # Group metadata is zarr.json (v3), not .zattrs/.zgroup (v2).
+        assert os.path.isfile(os.path.join(out_path, "zarr.json"))
+        assert not os.path.exists(os.path.join(out_path, ".zattrs"))
+
+        s1 = ts.open({
+            "driver": "zarr3",
+            "kvstore": {"driver": "file", "path": os.path.join(out_path, "s1")},
+            "open": True,
+        }).result().read().result()
+        ref_s1, _ = downsample_labels_3d(vol, (2, 2, 2))
+        np.testing.assert_array_equal(s1, ref_s1)
+
     def test_existing_factor_skipped(self, tmp_path):
         """If a factor is already present (existing_factors), it shouldn't
         be re-built."""

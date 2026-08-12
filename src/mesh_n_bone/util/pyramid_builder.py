@@ -272,15 +272,20 @@ def _ts_handle_for_input(dataset_path):
     return handle
 
 
-def _ts_handle_for_output(path):
-    if path in _PYRAMID_WORKER_TS_CACHE:
-        return _PYRAMID_WORKER_TS_CACHE[path]
+def _ts_handle_for_output(path, zarr_format=2):
+    """Open a pyramid-owned zarr array (one we created, or the immediately
+    preceding cascade level, per this pyramid's own ``zarr_format``) for
+    read/write. Not for arbitrary external arrays — see
+    ``_ts_handle_for_input`` for those (driver auto-detected)."""
+    cache_key = (path, zarr_format)
+    if cache_key in _PYRAMID_WORKER_TS_CACHE:
+        return _PYRAMID_WORKER_TS_CACHE[cache_key]
     import tensorstore as ts
     from mesh_n_bone.util.image_data_interface import (
         _capped_tensorstore_context_spec,
     )
     handle = ts.open({
-        "driver": "zarr",
+        "driver": "zarr3" if zarr_format == 3 else "zarr",
         "kvstore": {"driver": "file", "path": path},
         "open": True,
         # Cap thread pools + disable decoded-chunk cache. Without this
@@ -288,7 +293,7 @@ def _ts_handle_for_output(path):
         # the worker's lifetime, OOMing on large super-chunk runs.
         "context": _capped_tensorstore_context_spec(),
     }).result()
-    _PYRAMID_WORKER_TS_CACHE[path] = handle
+    _PYRAMID_WORKER_TS_CACHE[cache_key] = handle
     return handle
 
 
@@ -356,7 +361,7 @@ def process_super_chunk_for_dask(sc_origin_tuple, worker_config):
         ds_origin = sc_origin // f
         local_origin = ds_origin - (out_origin // f)
         out_path = os.path.join(worker_config["pyramid_path"], f"s{k}")
-        out_arr = _ts_handle_for_output(out_path)
+        out_arr = _ts_handle_for_output(out_path, worker_config.get("zarr_format", 2))
         z, y, x = local_origin.tolist()
         arr_shape = out_arr.shape
         zE = min(z + ds_block.shape[0], arr_shape[0])
@@ -391,8 +396,9 @@ def process_cascade_chunk_for_dask(sc_origin_tuple, worker_config):
     world-coordinate region of the *original* source array, with its own
     offset/voxel-size/``swap_axes`` bookkeeping), this downsamples a single
     per-axis ``step_factor`` from the immediately preceding pyramid level —
-    a plain, already ZYX-native zarr v2 array starting at voxel (0, 0, 0),
-    since it was written by this same pyramid builder.
+    a plain, already ZYX-native array starting at voxel (0, 0, 0), in
+    whichever zarr format (``worker_config["zarr_format"]``) this whole
+    pyramid was written in, since it was written by this same builder.
 
     Module-level so the function reference is picklable for dask.
     """
@@ -412,8 +418,9 @@ def process_cascade_chunk_for_dask(sc_origin_tuple, worker_config):
     sc_origin = np.array(sc_origin_tuple, dtype=np.int64)
     step = np.asarray(worker_config["step_factor"], dtype=np.int64)
     chunk_step = np.asarray(worker_config["super_chunk_shape"], dtype=np.int64)
+    zarr_format = worker_config.get("zarr_format", 2)
 
-    read_arr = _ts_handle_for_output(worker_config["read_path"])
+    read_arr = _ts_handle_for_output(worker_config["read_path"], zarr_format)
     read_shape = np.array(read_arr.shape, dtype=np.int64)
     read_end = np.minimum(sc_origin + chunk_step, read_shape)
     read_size = read_end - sc_origin
@@ -430,7 +437,7 @@ def process_cascade_chunk_for_dask(sc_origin_tuple, worker_config):
     ds_block, _ = downsample_func(block, tuple(step.tolist()))
 
     write_origin = sc_origin // step
-    out_arr = _ts_handle_for_output(worker_config["write_path"])
+    out_arr = _ts_handle_for_output(worker_config["write_path"], zarr_format)
     oz, oy, ox = write_origin.tolist()
     arr_shape = out_arr.shape
     ozE = min(oz + ds_block.shape[0], arr_shape[0])
@@ -489,12 +496,13 @@ def prepare_pyramid_metadata_and_arrays(
         ds_path = os.path.join(output_zarr_path, f"s{k}")
         if os.path.exists(ds_path):
             shutil.rmtree(ds_path)
-        _create_zarr_v2_array(
+        _create_zarr_array(
             ds_path, shape=lod_shape, chunks=out_chunk.tolist(), dtype=dtype,
+            zarr_format=zarr_format,
         )
 
     if s0_source_path is not None:
-        _try_symlink_s0(output_zarr_path, s0_source_path)
+        _try_symlink_s0(output_zarr_path, s0_source_path, zarr_format=zarr_format)
 
     super_chunk_shape = out_chunk * max_factor
     return super_chunk_shape, max_factor
@@ -621,13 +629,14 @@ def build_missing_pyramid_levels(
         ds_path = os.path.join(output_zarr_path, f"s{k}")
         if os.path.exists(ds_path):
             shutil.rmtree(ds_path)
-        out_arrays[k] = _create_zarr_v2_array(
+        out_arrays[k] = _create_zarr_array(
             ds_path, shape=lod_shape, chunks=out_chunk.tolist(), dtype=dtype,
+            zarr_format=zarr_format,
         )
 
     # Optionally symlink s0
     if s0_source_path is not None:
-        _try_symlink_s0(output_zarr_path, s0_source_path)
+        _try_symlink_s0(output_zarr_path, s0_source_path, zarr_format=zarr_format)
 
     def _run_chunk_grid(sc_grid, process_one, label):
         n_chunks = len(sc_grid)
@@ -781,7 +790,7 @@ def build_missing_pyramid_levels(
 
 
 # ---------------------------------------------------------------------------
-# Minimal zarr v2 array helpers (no extra deps)
+# Minimal zarr v2/v3 array helpers (no extra deps)
 # ---------------------------------------------------------------------------
 
 
@@ -798,45 +807,90 @@ _TS_DTYPE_MAP = {
     np.dtype("float64"): "<f8",
 }
 
+# zarr v3's core spec names data types after their plain numpy names
+# (no byte-order/size prefix like v2's "<u2").
+_TS_V3_DTYPE_MAP = {
+    np.dtype("uint8"): "uint8",
+    np.dtype("uint16"): "uint16",
+    np.dtype("uint32"): "uint32",
+    np.dtype("uint64"): "uint64",
+    np.dtype("int8"): "int8",
+    np.dtype("int16"): "int16",
+    np.dtype("int32"): "int32",
+    np.dtype("int64"): "int64",
+    np.dtype("float32"): "float32",
+    np.dtype("float64"): "float64",
+}
 
-def _create_zarr_v2_array(path, shape, chunks, dtype):
-    """Create a zarr v2 array on disk via tensorstore and return a handle.
+
+def _create_zarr_array(path, shape, chunks, dtype, zarr_format=2):
+    """Create a zarr array on disk via tensorstore and return a handle.
 
     Uses tensorstore (already a core dep) instead of the optional ``zarr``
     package so the pyramid builder works in any pixi env that has the
-    base mesh-n-bone install.
+    base mesh-n-bone install. ``zarr_format`` (2 or 3) should match
+    whatever format this whole pyramid is being written in — see
+    ``_try_symlink_s0`` for why that matters.
     """
     import tensorstore as ts
     if os.path.exists(path):
         shutil.rmtree(path)
     dt = np.dtype(dtype)
-    ts_dtype = _TS_DTYPE_MAP.get(dt)
-    if ts_dtype is None:
-        raise ValueError(
-            f"Unsupported dtype for pyramid build: {dt}. "
-            f"Add it to _TS_DTYPE_MAP."
-        )
-    spec = {
-        "driver": "zarr",  # zarr v2
-        "kvstore": {"driver": "file", "path": path},
-        "metadata": {
-            "shape": list(shape),
-            "chunks": list(chunks),
-            "dtype": ts_dtype,
-            "compressor": None,
-            "fill_value": 0,
-            "order": "C",
-        },
-        "create": True,
-        "delete_existing": True,
-    }
+    if zarr_format == 3:
+        ts_dtype = _TS_V3_DTYPE_MAP.get(dt)
+        if ts_dtype is None:
+            raise ValueError(
+                f"Unsupported dtype for pyramid build: {dt}. "
+                f"Add it to _TS_V3_DTYPE_MAP."
+            )
+        spec = {
+            "driver": "zarr3",
+            "kvstore": {"driver": "file", "path": path},
+            "metadata": {
+                "shape": list(shape),
+                "data_type": ts_dtype,
+                "chunk_grid": {
+                    "name": "regular",
+                    "configuration": {"chunk_shape": list(chunks)},
+                },
+                # Uncompressed, matching the v2 branch's "compressor": None
+                # — mode/label downsamples are CPU- not I/O-bound here.
+                "codecs": [{"name": "bytes"}],
+                "fill_value": 0,
+            },
+            "create": True,
+            "delete_existing": True,
+        }
+    else:
+        ts_dtype = _TS_DTYPE_MAP.get(dt)
+        if ts_dtype is None:
+            raise ValueError(
+                f"Unsupported dtype for pyramid build: {dt}. "
+                f"Add it to _TS_DTYPE_MAP."
+            )
+        spec = {
+            "driver": "zarr",  # zarr v2
+            "kvstore": {"driver": "file", "path": path},
+            "metadata": {
+                "shape": list(shape),
+                "chunks": list(chunks),
+                "dtype": ts_dtype,
+                "compressor": None,
+                "fill_value": 0,
+                "order": "C",
+            },
+            "create": True,
+            "delete_existing": True,
+        }
     return ts.open(spec).result()
 
 
 def _write_zarr_v2_region(arr, origin_voxels, data):
     """Write ``data`` into ``arr`` at the given origin (zyx voxel coords).
 
-    ``arr`` is a tensorstore handle from ``_create_zarr_v2_array``.
+    ``arr`` is a tensorstore handle from ``_create_zarr_array`` — despite
+    the name (kept for backwards compatibility), this write path is
+    format-agnostic; it works the same for v2 or v3 handles.
     """
     z, y, x = origin_voxels.tolist()
     shape = arr.shape
@@ -848,15 +902,55 @@ def _write_zarr_v2_region(arr, origin_voxels, data):
     arr[z:zE, y:yE, x:xE].write(clipped).result()
 
 
-def _try_symlink_s0(pyramid_path, s0_source_path):
+def _try_symlink_s0(pyramid_path, s0_source_path, zarr_format=2):
     """Symlink the pyramid's s0 to the source s0 array.
 
     Returns True on success. Logs a warning and returns False otherwise
-    (e.g. cross-filesystem, remote source, permission denied).
+    (e.g. cross-filesystem, remote source, permission denied, or a zarr
+    format mismatch — see below).
     """
     target = os.path.join(pyramid_path, "s0")
     if os.path.exists(target):
         return True
+
+    # This pyramid's own group metadata (.zgroup/.zattrs or zarr.json) and
+    # its s1+ arrays are always written in ``zarr_format`` (see
+    # _create_zarr_array). If the real source array is in a DIFFERENT
+    # format, symlinking it in as s0 produces a group that LOOKS complete
+    # but is format-inconsistent: generic OME-zarr multiscale readers
+    # (e.g. neuroglancer) resolve the group's declared format and then
+    # look for THAT format's array metadata inside s0 — which has the
+    # other format's metadata file instead — and fail with something like
+    # "zarr v{version} array metadata not found", even though s0 is
+    # perfectly readable on its own (e.g. with an explicit driver
+    # override). s1+ are unaffected since those really do match.
+    # Leave s0 absent rather than link in something unreadable through
+    # the group's declared format — mesh-n-bone's own LOD-reading logic
+    # never depends on this symlink anyway (LOD 0 always reads the real
+    # source path directly); it's a convenience for external tools only.
+    # (Callers should normally have already matched ``zarr_format`` to
+    # the source's own format — see Meshify._build_missing_pyramid_scales
+    # — so this is mostly a safety net for n5/precomputed sources, which
+    # can't be represented as a zarr array at all.)
+    expected_driver = "zarr3" if zarr_format == 3 else "zarr"
+    try:
+        from mesh_n_bone.util.image_data_interface import _detect_zarr_driver
+        actual_driver = _detect_zarr_driver(s0_source_path)
+        if actual_driver != expected_driver:
+            logger.warning(
+                "pyramid_builder: not symlinking s0 from %s into %s — "
+                "source format (%s) doesn't match this pyramid's "
+                "zarr_format=%d (%s). s0 stays absent from the pyramid; "
+                "it's still directly browsable at its own real path/URL.",
+                s0_source_path, target, actual_driver, zarr_format, expected_driver,
+            )
+            return False
+    except Exception as e:
+        logger.warning(
+            "pyramid_builder: could not detect zarr format of %s (%s); "
+            "proceeding with symlink attempt.", s0_source_path, e,
+        )
+
     try:
         os.symlink(s0_source_path, target)
         return True
