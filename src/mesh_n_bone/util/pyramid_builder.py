@@ -823,6 +823,13 @@ _TS_V3_DTYPE_MAP = {
 }
 
 
+# zstd level for pyramid levels. Label volumes are mostly background, so
+# even a low level shrinks 128^3 uint16 chunks ~100x (4 MiB -> tens of KiB).
+# That matters both for the NRS writes/reads while building and for
+# browsing the kept pyramid over HTTP in neuroglancer.
+_PYRAMID_ZSTD_LEVEL = 3
+
+
 def _create_zarr_array(path, shape, chunks, dtype, zarr_format=2):
     """Create a zarr array on disk via tensorstore and return a handle.
 
@@ -831,6 +838,10 @@ def _create_zarr_array(path, shape, chunks, dtype, zarr_format=2):
     base mesh-n-bone install. ``zarr_format`` (2 or 3) should match
     whatever format this whole pyramid is being written in — see
     ``_try_symlink_s0`` for why that matters.
+
+    Chunks are zstd-compressed: the ``zstd`` codec for zarr v3, and
+    blosc with ``cname="zstd"`` for zarr v2, the v2 compressor every
+    zarr reader (zarr-python, tensorstore, neuroglancer) supports.
     """
     import tensorstore as ts
     if os.path.exists(path):
@@ -853,9 +864,15 @@ def _create_zarr_array(path, shape, chunks, dtype, zarr_format=2):
                     "name": "regular",
                     "configuration": {"chunk_shape": list(chunks)},
                 },
-                # Uncompressed, matching the v2 branch's "compressor": None
-                # — mode/label downsamples are CPU- not I/O-bound here.
-                "codecs": [{"name": "bytes"}],
+                "codecs": [
+                    {"name": "bytes", "configuration": {"endian": "little"}},
+                    {
+                        "name": "zstd",
+                        "configuration": {
+                            "level": _PYRAMID_ZSTD_LEVEL, "checksum": False,
+                        },
+                    },
+                ],
                 "fill_value": 0,
             },
             "create": True,
@@ -875,7 +892,12 @@ def _create_zarr_array(path, shape, chunks, dtype, zarr_format=2):
                 "shape": list(shape),
                 "chunks": list(chunks),
                 "dtype": ts_dtype,
-                "compressor": None,
+                "compressor": {
+                    "id": "blosc",
+                    "cname": "zstd",
+                    "clevel": _PYRAMID_ZSTD_LEVEL,
+                    "shuffle": 1,
+                },
                 "fill_value": 0,
                 "order": "C",
             },
