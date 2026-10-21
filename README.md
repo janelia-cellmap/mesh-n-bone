@@ -194,9 +194,10 @@ sharded: true                    # Pack all meshes into a few <n>.shard files
 delete_unsharded_files: true     # Remove per-segment files after packing (default: true)
 
 # ── Coordinate system ──
-# Voxel size is read automatically from the dataset metadata (OME-NGFF or
-# zarr attributes). Use voxel_size_nm only to override when the metadata is
-# missing or incorrect. It affects mesh vertex scaling, not ROI coordinates.
+# Voxel size and placement are read automatically from the dataset metadata
+# (OME-NGFF, funlib/COSEM attributes, N5, or precomputed info). Use
+# voxel_size_nm only to override when the metadata is missing or incorrect.
+# It affects mesh vertex scaling, not ROI coordinates.
 voxel_size_nm: [1000, 1000, 1000]  # Override voxel size (ZYX)
 
 # ── Segment properties ──
@@ -208,6 +209,7 @@ segment_properties_id_column: "Object ID"        # CSV column with segment IDs (
 roi:                             # Restrict processing to this subregion
   begin: [100, 200, 300]         # Start coordinates in dataset world units (ZYX)
   end: [500, 600, 700]           # End coordinates in dataset world units (ZYX)
+                                 # Voxels whose centres lie in [begin, end) are meshed.
                                  # Boundary edges are preserved during simplification.
                                  # Can also be passed via CLI: --roi z0,y0,x0,z1,y1,x1
 
@@ -230,6 +232,8 @@ target_ids: [12345, 67890]                # YAML list of ids, OR
 - `s3://bucket/path`
 
 The format is auto-detected by probing for the relevant marker file (`info` → precomputed, `zarr.json` → zarr v3, `.zarray` → zarr v2, `attributes.json` → N5), so a path like `gs://neuroglancer-janelia-flyem-hemibrain/v1.0/segmentation` opens correctly with no extra prefix.
+
+Volumes are read through [worldarray](https://github.com/JaneliaSciComp/worldarray), which also decides where they sit. Every format is placed by one rule: a translation is the centre of voxel 0, as in OME-NGFF. Formats that store voxel 0's corner instead (funlib `offset`, precomputed `voxel_offset`, or no placement metadata at all) are moved half a voxel on reading. Meshes therefore land where Neuroglancer draws the segmentation, whichever way the volume was stored.
 
 If no specific scale is provided, the highest-resolution scale is used by default — for OME-Zarr multiscales groups (root or subgroup) that's the first dataset listed in the metadata; for precomputed, scale index 0 from the `info` file. To use a different scale, either name the array directly (`.../seg.zarr/s2`) or, for precomputed, append the scale `key` from the `info` file (e.g. `gs://neuroglancer-janelia-flyem-hemibrain/v1.0/segmentation/16.0x16.0x16.0`).
 

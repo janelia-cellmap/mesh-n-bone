@@ -1,41 +1,55 @@
-"""Lightweight wrapper around array metadata with physical coordinate support.
+"""A volume's geometry in the integer funlib frame Meshify does block math in."""
 
-Replaces funlib.persistence.Array for read-only use cases.
-"""
+import logging
 
 import numpy as np
 from funlib.geometry import Coordinate, Roi
 
+logger = logging.getLogger(__name__)
+
 
 class CellMapArray:
-    """Wrapper providing ROI-based indexing over array metadata.
+    """Integer ``voxel_size`` / ``roi`` for funlib block arithmetic, plus
+    the volume's true float geometry.
 
-    Converts between physical coordinates and voxel indices,
-    replacing funlib.persistence.Array for read-only workflows.
+    Built from a :class:`worldarray.WorldArray`. ``roi.offset`` is the
+    rounded translation (voxel 0's centre), so voxel ``i`` sits at
+    ``roi.offset + i * voxel_size`` in the integer frame; ``true_offset``
+    and ``true_voxel_size`` keep the floats Meshify maps final mesh
+    vertices back onto. Holds metadata only, no tensorstore handle.
     """
 
-    def __init__(self, data, voxel_size, offset, dataset_path=None):
+    def __init__(self, volume, dataset_path):
         """
         Parameters
         ----------
-        data : ArrayMetadata
-            Metadata container with shape, dtype, chunks, and attrs.
-        voxel_size : Coordinate or tuple
-            Voxel dimensions in physical units.
-        offset : Coordinate or tuple
-            Array origin in physical units.
-        dataset_path : str or None
-            Filesystem path to the dataset (used for parent attr lookup).
+        volume : worldarray.WorldArray
+            The opened volume, in its stored units.
+        dataset_path : str
+            Path of the array (the level, when a group was opened).
         """
-        self.data = data
+        self.data = volume.meta
         self._dataset_path = dataset_path
-        self.voxel_size = (
-            voxel_size if isinstance(voxel_size, Coordinate) else Coordinate(voxel_size)
-        )
-        n_spatial = len(self.voxel_size)
-        shape_spatial = self.data.shape[-n_spatial:]
-        offset = offset if isinstance(offset, Coordinate) else Coordinate(offset)
+        self.true_voxel_size = np.array(volume.voxel_size, dtype=float)
+        self.true_offset = np.array(volume.translation, dtype=float)
+        if np.any(self.true_voxel_size != np.round(self.true_voxel_size)):
+            logger.warning(
+                "Rounding non-integer voxel_size %s to integers for funlib "
+                "block arithmetic; mesh vertices are mapped back to the true "
+                "values.",
+                self.true_voxel_size.tolist(),
+            )
+        self.voxel_size = Coordinate(int(round(v)) for v in self.true_voxel_size)
+        offset = Coordinate(int(round(v)) for v in self.true_offset)
+        shape_spatial = tuple(volume.shape[i] for i in volume.spatial)
         self.roi = Roi(offset, Coordinate(shape_spatial) * self.voxel_size)
+        units = [self.data.units[i] for i in self.data.spatial]
+        self.units = units[0] or None
+
+    @property
+    def format(self):
+        """``"zarr2"``, ``"zarr3"``, ``"n5"`` or ``"precomputed"``."""
+        return self.data.format
 
     @property
     def dtype(self):
@@ -43,7 +57,7 @@ class CellMapArray:
 
     @property
     def chunk_shape(self):
-        return Coordinate(self.data.chunks)
+        return Coordinate(self.data.chunk_shape)
 
     @property
     def shape(self):

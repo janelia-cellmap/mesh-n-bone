@@ -266,8 +266,8 @@ _PYRAMID_WORKER_TS_CACHE: dict[str, object] = {}
 def _ts_handle_for_input(dataset_path):
     if dataset_path in _PYRAMID_WORKER_TS_CACHE:
         return _PYRAMID_WORKER_TS_CACHE[dataset_path]
-    from mesh_n_bone.util.image_data_interface import open_ds_tensorstore
-    handle = open_ds_tensorstore(dataset_path)
+    from mesh_n_bone.util.image_data_interface import open_volume
+    handle = open_volume(dataset_path)
     _PYRAMID_WORKER_TS_CACHE[dataset_path] = handle
     return handle
 
@@ -281,9 +281,7 @@ def _ts_handle_for_output(path, zarr_format=2):
     if cache_key in _PYRAMID_WORKER_TS_CACHE:
         return _PYRAMID_WORKER_TS_CACHE[cache_key]
     import tensorstore as ts
-    from mesh_n_bone.util.image_data_interface import (
-        _capped_tensorstore_context_spec,
-    )
+    from worldarray import capped_context_spec
     handle = ts.open({
         "driver": "zarr3" if zarr_format == 3 else "zarr",
         "kvstore": {"driver": "file", "path": path},
@@ -291,7 +289,7 @@ def _ts_handle_for_output(path, zarr_format=2):
         # Cap thread pools + disable decoded-chunk cache. Without this
         # the output handle's cache_pool accumulates encoded chunks for
         # the worker's lifetime, OOMing on large super-chunk runs.
-        "context": _capped_tensorstore_context_spec(),
+        "context": capped_context_spec(),
     }).result()
     _PYRAMID_WORKER_TS_CACHE[cache_key] = handle
     return handle
@@ -311,7 +309,7 @@ def process_super_chunk_for_dask(sc_origin_tuple, worker_config):
     Returns ``None`` (dask bag collects None values; we don't aggregate).
     """
     from funlib.geometry import Coordinate, Roi
-    from mesh_n_bone.util.image_data_interface import to_ndarray_tensorstore
+    from mesh_n_bone.util.image_data_interface import read_block
     from mesh_n_bone.meshify.downsample import (
         downsample_labels_3d,
         downsample_binary_3d,
@@ -343,12 +341,8 @@ def process_super_chunk_for_dask(sc_origin_tuple, worker_config):
     world_shape = Coordinate(read_size_voxels.tolist()) * voxel_size
     roi = Roi(world_origin, world_shape)
 
-    ts_s0 = _ts_handle_for_input(worker_config["s0_dataset_path"])
-    s0_block = to_ndarray_tensorstore(
-        ts_s0, roi, voxel_size, ds_offset,
-        swap_axes=worker_config["swap_axes"], fill_value=0,
-        source_path=worker_config["s0_dataset_path"],
-    )
+    s0 = _ts_handle_for_input(worker_config["s0_dataset_path"])
+    s0_block = read_block(s0, roi, voxel_size, ds_offset, fill_value=0)
 
     # Downsample + write each LOD's chunk (streaming: drop the buffer after write)
     for k in missing_lods:
@@ -394,7 +388,7 @@ def process_cascade_chunk_for_dask(sc_origin_tuple, worker_config):
 
     Unlike ``process_super_chunk_for_dask`` (which always reads a
     world-coordinate region of the *original* source array, with its own
-    offset/voxel-size/``swap_axes`` bookkeeping), this downsamples a single
+    offset/voxel-size bookkeeping), this downsamples a single
     per-axis ``step_factor`` from the immediately preceding pyramid level —
     a plain, already ZYX-native array starting at voxel (0, 0, 0), in
     whichever zarr format (``worker_config["zarr_format"]``) this whole
@@ -722,8 +716,6 @@ def build_missing_pyramid_levels(
         # nearest predecessor this call ALSO just built. A gap (the
         # predecessor was already present in existing_factors, so we have
         # no reader for it here) resets the chain to read s0 directly.
-        import zarr as _zarr
-
         prev_k, prev_factor = None, (1, 1, 1)
         for k, factor in missing:
             read_from_s0 = not (prev_k is not None and k == prev_k + 1)
@@ -739,9 +731,9 @@ def build_missing_pyramid_levels(
                 prev_arr = None
             else:
                 grid_origin = np.zeros(3, dtype=np.int64)
-                prev_arr = _zarr.open_array(
-                    os.path.join(output_zarr_path, f"s{prev_k}"), mode="r",
-                )
+                # The level this call wrote one step ago, read back
+                # through its own tensorstore handle.
+                prev_arr = out_arrays[prev_k]
                 grid_shape = np.asarray(prev_arr.shape, dtype=np.int64)
                 bound_shape = grid_shape
 
@@ -765,7 +757,7 @@ def build_missing_pyramid_levels(
                 else:
                     z, y, x = sc_origin.tolist()
                     zE, yE, xE = read_end.tolist()
-                    block = np.asarray(prev_arr[z:zE, y:yE, x:xE])
+                    block = prev_arr[z:zE, y:yE, x:xE].read().result()
                     write_origin = sc_origin // step_arr
 
                 trim = (np.array(block.shape) // step_arr) * step_arr
@@ -934,8 +926,8 @@ def _try_symlink_s0(pyramid_path, s0_source_path, zarr_format=2):
     # can't be represented as a zarr array at all.)
     expected_driver = "zarr3" if zarr_format == 3 else "zarr"
     try:
-        from mesh_n_bone.util.image_data_interface import _detect_zarr_driver
-        actual_driver = _detect_zarr_driver(s0_source_path)
+        from mesh_n_bone.util.image_data_interface import detect_driver
+        actual_driver = detect_driver(s0_source_path)
         if actual_driver != expected_driver:
             logger.warning(
                 "pyramid_builder: not symlinking s0 from %s into %s — "

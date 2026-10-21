@@ -267,56 +267,6 @@ class TestAssemblyMemoryPlanning:
         assert cfg["jobqueue"]["lsf"]["ncpus"] == 12
 
 
-class TestTensorStoreReadTimeouts:
-    class _FakeDataset:
-        class _FakeDType:
-            numpy_dtype = np.dtype("uint64")
-
-        dtype = _FakeDType()
-
-    def _slices_for_mib(self, mib):
-        voxels = int(mib * 2**20 / np.dtype("uint64").itemsize)
-        return (slice(0, voxels),)
-
-    def test_small_reads_keep_old_five_second_timeout(self):
-        from mesh_n_bone.util.image_data_interface import (
-            _default_read_timeout_seconds,
-        )
-
-        slices = self._slices_for_mib(67)
-        assert _default_read_timeout_seconds(
-            self._FakeDataset(), slices, "/nrs/local.zarr",
-        ) == 5.0
-        assert _default_read_timeout_seconds(
-            self._FakeDataset(), slices, "gs://bucket/volume",
-        ) == 5.0
-
-    def test_remote_timeout_scales_with_read_size(self):
-        from mesh_n_bone.util.image_data_interface import (
-            _default_read_timeout_seconds,
-        )
-
-        slices = self._slices_for_mib(512)
-        assert _default_read_timeout_seconds(
-            self._FakeDataset(), slices, "precomputed://gs://bucket/volume",
-        ) == 32.0
-
-    def test_local_timeout_scales_more_slowly_and_caps(self):
-        from mesh_n_bone.util.image_data_interface import (
-            _default_read_timeout_seconds,
-        )
-
-        slices = self._slices_for_mib(4096)
-        assert _default_read_timeout_seconds(
-            self._FakeDataset(), slices, "/nrs/local.zarr",
-        ) == 16.0
-
-        huge_slices = self._slices_for_mib(16384)
-        assert _default_read_timeout_seconds(
-            self._FakeDataset(), huge_slices, "/nrs/local.zarr",
-        ) == 30.0
-
-
 class TestBlockFromIndex:
     """`block_from_index` should produce the same DaskBlocks as
     `create_blocks` would, indexed by integer."""

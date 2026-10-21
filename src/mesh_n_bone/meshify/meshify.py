@@ -17,24 +17,9 @@ import pymeshlab
 import fastremap
 from mesh_n_bone.util import dask_util
 from mesh_n_bone.util.logging import Timing_Messager
-from mesh_n_bone.util.zarr_io import (
-    open_dataset,
-    split_dataset_path,
-    read_raw_voxel_size,
-    read_raw_offset,
-    _read_attrs,
-    _get_multiscales,
-    _extract_ome_scale_translation,
-    _first_multiscales_dataset_path,
-    _path_basename,
-    _path_dirname,
-    _path_join,
-)
-from mesh_n_bone.util.image_data_interface import (
-    _detect_zarr_driver,
-    open_ds_tensorstore,
-    to_ndarray_tensorstore,
-)
+from mesh_n_bone.util.zarr_io import open_dataset
+from mesh_n_bone.util.image_data_interface import open_volume, read_block
+from worldarray import index_range
 from mesh_n_bone.meshify.downsample import (
     downsample_labels_3d_suppress_zero,
     downsample_labels_3d,
@@ -54,62 +39,21 @@ _OME_UNIT_TO_ABBREVIATION = {
 }
 
 
-def _read_ome_ngff_transform(input_path):
-    """Extract voxel_size, offset, and coordinate unit from OME-NGFF metadata.
+def _snap_roi_to_voxels(seg_array, roi):
+    """Return the voxels whose centres lie in world *roi*, as a Roi in
+    *seg_array*'s integer frame (voxel ``i`` at ``roi.offset + i *
+    voxel_size``).
 
-    Reads multiscales from the parent group of *input_path*. Robust to
-    OME-Zarr v0.4 / v0.5 layouts, non-ZYX axes, root-level
-    coordinateTransformations, and arbitrary dataset paths — all via
-    :func:`mesh_n_bone.util.zarr_io._extract_ome_scale_translation`.
-
-    Returns ``(voxel_size, offset, coordinate_units)`` in ZYX order
-    (or ``(None, None, None)`` when no metadata is found). The voxel
-    size and offset are returned as ``np.ndarray`` for consistency
-    with existing callers.
+    A ROI aligned to voxel corners and one aligned to voxel centres both
+    select whole voxels (worldarray's world-box rule), so a ROI written
+    against either convention keeps meshing the voxels it always did.
     """
-    zarr_root_path, dataset_path = split_dataset_path(input_path)
-    if dataset_path:
-        dataset_name = _path_basename(dataset_path)
-        parent_path = _path_dirname(dataset_path)
-        parent_dir = _path_join(zarr_root_path, parent_path) if parent_path else zarr_root_path
-    else:
-        dataset_name = _path_basename(input_path)
-        parent_dir = _path_dirname(input_path)
-
-    try:
-        parent_attrs = _read_attrs(parent_dir)
-        if not dataset_path:
-            input_attrs = _read_attrs(input_path)
-            selected_dataset_path = _first_multiscales_dataset_path(input_attrs)
-            if selected_dataset_path:
-                parent_attrs = input_attrs
-                dataset_name = selected_dataset_path
-        multiscales = _get_multiscales(parent_attrs)
-        if not multiscales:
-            return None, None, None
-
-        scale, translation = _extract_ome_scale_translation(
-            parent_attrs, dataset_name=dataset_name,
-        )
-        if scale is None and translation is None:
-            return None, None, None
-
-        # Pull the unit off the first spatial axis (units are per-axis but
-        # mesh-n-bone treats voxel_size isotropically here).
-        coordinate_units = None
-        for ax in multiscales[0].get("axes", []) or []:
-            if isinstance(ax, dict) and ax.get("type") == "space":
-                unit = ax.get("unit")
-                if unit is not None:
-                    coordinate_units = _OME_UNIT_TO_ABBREVIATION.get(unit, unit)
-                break
-
-        voxel_size = np.array(scale, dtype=float) if scale is not None else None
-        offset = np.array(translation, dtype=float) if translation is not None else None
-        return voxel_size, offset, coordinate_units
-    except Exception as e:
-        logger.debug(f"Could not read OME-NGFF metadata: {e}")
-        return None, None, None
+    lo, hi = index_range(
+        roi.begin, roi.end, seg_array.true_voxel_size, seg_array.true_offset,
+    )
+    vs = seg_array.voxel_size
+    begin = seg_array.roi.offset + Coordinate(lo) * vs
+    return Roi(begin, Coordinate(np.subtract(hi, lo)) * vs)
 
 
 try:
@@ -784,21 +728,17 @@ def _get_chunked_mesh_worker(block_index, tmpdirname, config):
     )
     dataset_path = config["dataset_path"]
     if dataset_path not in _thread_local_ts:
-        _thread_local_ts[dataset_path] = open_ds_tensorstore(dataset_path)
-    ts_dataset = _thread_local_ts[dataset_path]
+        _thread_local_ts[dataset_path] = open_volume(dataset_path)
+    volume = _thread_local_ts[dataset_path]
 
     voxel_size = Coordinate(config["voxel_size"])
     roi_offset = Coordinate(config["roi_offset"])
     output_voxel_size = Coordinate(config["output_voxel_size"])
 
     mesher = Mesher(output_voxel_size[::-1])
-    segmentation_block = to_ndarray_tensorstore(
-        ts_dataset, block.roi, voxel_size, roi_offset,
-        swap_axes=config["swap_axes"], fill_value=0, source_path=dataset_path,
+    segmentation_block = read_block(
+        volume, block.roi, voxel_size, roi_offset, fill_value=0,
     )
-    if segmentation_block.dtype.byteorder == ">":
-        swapped_dtype = segmentation_block.dtype.newbyteorder()
-        segmentation_block = segmentation_block.view(swapped_dtype).byteswap()
 
     downsample_factor = config["downsample_factor"]
     if downsample_factor:
@@ -1148,38 +1088,28 @@ class Meshify:
         keep_chunked_meshes: bool = False,
         center_octree: bool = True,
     ):
-        filename, dataset_name = split_dataset_path(input_path)
-        self.segmentation_array = open_dataset(filename, dataset_name)
-        self._dataset_path = (
-            getattr(self.segmentation_array, "_dataset_path", None)
-            or (_path_join(filename, dataset_name) if dataset_name else filename)
-        )
+        self.segmentation_array = open_dataset(input_path)
+        self._dataset_path = self.segmentation_array._dataset_path
         self.output_directory = output_directory
         self.input_path = input_path
-        # Both N5 and neuroglancer precomputed store voxels in XYZ order
-        # with no per-axis labels, so we need to swap to ZYX at read time.
-        driver = _detect_zarr_driver(self._dataset_path)
-        self._driver = driver
-        self._swap_axes = driver in ("n5", "neuroglancer_precomputed")
+        # "zarr2" | "zarr3" | "n5" | "precomputed". worldarray returns
+        # every format in C (z, y, x) order, so nothing is swapped here.
+        self._format = self.segmentation_array.format
 
-        # Get true (possibly non-integer) voxel size and offset from
-        # the underlying data. self.true_offset is the float-precision
-        # OME translation / funlib offset; self.roi.offset stays
-        # integer for funlib Roi arithmetic, and the final mesh
-        # vertices get corrected with true_offset before output.
-        self.true_voxel_size = np.array(read_raw_voxel_size(self.segmentation_array))
-        self.true_offset = np.array(read_raw_offset(self.segmentation_array))
+        # True (possibly non-integer) voxel size and translation (voxel
+        # 0's centre), as worldarray resolves them from OME-NGFF, funlib,
+        # COSEM, N5 or precomputed metadata. self.roi.offset stays
+        # integer for funlib Roi arithmetic, and the final mesh vertices
+        # get corrected with true_offset before output.
+        self.true_voxel_size = self.segmentation_array.true_voxel_size.copy()
+        self.true_offset = self.segmentation_array.true_offset.copy()
+        # The integer origin mesh vertices are in, kept on self because
+        # assembly drops segmentation_array before pickling.
+        self._dataset_origin = self.segmentation_array.roi.offset
 
-        # Check if voxel_size is just defaults (1,1,1) and
-        # try OME-NGFF multiscales metadata from the parent zarr group.
-        # Skip for precomputed (no OME metadata).
-        if driver == "neuroglancer_precomputed":
-            ome_voxel_size, ome_offset, ome_units = None, None, None
-        else:
-            ome_voxel_size, ome_offset, ome_units = _read_ome_ngff_transform(input_path)
-
-        if ome_units is not None and coordinate_units == "nm":
-            coordinate_units = ome_units
+        units = self.segmentation_array.units
+        if units is not None and coordinate_units == "nm":
+            coordinate_units = _OME_UNIT_TO_ABBREVIATION.get(units, units)
 
         if voxel_size_nm is not None:
             # Explicit voxel size in nm — only affects mesh vertex scaling,
@@ -1189,31 +1119,6 @@ class Meshify:
                 voxel_size_nm = np.repeat(voxel_size_nm, 3)
             logger.info(f"Using user-specified voxel_size_nm {voxel_size_nm}")
             self.true_voxel_size = voxel_size_nm.copy()
-        elif ome_voxel_size is not None:
-            if all(v == 1 for v in self.segmentation_array.voxel_size):
-                logger.info(
-                    f"Using OME-NGFF voxel_size {ome_voxel_size} "
-                    f"(attrs returned {self.segmentation_array.voxel_size})"
-                )
-                self.true_voxel_size = ome_voxel_size.copy()
-                ome_voxel_size_coord = Coordinate(int(v) for v in ome_voxel_size)
-                ome_offset_coord = (
-                    Coordinate(int(v) for v in ome_offset)
-                    if ome_offset is not None
-                    else Coordinate(0, 0, 0)
-                )
-                self.segmentation_array.voxel_size = ome_voxel_size_coord
-                array_shape = self.segmentation_array.data.shape[-3:]
-                self.segmentation_array.roi = Roi(
-                    ome_offset_coord, Coordinate(array_shape) * ome_voxel_size_coord
-                )
-                # Track the float-precision OME translation so the
-                # final-mesh rescale can place vertices at sub-unit
-                # positions even when ome_offset_coord rounds them.
-                if ome_offset is not None:
-                    self.true_offset = np.array(ome_offset, dtype=float)
-                else:
-                    self.true_offset = np.zeros(3, dtype=float)
 
         if roi is not None:
             if not isinstance(roi, Roi):
@@ -1237,7 +1142,7 @@ class Meshify:
                         "roi must be a Roi object or a dict with "
                         "'offset'+'shape' or 'begin'+'end' keys"
                     )
-            self.roi = roi
+            self.roi = _snap_roi_to_voxels(self.segmentation_array, roi)
             self.has_custom_roi = True
         else:
             self.roi = self.segmentation_array.roi
@@ -1418,7 +1323,6 @@ class Meshify:
         """Return a lightweight, pickle-safe dict of parameters for workers."""
         return {
             "dataset_path": self._dataset_path,
-            "swap_axes": self._swap_axes,
             "voxel_size": tuple(self.segmentation_array.voxel_size),
             "roi_offset": tuple(self.segmentation_array.roi.offset),
             "output_voxel_size": tuple(self.output_voxel_size_funlib),
@@ -1951,23 +1855,27 @@ class Meshify:
         # Rewriting from voxel-index space gives:
         #   true_pos = true_offset + true_voxel * (int_pos - int_offset) / int_voxel
         #            = true_offset + scale * (int_pos - int_offset)
+        # int_offset is the dataset's own integer origin, not a custom
+        # ROI's begin: vertices are in the dataset's integer frame.
         voxel_mismatch = (
             list(self.true_voxel_size) != list(self.output_voxel_size_funlib)
         )
         true_offset_attr = getattr(self, "true_offset", None)
-        roi_attr = getattr(self, "roi", None)
+        int_origin = getattr(self, "_dataset_origin", None)
         offset_mismatch = False
-        if true_offset_attr is not None and roi_attr is not None:
-            int_offset_xyz = np.array(roi_attr.offset[::-1], dtype=float)
+        if true_offset_attr is not None and int_origin is not None:
+            int_offset_xyz = np.array(int_origin[::-1], dtype=float)
             true_offset_xyz = np.array(true_offset_attr[::-1], dtype=float)
             offset_mismatch = not np.allclose(int_offset_xyz, true_offset_xyz)
         if voxel_mismatch or offset_mismatch:
             scale = np.array(self.true_voxel_size[::-1]) / np.array(
                 self.output_voxel_size_funlib[::-1]
             )
-            int_offset_xyz = np.array(self.roi.offset[::-1], dtype=float)
+            if int_origin is None:
+                int_origin = self.roi.offset
+            int_offset_xyz = np.array(int_origin[::-1], dtype=float)
             true_offset_xyz = np.array(
-                getattr(self, "true_offset", self.roi.offset)[::-1], dtype=float
+                getattr(self, "true_offset", int_origin)[::-1], dtype=float
             )
             mesh.vertices -= int_offset_xyz
             mesh.vertices *= scale
@@ -2136,6 +2044,7 @@ class Meshify:
         orig_input_path = self.input_path
         orig_base_voxel = self.base_voxel_size_funlib
         orig_true_offset = self.true_offset.copy()
+        orig_dataset_origin = getattr(self, "_dataset_origin", None)
         orig_roi = self.roi
 
         try:
@@ -2147,29 +2056,15 @@ class Meshify:
             if input_dataset_path is not None:
                 # Swap to a pre-existing multiscale level. Reads that
                 # dataset directly — no in-worker downsampling.
-                from mesh_n_bone.util.zarr_io import (
-                    open_dataset, split_dataset_path,
-                    read_raw_voxel_size, read_raw_offset,
-                )
-                f_name, d_name = split_dataset_path(input_dataset_path)
-                new_arr = open_dataset(f_name, d_name)
+                new_arr = open_dataset(input_dataset_path)
                 self.segmentation_array = new_arr
-                self._dataset_path = (
-                    getattr(new_arr, "_dataset_path", None) or input_dataset_path
-                )
+                self._dataset_path = new_arr._dataset_path
                 self.input_path = input_dataset_path
                 self.base_voxel_size_funlib = new_arr.voxel_size
                 self.output_voxel_size_funlib = new_arr.voxel_size
-                # Prefer OME-NGFF fractional precision when available
-                ome_vs, ome_off, _ = _read_ome_ngff_transform(input_dataset_path)
-                self.true_voxel_size = (
-                    np.array(ome_vs, dtype=float) if ome_vs is not None
-                    else np.array(read_raw_voxel_size(new_arr), dtype=float)
-                )
-                self.true_offset = (
-                    np.array(ome_off, dtype=float) if ome_off is not None
-                    else np.array(read_raw_offset(new_arr), dtype=float)
-                )
+                self.true_voxel_size = new_arr.true_voxel_size.copy()
+                self.true_offset = new_arr.true_offset.copy()
+                self._dataset_origin = new_arr.roi.offset
                 self.downsample_factor = None
                 # Refresh ROI when we didn't have a custom one. For a
                 # custom ROI we keep the user-specified world bbox.
@@ -2215,6 +2110,7 @@ class Meshify:
             self.input_path = orig_input_path
             self.base_voxel_size_funlib = orig_base_voxel
             self.true_offset = orig_true_offset
+            self._dataset_origin = orig_dataset_origin
             self.roi = orig_roi
 
     def _discover_existing_scales(self):
@@ -2238,45 +2134,30 @@ class Meshify:
 
         result = {}
         try:
-            from mesh_n_bone.util.zarr_io import (
-                _get_multiscales,
-                _extract_ome_scale_translation,
-                _read_parent_attrs,
-                _path_join,
-                _path_dirname,
-                _path_basename,
-            )
-            parent_attrs = _read_parent_attrs(self.segmentation_array)
-            multiscales = _get_multiscales(parent_attrs)
-            if multiscales and isinstance(multiscales, list) and multiscales:
-                ms = multiscales[0]
-                input_ds_name = _path_basename(self._dataset_path)
-                input_scale, _ = _extract_ome_scale_translation(
-                    parent_attrs, dataset_name=input_ds_name,
+            # Precomputed scales are left alone (as before worldarray):
+            # only OME-NGFF / N5 multiscales groups are reused.
+            if self.segmentation_array.format != "precomputed":
+                import worldarray as wa
+
+                input_scale = np.asarray(
+                    self.segmentation_array.true_voxel_size, dtype=float,
                 )
-                if input_scale is not None and all(s > 0 for s in input_scale):
-                    parent_path = _path_dirname(self._dataset_path)
-                    for ds in ms.get("datasets", []) or []:
-                        ds_name = ds.get("path")
-                        if not ds_name:
-                            continue
-                        ds_scale, _ = _extract_ome_scale_translation(
-                            parent_attrs, dataset_name=ds_name,
-                        )
-                        if ds_scale is None:
-                            continue
-                        ratios = [d / i for d, i in zip(ds_scale, input_scale)]
-                        if not all(abs(r - ratios[0]) < 1e-6 for r in ratios):
-                            continue
-                        ratio = ratios[0]
-                        if ratio < 1.0 - 1e-6:
-                            continue
-                        ratio_int = int(round(ratio))
-                        if abs(ratio - ratio_int) > 1e-6:
-                            continue
-                        if ratio_int < 1 or (ratio_int & (ratio_int - 1)) != 0:
-                            continue
-                        result[ratio_int] = _path_join(parent_path, ds_name)
+                pyramid = wa.open_pyramid(self._dataset_path, units=None)
+                # A lone array is a pyramid of one level: nothing to reuse.
+                levels = pyramid.levels if len(pyramid) > 1 else ()
+                for level in levels:
+                    ratios = np.asarray(level.voxel_size, dtype=float) / input_scale
+                    if not np.allclose(ratios, ratios[0], rtol=0, atol=1e-6):
+                        continue
+                    ratio = float(ratios[0])
+                    if ratio < 1.0 - 1e-6:
+                        continue
+                    ratio_int = int(round(ratio))
+                    if abs(ratio - ratio_int) > 1e-6:
+                        continue
+                    if ratio_int < 1 or (ratio_int & (ratio_int - 1)) != 0:
+                        continue
+                    result[ratio_int] = level.meta.path
         except Exception as e:
             logger.warning(
                 "Could not discover existing multiscale levels (%s); "
@@ -2308,7 +2189,6 @@ class Meshify:
             per_lod_factors_for_anisotropy,
             build_missing_pyramid_levels,
         )
-        from mesh_n_bone.util.image_data_interface import to_ndarray_tensorstore
         from funlib.geometry import Coordinate, Roi
 
         voxel_size = np.asarray(self.true_voxel_size, dtype=float)
@@ -2363,7 +2243,6 @@ class Meshify:
 
         # No driver-side tensorstore handle needed — workers re-open per-process.
         dataset_path = self._dataset_path
-        swap_axes = self._swap_axes
         ds_offset_coord = Coordinate(seg_arr.roi.offset)
         vs_coord = Coordinate(seg_arr.voxel_size)
 
@@ -2397,7 +2276,7 @@ class Meshify:
         # sources can't be represented as a zarr array either way, so
         # they fall back to the zarr v2 default (s0 just won't be
         # symlinked in for those, same as before).
-        zarr_format = 3 if self._driver == "zarr3" else 2
+        zarr_format = 3 if self._format == "zarr3" else 2
 
         # Two decoupled sizes:
         #   out_chunk_shape:  on-disk chunk shape of the s_k zarr arrays.
@@ -2538,7 +2417,6 @@ class Meshify:
                 "s0_dataset_path": dataset_path,
                 "dataset_offset": tuple(int(v) for v in seg_arr.roi.offset),
                 "voxel_size": tuple(int(v) for v in seg_arr.voxel_size),
-                "swap_axes": bool(swap_axes),
                 "dataset_shape": tuple(int(v) for v in dataset_shape.tolist()),
                 "factors_per_lod": [list(f) for f in factors_per_lod_full],
                 "missing_lods": [k for k, _ in needed_uniform],
@@ -2574,7 +2452,6 @@ class Meshify:
                         "s0_dataset_path": dataset_path,
                         "dataset_offset": tuple(int(v) for v in seg_arr.roi.offset),
                         "voxel_size": tuple(int(v) for v in seg_arr.voxel_size),
-                        "swap_axes": bool(swap_axes),
                         "dataset_shape": tuple(int(v) for v in dataset_shape.tolist()),
                         "factors_per_lod": [[1, 1, 1]] * k + [list(step)],
                         "missing_lods": [k],
