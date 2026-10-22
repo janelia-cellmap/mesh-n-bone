@@ -924,17 +924,17 @@ def _try_symlink_s0(pyramid_path, s0_source_path, zarr_format=2):
     # the source's own format — see Meshify._build_missing_pyramid_scales
     # — so this is mostly a safety net for n5/precomputed sources, which
     # can't be represented as a zarr array at all.)
-    expected_driver = "zarr3" if zarr_format == 3 else "zarr"
+    expected_format = "zarr3" if zarr_format == 3 else "zarr2"
     try:
-        from mesh_n_bone.util.image_data_interface import detect_driver
-        actual_driver = detect_driver(s0_source_path)
-        if actual_driver != expected_driver:
+        import worldarray as wa
+        actual_format = wa.detect(s0_source_path).format
+        if actual_format != expected_format:
             logger.warning(
                 "pyramid_builder: not symlinking s0 from %s into %s — "
                 "source format (%s) doesn't match this pyramid's "
                 "zarr_format=%d (%s). s0 stays absent from the pyramid; "
                 "it's still directly browsable at its own real path/URL.",
-                s0_source_path, target, actual_driver, zarr_format, expected_driver,
+                s0_source_path, target, actual_format, zarr_format, expected_format,
             )
             return False
     except Exception as e:

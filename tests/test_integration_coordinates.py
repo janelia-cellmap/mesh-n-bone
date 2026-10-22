@@ -381,3 +381,14 @@ class TestPlacementAcrossFormats:
         # Voxels of 1: label at [8, 24) occupies world [8, 24).
         np.testing.assert_allclose(mesh.bounds[0], [8.0] * 3, atol=0.1)
         np.testing.assert_allclose(mesh.bounds[1], [24.0] * 3, atol=0.1)
+
+    def test_voxel_size_nm_scales_the_translation_too(self, tmp_output_dir):
+        # An unplaced array given voxels of 4 nm: its corner stays at the
+        # origin, so the cube lands where the 4 nm stores put it.
+        path = self._write_store(os.path.join(tmp_output_dir, "plain"), "unplaced")
+        out = os.path.join(tmp_output_dir, "out_plain_nm")
+        _run_meshify(path, out, voxel_size_nm=[self.VOXEL] * 3)
+        mesh = trimesh.load(os.path.join(out, "meshes", "1.ply"))
+        tol = 0.1 * self.VOXEL
+        np.testing.assert_allclose(mesh.bounds[0], [self.TRUTH[0]] * 3, atol=tol)
+        np.testing.assert_allclose(mesh.bounds[1], [self.TRUTH[1]] * 3, atol=tol)

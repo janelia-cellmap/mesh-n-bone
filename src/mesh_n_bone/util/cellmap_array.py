@@ -57,7 +57,7 @@ class CellMapArray:
 
     @property
     def chunk_shape(self):
-        return Coordinate(self.data.chunk_shape)
+        return Coordinate(self.data.chunk_shape[i] for i in self.data.spatial)
 
     @property
     def shape(self):

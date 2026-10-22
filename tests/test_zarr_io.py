@@ -157,3 +157,58 @@ class TestOpenDatasetOmeFallback:
         assert ds.shape == (4, 4, 4)
         assert ds._dataset_path == f"{url}/seg/s0"
         assert tuple(ds.true_voxel_size) == (8.5, 16.5, 32.5)
+
+
+def _precomputed_scales(path, scales, num_channels=1, data=None):
+    """Write a precomputed volume with one scale per ``(key, resolution,
+    size)``; *data* (x, y, z, c) fills the first scale."""
+    import tensorstore as ts
+
+    for i, (key, resolution, size) in enumerate(scales):
+        spec = {
+            "driver": "neuroglancer_precomputed",
+            "kvstore": {"driver": "file", "path": path},
+            "scale_metadata": {"resolution": resolution, "size": size,
+                               "chunk_size": size, "encoding": "raw", "key": key},
+        }
+        if i == 0:
+            spec["multiscale_metadata"] = {"type": "segmentation", "data_type": "uint32",
+                                           "num_channels": num_channels}
+        store = ts.open(spec, create=True).result()
+        if i == 0 and data is not None:
+            store.write(data).result()
+
+
+class TestOpenDatasetLevels:
+    def test_precomputed_scale_key_opens_that_scale(self, tmp_output_dir):
+        path = os.path.join(tmp_output_dir, "pc")
+        _precomputed_scales(path, [("4nm", [4, 4, 4], [8, 8, 8]),
+                                   ("8nm", [8, 8, 8], [4, 4, 4])])
+
+        ds = open_dataset(f"{path}/8nm")
+
+        assert tuple(ds.true_voxel_size) == (8, 8, 8)
+        assert ds._dataset_path.endswith("8nm")
+        # The volume root still opens at its first scale.
+        assert tuple(open_dataset(path).true_voxel_size) == (4, 4, 4)
+
+    def test_multichannel_precomputed_reads_channel_zero(self, tmp_output_dir):
+        from funlib.geometry import Roi
+        from mesh_n_bone.util.image_data_interface import open_volume, read_block
+
+        path = os.path.join(tmp_output_dir, "pc2")
+        data = np.zeros((8, 8, 8, 2), dtype=np.uint32)
+        data[..., 0] = 1
+        data[..., 1] = 2
+        _precomputed_scales(path, [("s0", [4, 4, 4], [8, 8, 8])],
+                            num_channels=2, data=data)
+
+        ds = open_dataset(path)
+        block = read_block(
+            open_volume(path), Roi(ds.roi.offset, (16, 16, 16)),
+            ds.voxel_size, ds.roi.offset,
+        )
+
+        assert block.shape == (4, 4, 4)
+        assert np.all(block == 1)
+        assert len(ds.chunk_shape) == 3

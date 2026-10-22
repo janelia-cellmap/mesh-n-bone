@@ -39,21 +39,21 @@ _OME_UNIT_TO_ABBREVIATION = {
 }
 
 
-def _snap_roi_to_voxels(seg_array, roi):
-    """Return the voxels whose centres lie in world *roi*, as a Roi in
-    *seg_array*'s integer frame (voxel ``i`` at ``roi.offset + i *
-    voxel_size``).
+def _snap_roi_to_voxels(seg_array, begin, end):
+    """Return the voxels whose centres lie in the world box [*begin*,
+    *end*), as a Roi in *seg_array*'s integer frame (voxel ``i`` at
+    ``roi.offset + i * voxel_size``).
 
     A ROI aligned to voxel corners and one aligned to voxel centres both
     select whole voxels (worldarray's world-box rule), so a ROI written
     against either convention keeps meshing the voxels it always did.
     """
     lo, hi = index_range(
-        roi.begin, roi.end, seg_array.true_voxel_size, seg_array.true_offset,
+        begin, end, seg_array.true_voxel_size, seg_array.true_offset,
     )
     vs = seg_array.voxel_size
-    begin = seg_array.roi.offset + Coordinate(lo) * vs
-    return Roi(begin, Coordinate(np.subtract(hi, lo)) * vs)
+    origin = seg_array.roi.offset + Coordinate(lo) * vs
+    return Roi(origin, Coordinate(np.subtract(hi, lo)) * vs)
 
 
 try:
@@ -1118,31 +1118,40 @@ class Meshify:
             if voxel_size_nm.shape == (1,):
                 voxel_size_nm = np.repeat(voxel_size_nm, 3)
             logger.info(f"Using user-specified voxel_size_nm {voxel_size_nm}")
+            # The translation is in the stored voxel size's units, so it
+            # scales with it.
+            self.true_offset = self.true_offset * (
+                voxel_size_nm / self.true_voxel_size
+            )
             self.true_voxel_size = voxel_size_nm.copy()
 
         if roi is not None:
-            if not isinstance(roi, Roi):
-                # Accept dict with offset+shape or begin+end from YAML config
-                if isinstance(roi, dict):
-                    if "begin" in roi and "end" in roi:
-                        begin = Coordinate(roi["begin"])
-                        end = Coordinate(roi["end"])
-                        roi = Roi(begin, end - begin)
-                    elif "offset" in roi and "shape" in roi:
-                        roi = Roi(
-                            Coordinate(roi["offset"]),
-                            Coordinate(roi["shape"]),
-                        )
-                    else:
-                        raise ValueError(
-                            "roi dict must have 'offset'+'shape' or 'begin'+'end' keys"
-                        )
+            # Accept a Roi, or a dict with offset+shape or begin+end from
+            # YAML config. Bounds stay floats: _snap_roi_to_voxels picks
+            # the voxels whose centres lie inside them.
+            if isinstance(roi, Roi):
+                begin, end = roi.begin, roi.end
+            elif isinstance(roi, dict):
+                if "begin" in roi and "end" in roi:
+                    begin, end = roi["begin"], roi["end"]
+                elif "offset" in roi and "shape" in roi:
+                    begin = roi["offset"]
+                    end = np.add(roi["offset"], roi["shape"])
                 else:
                     raise ValueError(
-                        "roi must be a Roi object or a dict with "
-                        "'offset'+'shape' or 'begin'+'end' keys"
+                        "roi dict must have 'offset'+'shape' or 'begin'+'end' keys"
                     )
-            self.roi = _snap_roi_to_voxels(self.segmentation_array, roi)
+            else:
+                raise ValueError(
+                    "roi must be a Roi object or a dict with "
+                    "'offset'+'shape' or 'begin'+'end' keys"
+                )
+            # Kept in world units so each multiscale level snaps it to
+            # its own voxels (_generate_meshes_at_scale).
+            self._roi_world = (
+                np.asarray(begin, dtype=float), np.asarray(end, dtype=float),
+            )
+            self.roi = _snap_roi_to_voxels(self.segmentation_array, *self._roi_world)
             self.has_custom_roi = True
         else:
             self.roi = self.segmentation_array.roi
@@ -1872,7 +1881,7 @@ class Meshify:
                 self.output_voxel_size_funlib[::-1]
             )
             if int_origin is None:
-                int_origin = self.roi.offset
+                int_origin = self.segmentation_array.roi.offset
             int_offset_xyz = np.array(int_origin[::-1], dtype=float)
             true_offset_xyz = np.array(
                 getattr(self, "true_offset", int_origin)[::-1], dtype=float
@@ -2066,9 +2075,10 @@ class Meshify:
                 self.true_offset = new_arr.true_offset.copy()
                 self._dataset_origin = new_arr.roi.offset
                 self.downsample_factor = None
-                # Refresh ROI when we didn't have a custom one. For a
-                # custom ROI we keep the user-specified world bbox.
-                if not self.has_custom_roi:
+                # A custom ROI is snapped to this level's own voxels.
+                if self.has_custom_roi:
+                    self.roi = _snap_roi_to_voxels(new_arr, *self._roi_world)
+                else:
                     self.roi = new_arr.roi
             elif downsample_factor is not None:
                 self.downsample_factor = downsample_factor
@@ -2144,9 +2154,19 @@ class Meshify:
                 )
                 pyramid = wa.open_pyramid(self._dataset_path, units=None)
                 # A lone array is a pyramid of one level: nothing to reuse.
-                levels = pyramid.levels if len(pyramid) > 1 else ()
-                for level in levels:
-                    ratios = np.asarray(level.voxel_size, dtype=float) / input_scale
+                names = pyramid.names if len(pyramid) > 1 else ()
+                for name in names:
+                    # Each level's metadata documents only, no tensorstore
+                    # opened; a missing or unreadable level is skipped.
+                    try:
+                        meta = pyramid.level_meta(name)
+                    except Exception as e:
+                        logger.warning(
+                            "Skipping multiscale level %s (%s).", name, e,
+                        )
+                        continue
+                    voxel_size = [meta.voxel_size[i] for i in meta.spatial]
+                    ratios = np.asarray(voxel_size, dtype=float) / input_scale
                     if not np.allclose(ratios, ratios[0], rtol=0, atol=1e-6):
                         continue
                     ratio = float(ratios[0])
@@ -2157,7 +2177,7 @@ class Meshify:
                         continue
                     if ratio_int < 1 or (ratio_int & (ratio_int - 1)) != 0:
                         continue
-                    result[ratio_int] = level.meta.path
+                    result[ratio_int] = meta.path
         except Exception as e:
             logger.warning(
                 "Could not discover existing multiscale levels (%s); "
