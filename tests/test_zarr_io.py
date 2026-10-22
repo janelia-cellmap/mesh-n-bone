@@ -179,6 +179,40 @@ def _precomputed_scales(path, scales, num_channels=1, data=None):
             store.write(data).result()
 
 
+class TestOpenDatasetFunlibOnParent:
+    """Funlib ``voxel_size``/``offset`` on the parent group place an
+    array that has no placement attrs of its own; ``offset`` is voxel
+    0's corner, so the translation (its centre) is half a voxel on."""
+
+    @pytest.mark.parametrize("fmt", ["zarr", "n5"])
+    def test_parent_funlib_attrs(self, tmp_output_dir, fmt):
+        import json
+        import tensorstore as ts
+
+        group = os.path.join(tmp_output_dir, f"parent.{fmt}")
+        os.makedirs(group)
+        attrs = {"voxel_size": [16, 16, 16], "offset": [32, 32, 32]}
+        if fmt == "zarr":
+            with open(os.path.join(group, ".zgroup"), "w") as f:
+                json.dump({"zarr_format": 2}, f)
+            with open(os.path.join(group, ".zattrs"), "w") as f:
+                json.dump(attrs, f)
+            metadata = {"shape": [8, 8, 8], "chunks": [8, 8, 8], "dtype": "|u1"}
+        else:
+            with open(os.path.join(group, "attributes.json"), "w") as f:
+                json.dump({"n5": "2.5.0", **attrs}, f)
+            metadata = {"dimensions": [8, 8, 8], "blockSize": [8, 8, 8],
+                        "dataType": "uint8", "compression": {"type": "raw"}}
+        ts.open({"driver": fmt, "kvstore": {"driver": "file",
+                                            "path": os.path.join(group, "seg")},
+                 "metadata": metadata}, create=True).result()
+
+        ds = open_dataset(os.path.join(group, "seg"))
+
+        assert tuple(ds.true_voxel_size) == (16, 16, 16)
+        assert tuple(ds.true_offset) == (40, 40, 40)
+
+
 class TestOpenDatasetLevels:
     def test_precomputed_scale_key_opens_that_scale(self, tmp_output_dir):
         path = os.path.join(tmp_output_dir, "pc")

@@ -23,9 +23,7 @@ def open_volume(path, context=None):
     """
     if context is None:
         context = wa.capped_context()
-    node = wa.detect(path)
-    level = "first" if node.kind == "group" and node.scale_key is None else None
-    return wa.open(path, level=level, units=None, context=context)
+    return wa.open(path, level="first", units=None, context=context)
 
 
 def read_block(volume, roi, voxel_size, offset, fill_value=0):
