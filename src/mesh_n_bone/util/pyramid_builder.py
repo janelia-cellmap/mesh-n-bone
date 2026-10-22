@@ -8,8 +8,11 @@ arrays once, in parallel chunks, so each LOD reads pre-built
 properly-chunked data.
 
 Output layout: ``{output_directory}/_intermediate_scales.zarr`` is an
-OME-NGFF v0.4 multiscales group containing ``s0`` (symlinked to the
-source on local filesystems; copy or skip for remote) plus ``s1..s_n``.
+OME-NGFF multiscales group (0.4 in zarr v2, 0.5 in zarr v3) containing
+``s0`` (symlinked to the source on local filesystems; copy or skip for
+remote) plus ``s1..s_n``. Levels are created, placed and written through
+worldarray: level ``k`` covers s0 voxels from the aligned ROI origin on,
+and its OME-NGFF translation says so.
 
 Per-axis factors handle anisotropic voxels. Standard practice:
 downsample by 2x along axes whose voxel size is within ~50% of the
@@ -24,19 +27,22 @@ edge, two modes are available:
   max per-axis factor times s0 voxel size, dropping a small fringe of
   data (up to ``max_factor - 1`` s0 voxels per edge).
 - ``halo``: keep the ROI exact, read beyond the ROI when a cube needs
-  it (clipped to dataset bounds). No data loss.
+  it. Where that reaches past the dataset, the cube is padded with 0.
+  No data loss.
+
+Every block is read whole (padded past the dataset) so that each level
+write covers whole chunks: worldarray only writes whole chunks without
+coordination, which is what lets many dask workers fill one level.
 """
 
 from __future__ import annotations
 
-import json
 import logging
-import math
 import os
 import shutil
-from typing import Any
 
 import numpy as np
+import worldarray as wa
 
 logger = logging.getLogger(__name__)
 
@@ -53,8 +59,9 @@ def per_lod_factors_for_anisotropy(
     """Compute per-axis downsample factors for each LOD.
 
     At each step, an axis is downsampled by 2 if its current voxel size
-    is at or below ``anisotropy_tolerance * min(voxel_size)``. If no
-    axis qualifies (already isotropic), all axes downsample by 2.
+    is at or below ``anisotropy_tolerance * min(voxel_size)`` (the
+    schedule of :func:`worldarray.level_factors`, which gives the
+    per-step factors this compounds).
 
     Returns a list of cumulative (Fz, Fy, Fx) factors per LOD, including
     LOD 0 which is always (1, 1, 1).
@@ -65,20 +72,13 @@ def per_lod_factors_for_anisotropy(
         LOD 2: (4, 4, 2)  voxel=[32, 32, 40]
         LOD 3: (8, 8, 4)  voxel=[64, 64, 80]
     """
-    cur_vs = np.asarray(voxel_size_zyx, dtype=float).copy()
-    cur_factor = np.array([1, 1, 1], dtype=int)
-    out = [tuple(cur_factor.tolist())]
-    for _ in range(1, num_lods):
-        min_vs = cur_vs.min()
-        step = np.ones(3, dtype=int)
-        for ax in range(3):
-            if cur_vs[ax] <= anisotropy_tolerance * min_vs:
-                step[ax] = 2
-        if np.all(step == 1):
-            step[:] = 2
-        cur_factor = cur_factor * step
-        cur_vs = cur_vs * step
-        out.append(tuple(cur_factor.tolist()))
+    out = [(1, 1, 1)]
+    steps = wa.level_factors(
+        [float(v) for v in voxel_size_zyx], anisotropy_tolerance,
+        max_levels=max(0, num_lods - 1),
+    )
+    for step in steps:
+        out.append(tuple(int(f * s) for f, s in zip(out[-1], step)))
     return out
 
 
@@ -130,73 +130,26 @@ def align_roi_voxels(
 
 
 # ---------------------------------------------------------------------------
-# OME-NGFF multiscales metadata
+# Level placement
 # ---------------------------------------------------------------------------
 
 
-def build_multiscales_metadata(
-    s0_voxel_size_zyx: list[float],
-    s0_translation_zyx: list[float],
-    per_lod_factors: list[tuple[int, int, int]],
-    axes: list[str] = ("z", "y", "x"),
-    unit: str = "nanometer",
-    version: str = "0.4",
-) -> dict[str, Any]:
-    """Build an OME-NGFF multiscales metadata dict for a pyramid.
+def level_placements(
+    s0_voxel_size_zyx, s0_translation_zyx, per_lod_factors, origin_voxels=0,
+) -> list[tuple[tuple[float, ...], tuple[float, ...]]]:
+    """``(voxel_size, translation)`` of each level, translation being
+    voxel 0's centre as in OME-NGFF.
 
-    Translation per level uses the OME convention from cellmap-analyze
-    (voxel centers): ``tr_k_axis = tr_0_axis + 0.5 * vs0_axis * (F_k_axis - 1)``
-    where ``F_k_axis`` is the cumulative downsample factor at LOD k.
+    Level ``k``'s voxel ``j`` covers s0 voxels ``origin + j * F_k`` to
+    ``origin + (j + 1) * F_k - 1``, where ``origin`` is the aligned ROI
+    origin in s0 voxels, so each level is placed from that origin rather
+    than from s0's voxel 0 (:func:`worldarray.level_placement`).
     """
-    s0_vs = np.asarray(s0_voxel_size_zyx, dtype=float)
-    s0_tr = np.asarray(s0_translation_zyx, dtype=float)
-    datasets = []
-    for k, factor in enumerate(per_lod_factors):
-        f = np.asarray(factor, dtype=float)
-        vs_k = (s0_vs * f).tolist()
-        tr_k = (s0_tr + 0.5 * s0_vs * (f - 1.0)).tolist()
-        datasets.append({
-            "path": f"s{k}",
-            "coordinateTransformations": [
-                {"type": "scale", "scale": vs_k},
-                {"type": "translation", "translation": tr_k},
-            ],
-        })
-    return {
-        "multiscales": [{
-            "version": version,
-            "name": "",
-            "axes": [{"name": a, "type": "space", "unit": unit} for a in axes],
-            "datasets": datasets,
-        }],
-    }
-
-
-def write_multiscales_metadata(
-    group_path: str, metadata: dict[str, Any], zarr_format: int = 2,
-) -> None:
-    """Persist multiscales attrs at the zarr group root.
-
-    Writes ``.zattrs`` for zarr v2 layout or ``zarr.json`` for v3.
-    """
-    os.makedirs(group_path, exist_ok=True)
-    if zarr_format == 2:
-        with open(os.path.join(group_path, ".zattrs"), "w") as f:
-            json.dump(metadata, f, indent=2)
-        # Also need a minimal .zgroup
-        zg_path = os.path.join(group_path, ".zgroup")
-        if not os.path.exists(zg_path):
-            with open(zg_path, "w") as f:
-                json.dump({"zarr_format": 2}, f)
-    elif zarr_format == 3:
-        with open(os.path.join(group_path, "zarr.json"), "w") as f:
-            json.dump({
-                "zarr_format": 3,
-                "node_type": "group",
-                "attributes": metadata,
-            }, f, indent=2)
-    else:
-        raise ValueError(f"unsupported zarr_format: {zarr_format}")
+    origin = tuple(int(o) for o in np.broadcast_to(origin_voxels, (3,)))
+    return [
+        wa.level_placement(s0_voxel_size_zyx, s0_translation_zyx, factor, origin)
+        for factor in per_lod_factors
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -252,15 +205,30 @@ def downsample_super_chunk(
 
 
 # ---------------------------------------------------------------------------
-# Dask-cluster worker: runs ONE super-chunk task in a dask worker process.
+# Dask-cluster worker: runs ONE block task in a dask worker process.
 # Module-level so the function reference is picklable for dask.
 # ---------------------------------------------------------------------------
 
 
-# Per-worker-process cache: tensorstore handles, keyed by path.
+# Per-worker-process cache: worldarray handles, keyed by path.
 # Open is non-trivial (info-file fetch) — caching saves time across the
 # many tasks a single dask worker processes.
 _PYRAMID_WORKER_TS_CACHE: dict[str, object] = {}
+
+
+def _downsample_func(method):
+    from mesh_n_bone.meshify.downsample import (
+        downsample_labels_3d,
+        downsample_binary_3d,
+        downsample_labels_3d_suppress_zero,
+    )
+
+    dispatch = {
+        "mode": downsample_labels_3d,
+        "mode_suppress_zero": downsample_labels_3d_suppress_zero,
+        "binary": downsample_binary_3d,
+    }
+    return dispatch[method]
 
 
 def _ts_handle_for_input(dataset_path):
@@ -272,185 +240,132 @@ def _ts_handle_for_input(dataset_path):
     return handle
 
 
-def _ts_handle_for_output(path, zarr_format=2):
-    """Open a pyramid-owned zarr array (one we created, or the immediately
-    preceding cascade level, per this pyramid's own ``zarr_format``) for
-    read/write. Not for arbitrary external arrays — see
-    ``_ts_handle_for_input`` for those (driver auto-detected)."""
-    cache_key = (path, zarr_format)
+def _open_level(path):
+    """Open a level this pyramid created, for reading and writing. Not
+    for arbitrary external arrays — see ``_ts_handle_for_input`` for
+    those."""
+    cache_key = ("level", path)
     if cache_key in _PYRAMID_WORKER_TS_CACHE:
         return _PYRAMID_WORKER_TS_CACHE[cache_key]
-    import tensorstore as ts
-    from worldarray import capped_context_spec
-    handle = ts.open({
-        "driver": "zarr3" if zarr_format == 3 else "zarr",
-        "kvstore": {"driver": "file", "path": path},
-        "open": True,
-        # Cap thread pools + disable decoded-chunk cache. Without this
-        # the output handle's cache_pool accumulates encoded chunks for
-        # the worker's lifetime, OOMing on large super-chunk runs.
-        "context": capped_context_spec(),
-    }).result()
+    # Cap thread pools + disable decoded-chunk cache. Without this
+    # the output handle's cache_pool accumulates encoded chunks for
+    # the worker's lifetime, OOMing on large super-chunk runs.
+    handle = wa.open(path, mode="r+", units=None, context=wa.capped_context())
     _PYRAMID_WORKER_TS_CACHE[cache_key] = handle
     return handle
 
 
-def process_super_chunk_for_dask(sc_origin_tuple, worker_config):
+def _read_s0_box(worker_config, begin, end):
+    """Read s0 voxels ``[begin, end)`` of the source dataset in the
+    meshify worker's frame; the part past the dataset is 0."""
+    from funlib.geometry import Coordinate, Roi
+    from mesh_n_bone.util.image_data_interface import read_block
+
+    ds_offset = Coordinate(worker_config["dataset_offset"])
+    voxel_size = Coordinate(worker_config["voxel_size"])
+    begin, end = np.asarray(begin, dtype=np.int64), np.asarray(end, dtype=np.int64)
+    roi = Roi(
+        ds_offset + Coordinate(begin.tolist()) * voxel_size,
+        Coordinate((end - begin).tolist()) * voxel_size,
+    )
+    s0 = _ts_handle_for_input(worker_config["s0_dataset_path"])
+    return read_block(s0, roi, voxel_size, ds_offset, fill_value=0)
+
+
+def _release_memory():
+    """Force the allocator to hand freed pages back. Without this the
+    worker accumulates read residue across the 8+ blocks it processes
+    before exit (cached handles in _PYRAMID_WORKER_TS_CACHE don't release
+    on their own, and glibc malloc doesn't munmap freed pages without an
+    explicit trim)."""
+    import gc
+    gc.collect()
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except (OSError, AttributeError):
+        pass
+
+
+def process_super_chunk_for_dask(block, worker_config):
     """Process ONE pyramid super-chunk inside a dask worker process.
 
     Module-level + serialization-safe so dask can ship this to LSF workers.
-    ``worker_config`` is a plain dict of strings/tuples/numbers (no numpy
-    arrays, no closures, no opened handles).
+    ``block`` is a :class:`worldarray.Block` of the s0 grid (its write box
+    is the super-chunk, in s0 voxels); ``worker_config`` is a plain dict
+    of strings/tuples/numbers (no numpy arrays, no closures, no opened
+    handles).
 
     Reads its s0 super-chunk, downsamples to each missing LOD via the
-    configured ``downsample_method``, writes each LOD's chunk to the
-    pre-created output zarr arrays under ``worker_config["pyramid_path"]``.
+    configured ``downsample_method``, writes each LOD's chunks to the
+    pre-created output arrays under ``worker_config["pyramid_path"]``.
 
     Returns ``None`` (dask bag collects None values; we don't aggregate).
     """
-    from funlib.geometry import Coordinate, Roi
-    from mesh_n_bone.util.image_data_interface import read_block
-    from mesh_n_bone.meshify.downsample import (
-        downsample_labels_3d,
-        downsample_binary_3d,
-        downsample_labels_3d_suppress_zero,
-    )
-
-    dispatch = {
-        "mode": downsample_labels_3d,
-        "mode_suppress_zero": downsample_labels_3d_suppress_zero,
-        "binary": downsample_binary_3d,
-    }
-    downsample_func = dispatch[worker_config["downsample_method"]]
-
-    sc_origin = np.array(sc_origin_tuple, dtype=np.int64)
-    out_origin = np.array(worker_config["out_origin"], dtype=np.int64)
-    super_chunk_shape = np.array(worker_config["super_chunk_shape"], dtype=np.int64)
-    dataset_shape = np.array(worker_config["dataset_shape"], dtype=np.int64)
+    downsample_func = _downsample_func(worker_config["downsample_method"])
     factors_per_lod = [tuple(f) for f in worker_config["factors_per_lod"]]
-    missing_lods = list(worker_config["missing_lods"])
+    out_origin = np.array(worker_config["out_origin"], dtype=np.int64)
 
-    # Read s0 super-chunk in world coords (same pattern as the meshify worker)
-    ds_offset = Coordinate(worker_config["dataset_offset"])
-    voxel_size = Coordinate(worker_config["voxel_size"])
-    read_end_voxels = np.minimum(sc_origin + super_chunk_shape, dataset_shape)
-    read_size_voxels = read_end_voxels - sc_origin
-    if np.any(read_size_voxels <= 0):
-        return None
-    world_origin = ds_offset + Coordinate(sc_origin.tolist()) * voxel_size
-    world_shape = Coordinate(read_size_voxels.tolist()) * voxel_size
-    roi = Roi(world_origin, world_shape)
+    s0_block = _read_s0_box(worker_config, block.begin, block.end)
 
-    s0 = _ts_handle_for_input(worker_config["s0_dataset_path"])
-    s0_block = read_block(s0, roi, voxel_size, ds_offset, fill_value=0)
-
-    # Downsample + write each LOD's chunk (streaming: drop the buffer after write)
-    for k in missing_lods:
-        f = np.asarray(factors_per_lod[k], dtype=int)
-        trim = (np.array(s0_block.shape) // f) * f
-        block = s0_block[: trim[0], : trim[1], : trim[2]]
-        if block.size == 0:
-            continue
-        ds_block, _ = downsample_func(block, tuple(f.tolist()))
-        ds_origin = sc_origin // f
-        local_origin = ds_origin - (out_origin // f)
-        out_path = os.path.join(worker_config["pyramid_path"], f"s{k}")
-        out_arr = _ts_handle_for_output(out_path, worker_config.get("zarr_format", 2))
-        z, y, x = local_origin.tolist()
-        arr_shape = out_arr.shape
-        zE = min(z + ds_block.shape[0], arr_shape[0])
-        yE = min(y + ds_block.shape[1], arr_shape[1])
-        xE = min(x + ds_block.shape[2], arr_shape[2])
-        out_arr[z:zE, y:yE, x:xE].write(
-            ds_block[: zE - z, : yE - y, : xE - x]
-        ).result()
+    # Downsample + write each LOD's chunks (streaming: drop the buffer after write)
+    for k in worker_config["missing_lods"]:
+        f = np.asarray(factors_per_lod[k], dtype=np.int64)
+        ds_block, _ = downsample_func(s0_block, tuple(f.tolist()))
+        begin = (np.asarray(block.begin) - out_origin) // f
+        out_arr = _open_level(os.path.join(worker_config["pyramid_path"], f"s{k}"))
+        out_arr.write_index(begin, begin + np.asarray(ds_block.shape), ds_block)
         del ds_block
 
-    # Release the big s0 read buffer + force allocator release. Without this
-    # the worker accumulates s0 read residue across the 8+ super-chunks it
-    # processes before exit (cached tensorstore handles in
-    # _PYRAMID_WORKER_TS_CACHE don't release on their own, and glibc malloc
-    # doesn't munmap freed pages without an explicit trim).
     del s0_block
-    import gc
-    gc.collect()
-    try:
-        import ctypes
-        ctypes.CDLL("libc.so.6").malloc_trim(0)
-    except (OSError, AttributeError):
-        pass
-
+    _release_memory()
     return None
 
 
-def process_cascade_chunk_for_dask(sc_origin_tuple, worker_config):
-    """Process ONE cascade super-chunk in a dask worker process.
+def process_cascade_chunk_for_dask(block, worker_config):
+    """Process ONE cascade block in a dask worker process.
 
-    Unlike ``process_super_chunk_for_dask`` (which always reads a
-    world-coordinate region of the *original* source array, with its own
-    offset/voxel-size bookkeeping), this downsamples a single
-    per-axis ``step_factor`` from the immediately preceding pyramid level —
-    a plain, already ZYX-native array starting at voxel (0, 0, 0), in
-    whichever zarr format (``worker_config["zarr_format"]``) this whole
-    pyramid was written in, since it was written by this same builder.
+    ``block`` is a :class:`worldarray.Block` of the level being written,
+    one output chunk. It is downsampled by a single per-axis
+    ``step_factor`` from the immediately preceding pyramid level
+    (``worker_config["read_path"]``), or, for the first level of a chain,
+    from the original source s0 starting at the aligned ROI origin
+    (``worker_config["s0_dataset_path"]`` and ``out_origin``). Either read
+    is padded with 0 past its array, so the write is always the whole
+    chunk.
 
     Module-level so the function reference is picklable for dask.
     """
-    from mesh_n_bone.meshify.downsample import (
-        downsample_labels_3d,
-        downsample_binary_3d,
-        downsample_labels_3d_suppress_zero,
-    )
-
-    dispatch = {
-        "mode": downsample_labels_3d,
-        "mode_suppress_zero": downsample_labels_3d_suppress_zero,
-        "binary": downsample_binary_3d,
-    }
-    downsample_func = dispatch[worker_config["downsample_method"]]
-
-    sc_origin = np.array(sc_origin_tuple, dtype=np.int64)
+    downsample_func = _downsample_func(worker_config["downsample_method"])
     step = np.asarray(worker_config["step_factor"], dtype=np.int64)
-    chunk_step = np.asarray(worker_config["super_chunk_shape"], dtype=np.int64)
-    zarr_format = worker_config.get("zarr_format", 2)
+    begin = np.asarray(block.begin, dtype=np.int64) * step
+    end = np.asarray(block.end, dtype=np.int64) * step
 
-    read_arr = _ts_handle_for_output(worker_config["read_path"], zarr_format)
-    read_shape = np.array(read_arr.shape, dtype=np.int64)
-    read_end = np.minimum(sc_origin + chunk_step, read_shape)
-    read_size = read_end - sc_origin
-    if np.any(read_size <= 0):
-        return None
-    z, y, x = sc_origin.tolist()
-    zE, yE, xE = read_end.tolist()
-    block = read_arr[z:zE, y:yE, x:xE].read().result()
+    if "read_path" in worker_config:
+        data = _open_level(worker_config["read_path"]).read_index(begin, end, padding=0)
+    else:
+        out_origin = np.asarray(worker_config["out_origin"], dtype=np.int64)
+        data = _read_s0_box(worker_config, out_origin + begin, out_origin + end)
 
-    trim = (np.array(block.shape) // step) * step
-    block = block[: trim[0], : trim[1], : trim[2]]
-    if block.size == 0:
-        return None
-    ds_block, _ = downsample_func(block, tuple(step.tolist()))
+    ds_block, _ = downsample_func(data, tuple(step.tolist()))
+    _open_level(worker_config["write_path"]).write_index(block.begin, block.end, ds_block)
+    del data, ds_block
 
-    write_origin = sc_origin // step
-    out_arr = _ts_handle_for_output(worker_config["write_path"], zarr_format)
-    oz, oy, ox = write_origin.tolist()
-    arr_shape = out_arr.shape
-    ozE = min(oz + ds_block.shape[0], arr_shape[0])
-    oyE = min(oy + ds_block.shape[1], arr_shape[1])
-    oxE = min(ox + ds_block.shape[2], arr_shape[2])
-    out_arr[oz:ozE, oy:oyE, ox:oxE].write(
-        ds_block[: ozE - oz, : oyE - oy, : oxE - ox]
-    ).result()
-    del block, ds_block
-
-    import gc
-    gc.collect()
-    try:
-        import ctypes
-        ctypes.CDLL("libc.so.6").malloc_trim(0)
-    except (OSError, AttributeError):
-        pass
-
+    _release_memory()
     return None
+
+
+# zstd level 3 for pyramid levels. Label volumes are mostly background,
+# so even a low level shrinks 128^3 uint16 chunks ~100x (4 MiB -> tens
+# of KiB). That matters both for the NRS writes/reads while building and
+# for browsing the kept pyramid over HTTP in neuroglancer. zarr v3 uses
+# the zstd codec; zarr v2 uses blosc with cname="zstd", the v2
+# compressor every zarr reader (zarr-python, tensorstore, neuroglancer)
+# supports.
+_PYRAMID_CODECS = {
+    "zarr3": "zstd",
+    "zarr2": {"id": "blosc", "cname": "zstd", "clevel": 3, "shuffle": 1},
+}
 
 
 def prepare_pyramid_metadata_and_arrays(
@@ -458,53 +373,76 @@ def prepare_pyramid_metadata_and_arrays(
     output_zarr_path,
     factors_per_lod,
     missing_lods,
+    out_origin,
     out_shape,
     out_chunk_shape_voxels,
     dtype,
     s0_voxel_size_zyx,
     s0_translation_zyx,
     zarr_format=2,
+    units="nanometer",
     s0_source_path=None,
 ):
-    """Driver-side setup before dispatching pyramid super-chunks to dask.
+    """Driver-side setup before dispatching pyramid blocks to dask.
 
-    Writes the OME-NGFF multiscales metadata, creates empty output zarr
-    arrays for each missing LOD, and optionally symlinks s0. Returns
-    ``(super_chunk_shape, max_factor)``.
+    Creates an empty output array for each missing LOD, covering the
+    aligned ROI ``[out_origin, out_origin + out_shape)`` of s0 and
+    placed there, with its OME-NGFF multiscales entry; optionally
+    symlinks s0 and lists it too. Returns ``{lod: WorldArray}``, each
+    opened for writing.
     """
-    os.makedirs(output_zarr_path, exist_ok=True)
-    metadata = build_multiscales_metadata(
-        s0_voxel_size_zyx=list(s0_voxel_size_zyx),
-        s0_translation_zyx=list(s0_translation_zyx),
-        per_lod_factors=factors_per_lod,
-        version="0.4",
-    )
-    write_multiscales_metadata(output_zarr_path, metadata, zarr_format=zarr_format)
-
-    out_chunk = np.asarray(out_chunk_shape_voxels, dtype=np.int64)
+    fmt = "zarr3" if zarr_format == 3 else "zarr2"
     out_shape = np.asarray(out_shape, dtype=np.int64)
-    max_factor = np.max(np.array(factors_per_lod), axis=0)
+    placements = level_placements(
+        s0_voxel_size_zyx, s0_translation_zyx, factors_per_lod, out_origin,
+    )
+    levels = {}
     for k in missing_lods:
         f = np.asarray(factors_per_lod[k], dtype=np.int64)
-        lod_shape = ((out_shape + f - 1) // f).tolist()
         ds_path = os.path.join(output_zarr_path, f"s{k}")
-        if os.path.exists(ds_path):
+        # A level left by an earlier run (never s0, which may be a
+        # symlink to the user's input).
+        if os.path.isdir(ds_path) and not os.path.islink(ds_path):
             shutil.rmtree(ds_path)
-        _create_zarr_array(
-            ds_path, shape=lod_shape, chunks=out_chunk.tolist(), dtype=dtype,
-            zarr_format=zarr_format,
+        voxel_size, translation = placements[k]
+        levels[k] = wa.create(
+            ds_path, tuple(((out_shape + f - 1) // f).tolist()), np.dtype(dtype),
+            voxel_size, translation, units=units,
+            chunks=tuple(int(c) for c in out_chunk_shape_voxels),
+            codecs=_PYRAMID_CODECS[fmt], format=fmt,
         )
 
-    if s0_source_path is not None:
-        _try_symlink_s0(output_zarr_path, s0_source_path, zarr_format=zarr_format)
-
-    super_chunk_shape = out_chunk * max_factor
-    return super_chunk_shape, max_factor
+    if s0_source_path is not None and _try_symlink_s0(
+        output_zarr_path, s0_source_path, zarr_format=zarr_format,
+    ):
+        # s0 is the whole source array, placed as the source is.
+        wa.ensure_group_entry(
+            output_zarr_path, "s0", list(s0_voxel_size_zyx),
+            list(s0_translation_zyx), axes=("z", "y", "x"), units=units,
+        )
+    return levels
 
 
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
+
+
+def _padded_reader(s0_reader, dataset_shape, dtype):
+    """``read(begin, end)`` over ``s0_reader``: s0 voxels ``[begin,
+    end)``, with the part past the dataset filled with 0."""
+    def read(begin, end):
+        begin = np.asarray(begin, dtype=np.int64)
+        end = np.asarray(end, dtype=np.int64)
+        lo = np.clip(begin, 0, dataset_shape)
+        hi = np.clip(end, 0, dataset_shape)
+        out = np.zeros(tuple((end - begin).tolist()), dtype=dtype)
+        if np.all(hi > lo):
+            out[tuple(slice(a, b) for a, b in zip(lo - begin, hi - begin))] = (
+                s0_reader(lo, hi - lo)
+            )
+        return out
+    return read
 
 
 def build_missing_pyramid_levels(
@@ -524,6 +462,7 @@ def build_missing_pyramid_levels(
     alignment_mode: str = "snap",
     anisotropy_tolerance: float = 1.5,
     zarr_format: int = 2,
+    units: str = "nanometer",
     s0_source_path: str | None = None,
     dispatch=None,
     num_workers: int = 1,
@@ -605,32 +544,23 @@ def build_missing_pyramid_levels(
         logger.info("pyramid_builder: all required scales already present")
         return output_zarr_path
 
-    # Emit OME-NGFF metadata (covering ALL levels including s0 for completeness)
-    metadata = build_multiscales_metadata(
+    # Create the placed, empty level arrays (and link + list s0)
+    out_chunk = np.asarray(out_chunk_shape_voxels, dtype=np.int64)
+    out_arrays = prepare_pyramid_metadata_and_arrays(
+        output_zarr_path=output_zarr_path,
+        factors_per_lod=factors_per_lod,
+        missing_lods=[k for k, _ in missing],
+        out_origin=out_origin,
+        out_shape=out_shape,
+        out_chunk_shape_voxels=out_chunk.tolist(),
+        dtype=dtype,
         s0_voxel_size_zyx=voxel_size.tolist(),
         s0_translation_zyx=translation.tolist(),
-        per_lod_factors=factors_per_lod,
-        version="0.4",
+        zarr_format=zarr_format,
+        units=units,
+        s0_source_path=s0_source_path,
     )
-    write_multiscales_metadata(output_zarr_path, metadata, zarr_format=zarr_format)
-
-    # Create empty zarr arrays for each missing level
-    out_chunk = np.asarray(out_chunk_shape_voxels, dtype=np.int64)
-    out_arrays = {}
-    for k, factor in missing:
-        f = np.asarray(factor, dtype=np.int64)
-        lod_shape = ((out_shape + f - 1) // f).tolist()
-        ds_path = os.path.join(output_zarr_path, f"s{k}")
-        if os.path.exists(ds_path):
-            shutil.rmtree(ds_path)
-        out_arrays[k] = _create_zarr_array(
-            ds_path, shape=lod_shape, chunks=out_chunk.tolist(), dtype=dtype,
-            zarr_format=zarr_format,
-        )
-
-    # Optionally symlink s0
-    if s0_source_path is not None:
-        _try_symlink_s0(output_zarr_path, s0_source_path, zarr_format=zarr_format)
+    read_s0 = _padded_reader(s0_reader, dataset_shape, np.dtype(dtype))
 
     def _run_chunk_grid(sc_grid, process_one, label):
         n_chunks = len(sc_grid)
@@ -678,31 +608,27 @@ def build_missing_pyramid_levels(
 
     if not cascade:
         # Direct: one super-chunk pass computes EVERY missing LOD from a
-        # single s0 read.
+        # single s0 read. The grid may reach past the dataset (halo).
         super_chunk_shape = out_chunk * max_factor
-        sc_grid = []
-        for z0 in range(int(out_origin[0]), int(out_origin[0] + out_shape[0]), int(super_chunk_shape[0])):
-            for y0 in range(int(out_origin[1]), int(out_origin[1] + out_shape[1]), int(super_chunk_shape[1])):
-                for x0 in range(int(out_origin[2]), int(out_origin[2] + out_shape[2]), int(super_chunk_shape[2])):
-                    sc_grid.append(np.array([z0, y0, x0], dtype=np.int64))
+        sc_grid = wa.blocks(
+            tuple(dataset_shape.tolist()), tuple(super_chunk_shape.tolist()),
+            box=(tuple(out_origin.tolist()), tuple((out_origin + out_shape).tolist())),
+        )
 
-        def _process_super_chunk(sc_origin):
-            read_end = np.minimum(sc_origin + super_chunk_shape, dataset_shape)
-            read_size = read_end - sc_origin
-            s0_block = s0_reader(sc_origin, read_size)
+        def _process_super_chunk(block):
+            s0_block = read_s0(block.begin, block.end)
 
-            def _write_one(k, ds_block, ds_origin):
+            def _write_one(k, ds_block, _ds_origin):
                 if k not in out_arrays:
                     return
-                arr = out_arrays[k]
                 f = np.asarray(factors_per_lod[k], dtype=np.int64)
-                local_origin = ds_origin - (out_origin // f)
-                _write_zarr_v2_region(arr, local_origin, ds_block)
+                begin = (np.asarray(block.begin) - out_origin) // f
+                out_arrays[k].write_index(begin, begin + np.asarray(ds_block.shape), ds_block)
 
             # Stream each LOD's output: compute → write → drop the buffer.
             # Peak memory per task ≈ s0_block + one_lod_output.
             downsample_super_chunk(
-                s0_block, sc_origin, factors_per_lod,
+                s0_block, np.asarray(block.begin), factors_per_lod,
                 downsample_func, out_chunk,
                 write_chunk=_write_one,
             )
@@ -716,6 +642,7 @@ def build_missing_pyramid_levels(
         # nearest predecessor this call ALSO just built. A gap (the
         # predecessor was already present in existing_factors, so we have
         # no reader for it here) resets the chain to read s0 directly.
+        # Each pass tiles the level being written by its chunks.
         prev_k, prev_factor = None, (1, 1, 1)
         for k, factor in missing:
             read_from_s0 = not (prev_k is not None and k == prev_k + 1)
@@ -723,52 +650,25 @@ def build_missing_pyramid_levels(
                 int(a // b) for a, b in zip(factor, prev_factor)
             )
             step_arr = np.asarray(step, dtype=np.int64)
-            chunk_step = out_chunk * step_arr
             out_arr = out_arrays[k]
 
             if read_from_s0:
-                grid_origin, grid_shape, bound_shape = out_origin, out_shape, dataset_shape
-                prev_arr = None
+                def read(begin, end):
+                    return read_s0(out_origin + begin, out_origin + end)
             else:
-                grid_origin = np.zeros(3, dtype=np.int64)
-                # The level this call wrote one step ago, read back
-                # through its own tensorstore handle.
-                prev_arr = out_arrays[prev_k]
-                grid_shape = np.asarray(prev_arr.shape, dtype=np.int64)
-                bound_shape = grid_shape
+                # The level this call wrote one step ago.
+                def read(begin, end, prev_arr=out_arrays[prev_k]):
+                    return prev_arr.read_index(begin, end, padding=0)
 
-            sc_grid = []
-            for z0 in range(int(grid_origin[0]), int(grid_origin[0] + grid_shape[0]), int(chunk_step[0])):
-                for y0 in range(int(grid_origin[1]), int(grid_origin[1] + grid_shape[1]), int(chunk_step[1])):
-                    for x0 in range(int(grid_origin[2]), int(grid_origin[2] + grid_shape[2]), int(chunk_step[2])):
-                        sc_grid.append(np.array([z0, y0, x0], dtype=np.int64))
-
-            def _process_cascade_chunk(sc_origin, chunk_step=chunk_step, bound_shape=bound_shape,
-                                        read_from_s0=read_from_s0, prev_arr=prev_arr,
-                                        step_arr=step_arr, out_origin_for_read=out_origin,
-                                        out_arr=out_arr):
-                read_end = np.minimum(sc_origin + chunk_step, bound_shape)
-                read_size = read_end - sc_origin
-                if np.any(read_size <= 0):
-                    return
-                if read_from_s0:
-                    block = s0_reader(sc_origin, read_size)
-                    write_origin = (sc_origin // step_arr) - (out_origin_for_read // step_arr)
-                else:
-                    z, y, x = sc_origin.tolist()
-                    zE, yE, xE = read_end.tolist()
-                    block = prev_arr[z:zE, y:yE, x:xE].read().result()
-                    write_origin = sc_origin // step_arr
-
-                trim = (np.array(block.shape) // step_arr) * step_arr
-                block = block[: trim[0], : trim[1], : trim[2]]
-                if block.size == 0:
-                    return
-                ds_block, _ = downsample_func(block, tuple(step_arr.tolist()))
-                _write_zarr_v2_region(out_arr, write_origin, ds_block)
+            def _process_cascade_chunk(block, read=read, step_arr=step_arr,
+                                       out_arr=out_arr):
+                begin = np.asarray(block.begin, dtype=np.int64) * step_arr
+                end = np.asarray(block.end, dtype=np.int64) * step_arr
+                ds_block, _ = downsample_func(read(begin, end), tuple(step_arr.tolist()))
+                out_arr.write_index(block.begin, block.end, ds_block)
 
             _run_chunk_grid(
-                sc_grid, _process_cascade_chunk,
+                out_arr.blocks(), _process_cascade_chunk,
                 f"s{k} from {'s0' if read_from_s0 else f's{prev_k}'}, step={step}",
             )
             prev_k, prev_factor = k, factor
@@ -779,141 +679,6 @@ def build_missing_pyramid_levels(
         [factor for _, factor in missing],
     )
     return output_zarr_path
-
-
-# ---------------------------------------------------------------------------
-# Minimal zarr v2/v3 array helpers (no extra deps)
-# ---------------------------------------------------------------------------
-
-
-_TS_DTYPE_MAP = {
-    np.dtype("uint8"): "|u1",
-    np.dtype("uint16"): "<u2",
-    np.dtype("uint32"): "<u4",
-    np.dtype("uint64"): "<u8",
-    np.dtype("int8"): "|i1",
-    np.dtype("int16"): "<i2",
-    np.dtype("int32"): "<i4",
-    np.dtype("int64"): "<i8",
-    np.dtype("float32"): "<f4",
-    np.dtype("float64"): "<f8",
-}
-
-# zarr v3's core spec names data types after their plain numpy names
-# (no byte-order/size prefix like v2's "<u2").
-_TS_V3_DTYPE_MAP = {
-    np.dtype("uint8"): "uint8",
-    np.dtype("uint16"): "uint16",
-    np.dtype("uint32"): "uint32",
-    np.dtype("uint64"): "uint64",
-    np.dtype("int8"): "int8",
-    np.dtype("int16"): "int16",
-    np.dtype("int32"): "int32",
-    np.dtype("int64"): "int64",
-    np.dtype("float32"): "float32",
-    np.dtype("float64"): "float64",
-}
-
-
-# zstd level for pyramid levels. Label volumes are mostly background, so
-# even a low level shrinks 128^3 uint16 chunks ~100x (4 MiB -> tens of KiB).
-# That matters both for the NRS writes/reads while building and for
-# browsing the kept pyramid over HTTP in neuroglancer.
-_PYRAMID_ZSTD_LEVEL = 3
-
-
-def _create_zarr_array(path, shape, chunks, dtype, zarr_format=2):
-    """Create a zarr array on disk via tensorstore and return a handle.
-
-    Uses tensorstore (already a core dep) instead of the optional ``zarr``
-    package so the pyramid builder works in any pixi env that has the
-    base mesh-n-bone install. ``zarr_format`` (2 or 3) should match
-    whatever format this whole pyramid is being written in — see
-    ``_try_symlink_s0`` for why that matters.
-
-    Chunks are zstd-compressed: the ``zstd`` codec for zarr v3, and
-    blosc with ``cname="zstd"`` for zarr v2, the v2 compressor every
-    zarr reader (zarr-python, tensorstore, neuroglancer) supports.
-    """
-    import tensorstore as ts
-    if os.path.exists(path):
-        shutil.rmtree(path)
-    dt = np.dtype(dtype)
-    if zarr_format == 3:
-        ts_dtype = _TS_V3_DTYPE_MAP.get(dt)
-        if ts_dtype is None:
-            raise ValueError(
-                f"Unsupported dtype for pyramid build: {dt}. "
-                f"Add it to _TS_V3_DTYPE_MAP."
-            )
-        spec = {
-            "driver": "zarr3",
-            "kvstore": {"driver": "file", "path": path},
-            "metadata": {
-                "shape": list(shape),
-                "data_type": ts_dtype,
-                "chunk_grid": {
-                    "name": "regular",
-                    "configuration": {"chunk_shape": list(chunks)},
-                },
-                "codecs": [
-                    {"name": "bytes", "configuration": {"endian": "little"}},
-                    {
-                        "name": "zstd",
-                        "configuration": {
-                            "level": _PYRAMID_ZSTD_LEVEL, "checksum": False,
-                        },
-                    },
-                ],
-                "fill_value": 0,
-            },
-            "create": True,
-            "delete_existing": True,
-        }
-    else:
-        ts_dtype = _TS_DTYPE_MAP.get(dt)
-        if ts_dtype is None:
-            raise ValueError(
-                f"Unsupported dtype for pyramid build: {dt}. "
-                f"Add it to _TS_DTYPE_MAP."
-            )
-        spec = {
-            "driver": "zarr",  # zarr v2
-            "kvstore": {"driver": "file", "path": path},
-            "metadata": {
-                "shape": list(shape),
-                "chunks": list(chunks),
-                "dtype": ts_dtype,
-                "compressor": {
-                    "id": "blosc",
-                    "cname": "zstd",
-                    "clevel": _PYRAMID_ZSTD_LEVEL,
-                    "shuffle": 1,
-                },
-                "fill_value": 0,
-                "order": "C",
-            },
-            "create": True,
-            "delete_existing": True,
-        }
-    return ts.open(spec).result()
-
-
-def _write_zarr_v2_region(arr, origin_voxels, data):
-    """Write ``data`` into ``arr`` at the given origin (zyx voxel coords).
-
-    ``arr`` is a tensorstore handle from ``_create_zarr_array`` — despite
-    the name (kept for backwards compatibility), this write path is
-    format-agnostic; it works the same for v2 or v3 handles.
-    """
-    z, y, x = origin_voxels.tolist()
-    shape = arr.shape
-    zE = min(z + data.shape[0], shape[0])
-    yE = min(y + data.shape[1], shape[1])
-    xE = min(x + data.shape[2], shape[2])
-    # Clip the data block to the array bounds (boundary chunks at the edge)
-    clipped = data[: zE - z, : yE - y, : xE - x]
-    arr[z:zE, y:yE, x:xE].write(clipped).result()
 
 
 def _try_symlink_s0(pyramid_path, s0_source_path, zarr_format=2):
@@ -929,15 +694,15 @@ def _try_symlink_s0(pyramid_path, s0_source_path, zarr_format=2):
 
     # This pyramid's own group metadata (.zgroup/.zattrs or zarr.json) and
     # its s1+ arrays are always written in ``zarr_format`` (see
-    # _create_zarr_array). If the real source array is in a DIFFERENT
-    # format, symlinking it in as s0 produces a group that LOOKS complete
-    # but is format-inconsistent: generic OME-zarr multiscale readers
-    # (e.g. neuroglancer) resolve the group's declared format and then
-    # look for THAT format's array metadata inside s0 — which has the
-    # other format's metadata file instead — and fail with something like
-    # "zarr v{version} array metadata not found", even though s0 is
-    # perfectly readable on its own (e.g. with an explicit driver
-    # override). s1+ are unaffected since those really do match.
+    # prepare_pyramid_metadata_and_arrays). If the real source array is in
+    # a DIFFERENT format, symlinking it in as s0 produces a group that
+    # LOOKS complete but is format-inconsistent: generic OME-zarr
+    # multiscale readers (e.g. neuroglancer) resolve the group's declared
+    # format and then look for THAT format's array metadata inside s0 —
+    # which has the other format's metadata file instead — and fail with
+    # something like "zarr v{version} array metadata not found", even
+    # though s0 is perfectly readable on its own (e.g. with an explicit
+    # driver override). s1+ are unaffected since those really do match.
     # Leave s0 absent rather than link in something unreadable through
     # the group's declared format — mesh-n-bone's own LOD-reading logic
     # never depends on this symlink anyway (LOD 0 always reads the real
@@ -948,7 +713,6 @@ def _try_symlink_s0(pyramid_path, s0_source_path, zarr_format=2):
     # can't be represented as a zarr array at all.)
     expected_format = "zarr3" if zarr_format == 3 else "zarr2"
     try:
-        import worldarray as wa
         actual_format = wa.detect(s0_source_path).format
         if actual_format != expected_format:
             logger.warning(

@@ -652,6 +652,40 @@ class TestMeshifyDownsampleAutoBuildPyramid:
         agreement = np.mean(np.asarray(s2) == ref_s2)
         assert agreement > 0.95, f"expected high agreement, got {agreement:.2%}"
 
+    @pytest.mark.parametrize("cascade", [False, True])
+    def test_custom_roi_levels_are_placed_at_the_roi(self, tmp_output_dir, cascade):
+        """A custom ROI starting at s0 voxel 16 builds levels that start
+        there too, and their metadata says so: s1's voxel 0 is centred
+        at 8 * (16 + 0.5) = 132 (voxel 0 of s0 is centred at 0)."""
+        import worldarray as wa
+        from mesh_n_bone.meshify.downsample import downsample_labels_3d
+
+        s0_path, _ = self._create_single_scale_ome_zarr(tmp_output_dir)
+        output_dir = os.path.join(tmp_output_dir, f"out_roi_{cascade}")
+        m = Meshify(
+            input_path=s0_path,
+            output_directory=output_dir,
+            roi={"begin": [128] * 3, "end": [512] * 3},
+            num_workers=1,
+            do_multires=True,
+            num_lods=3,
+            multires_strategy="downsample",
+            downsample_cascade=cascade,
+            delete_intermediate_scales=False,
+            target_faces_per_lod0_chunk=200,
+            check_mesh_validity=False,
+            do_analysis=False,
+            do_simplification=True,
+        )
+        m.get_meshes()
+
+        s0 = wa.open(s0_path)
+        vol = s0.read_index((0, 0, 0), s0.shape)
+        s1 = wa.open(os.path.join(output_dir, "_intermediate_scales.zarr", "s1"))
+        assert s1.translation == (132.0, 132.0, 132.0)
+        ref_s1, _ = downsample_labels_3d(vol[16:64, 16:64, 16:64], (2, 2, 2))
+        np.testing.assert_array_equal(s1.read_index((0, 0, 0), s1.shape), ref_s1)
+
     def test_delete_intermediate_scales_default_cleans_up(self, tmp_output_dir):
         s0_path, _ = self._create_single_scale_ome_zarr(tmp_output_dir)
         output_dir = os.path.join(tmp_output_dir, "out_autobuild_cleanup")

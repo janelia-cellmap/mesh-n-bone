@@ -456,72 +456,39 @@ def _write_assembly_memory_plan(output_directory, estimates, waves):
         json.dump(plan, f, indent=2)
 
 
-def _existing_pyramid_scales(pyramid_path):
-    """Return ``{lod_index: uniform_factor}`` of usable scales on disk, or
-    ``None`` if the pyramid isn't readable.
+def _existing_pyramid_scales(pyramid_path, s0_voxel_size):
+    """Return ``{uniform_factor: level_path}`` of usable scales on disk,
+    or ``None`` if there is no readable pyramid at *pyramid_path*.
 
-    Parses the OME-NGFF v0.4 multiscales metadata — from
-    ``{pyramid_path}/.zattrs`` (zarr v2) or ``{pyramid_path}/zarr.json``
-    (zarr v3, metadata under ``attributes``) — and returns the per-LOD
-    uniform downsample factor (relative to s0) for each dataset whose
-    corresponding array actually exists on disk (``s_k/.zarray`` for v2,
-    ``s_k/zarr.json`` for v3). Used to skip a fresh build when a prior
-    run already wrote the pyramid (e.g. debug re-runs).
-
-    Returns ``None`` when neither metadata file is present/parseable, or
-    doesn't expose multiscales in the expected shape.
+    Reads the pyramid's OME-NGFF multiscales through worldarray (0.4 in
+    zarr v2, 0.5 in zarr v3, or the 0.4 document earlier versions wrote
+    into zarr v3) and returns, for each listed level whose array actually
+    exists, its downsample factor relative to *s0_voxel_size* when that
+    factor is the same whole number > 1 on every axis. Used to skip a
+    fresh build when a prior run already wrote the pyramid (e.g. debug
+    re-runs).
     """
-    zattrs_path = os.path.join(pyramid_path, ".zattrs")
-    zarr_json_path = os.path.join(pyramid_path, "zarr.json")
-    try:
-        if os.path.isfile(zattrs_path):
-            with open(zattrs_path) as f:
-                attrs = json.load(f)
-            array_metadata_name = ".zarray"
-        elif os.path.isfile(zarr_json_path):
-            with open(zarr_json_path) as f:
-                attrs = json.load(f).get("attributes", {})
-            array_metadata_name = "zarr.json"
-        else:
-            return None
-        datasets = attrs["multiscales"][0]["datasets"]
-        # s0's scale per-axis defines the base; s_k's factor = s_k/s_0
-        s0_scale = None
-        for ds in datasets:
-            if ds.get("path") == "s0":
-                for tr in ds.get("coordinateTransformations", []):
-                    if tr.get("type") == "scale":
-                        s0_scale = tr["scale"]
-                        break
-                break
-        if s0_scale is None:
-            return None
-        result = {}
-        for ds in datasets:
-            name = ds.get("path", "")
-            if not name.startswith("s") or not name[1:].isdigit():
-                continue
-            k = int(name[1:])
-            if k == 0:
-                continue
-            scale = None
-            for tr in ds.get("coordinateTransformations", []):
-                if tr.get("type") == "scale":
-                    scale = tr["scale"]
-                    break
-            if scale is None:
-                continue
-            factors = [scale[i] / s0_scale[i] for i in range(3)]
-            if not (factors[0] == factors[1] == factors[2]):
-                continue
-            factor = int(round(factors[0]))
-            # Verify the underlying zarr array actually exists
-            if not os.path.isfile(os.path.join(pyramid_path, name, array_metadata_name)):
-                continue
-            result[k] = factor
-        return result
-    except (KeyError, IndexError, ValueError, json.JSONDecodeError, OSError):
+    if not os.path.isdir(pyramid_path):
         return None
+    try:
+        import worldarray as wa
+        pyramid = wa.open_pyramid(pyramid_path, units=None)
+    except Exception:
+        return None
+    s0_voxel_size = np.asarray(s0_voxel_size, dtype=float)
+    result = {}
+    for name in pyramid.names:
+        try:
+            meta = pyramid.level_meta(name)
+        except Exception:
+            continue  # listed, but its array isn't on disk
+        ratios = np.asarray(
+            [meta.voxel_size[i] for i in meta.spatial], dtype=float,
+        ) / s0_voxel_size
+        factor = int(round(ratios[0]))
+        if factor > 1 and np.allclose(ratios, factor, rtol=0, atol=1e-6):
+            result[factor] = meta.path
+    return result
 
 
 def _safely_remove_pyramid(pyramid_path, num_workers=8):
@@ -2238,16 +2205,15 @@ class Meshify:
         # skip the rebuild and reuse what's there. Useful when re-running a
         # job in the same output dir (e.g. for debugging) so we don't redo
         # the (potentially slow) downsample pass each time.
-        existing_pyramid = _existing_pyramid_scales(pyramid_path)
+        existing_pyramid = _existing_pyramid_scales(pyramid_path, self.true_voxel_size)
         if existing_pyramid is not None:
-            available = {f: f"{pyramid_path}/s{k}" for k, f in existing_pyramid.items()}
             need_factors = {int(factor[0]) for _, factor in needed_uniform}
-            if need_factors.issubset(set(available.keys())):
+            if need_factors.issubset(set(existing_pyramid.keys())):
                 logger.info(
                     "pyramid_builder: reusing existing %s (scales %s)",
                     pyramid_path, sorted(need_factors),
                 )
-                return {f: available[f] for f in need_factors}
+                return {f: existing_pyramid[f] for f in need_factors}
 
         # ROI in voxel coordinates relative to the dataset's own (0, 0, 0)
         seg_arr = self.segmentation_array
@@ -2420,83 +2386,59 @@ class Meshify:
             "cascade" if self.downsample_cascade else "direct-from-source",
         )
 
+        import worldarray as wa
+
+        # What every worker reading the source s0 needs to find it.
+        s0_config = {
+            "s0_dataset_path": dataset_path,
+            "dataset_offset": tuple(int(v) for v in seg_arr.roi.offset),
+            "voxel_size": tuple(int(v) for v in seg_arr.voxel_size),
+            "out_origin": tuple(int(v) for v in aligned_out_origin.tolist()),
+        }
+
         def _build_direct_pass():
-            super_chunk_arr = out_chunk_arr * max_factor
-            sc_grid = []
-            for z0 in range(int(aligned_out_origin[0]),
-                            int(aligned_out_origin[0] + aligned_out_shape[0]),
-                            int(super_chunk_arr[0])):
-                for y0 in range(int(aligned_out_origin[1]),
-                                int(aligned_out_origin[1] + aligned_out_shape[1]),
-                                int(super_chunk_arr[1])):
-                    for x0 in range(int(aligned_out_origin[2]),
-                                    int(aligned_out_origin[2] + aligned_out_shape[2]),
-                                    int(super_chunk_arr[2])):
-                        sc_grid.append((z0, y0, x0))
+            # One grid of super-chunks over the aligned ROI in s0 voxels;
+            # in halo mode it may reach past the dataset.
+            sc_grid = wa.blocks(
+                tuple(int(v) for v in dataset_shape.tolist()),
+                tuple(int(v) for v in (out_chunk_arr * max_factor).tolist()),
+                box=(
+                    tuple(int(v) for v in aligned_out_origin.tolist()),
+                    tuple(int(v) for v in (aligned_out_origin + aligned_out_shape).tolist()),
+                ),
+            )
             worker_config = {
-                "s0_dataset_path": dataset_path,
-                "dataset_offset": tuple(int(v) for v in seg_arr.roi.offset),
-                "voxel_size": tuple(int(v) for v in seg_arr.voxel_size),
-                "dataset_shape": tuple(int(v) for v in dataset_shape.tolist()),
+                **s0_config,
                 "factors_per_lod": [list(f) for f in factors_per_lod_full],
                 "missing_lods": [k for k, _ in needed_uniform],
                 "downsample_method": self.downsample_method,
                 "pyramid_path": pyramid_path,
-                "super_chunk_shape": tuple(int(v) for v in super_chunk_arr.tolist()),
-                "out_origin": tuple(int(v) for v in aligned_out_origin.tolist()),
-                "zarr_format": zarr_format,
             }
             return [(process_super_chunk_for_dask, sc_grid, worker_config, "pyramid (direct)")]
 
         def _build_cascade_passes():
+            # One pass per level, tiling that level by its output chunks;
+            # each chunk reads step x its extent from the level below.
             passes = []
-            prev_shape = None
             for k, factor, step, read_from_s0 in cascade_steps:
-                step_arr = np.asarray(step, dtype=np.int64)
-                chunk_step = out_chunk_arr * step_arr
-
+                f_arr = np.asarray(factor, dtype=np.int64)
+                level_shape = (aligned_out_shape + f_arr - 1) // f_arr
+                sc_grid = wa.blocks(
+                    tuple(int(v) for v in level_shape.tolist()),
+                    tuple(int(v) for v in out_chunk_arr.tolist()),
+                )
+                worker_config = {
+                    "write_path": os.path.join(pyramid_path, f"s{k}"),
+                    "step_factor": list(step),
+                    "downsample_method": self.downsample_method,
+                }
                 if read_from_s0:
-                    grid_origin, grid_shape = aligned_out_origin, aligned_out_shape
-                else:
-                    grid_origin, grid_shape = np.zeros(3, dtype=np.int64), prev_shape
-
-                sc_grid = []
-                for z0 in range(int(grid_origin[0]), int(grid_origin[0] + grid_shape[0]), int(chunk_step[0])):
-                    for y0 in range(int(grid_origin[1]), int(grid_origin[1] + grid_shape[1]), int(chunk_step[1])):
-                        for x0 in range(int(grid_origin[2]), int(grid_origin[2] + grid_shape[2]), int(chunk_step[2])):
-                            sc_grid.append((z0, y0, x0))
-
-                if read_from_s0:
-                    worker_func = process_super_chunk_for_dask
-                    worker_config = {
-                        "s0_dataset_path": dataset_path,
-                        "dataset_offset": tuple(int(v) for v in seg_arr.roi.offset),
-                        "voxel_size": tuple(int(v) for v in seg_arr.voxel_size),
-                        "dataset_shape": tuple(int(v) for v in dataset_shape.tolist()),
-                        "factors_per_lod": [[1, 1, 1]] * k + [list(step)],
-                        "missing_lods": [k],
-                        "downsample_method": self.downsample_method,
-                        "pyramid_path": pyramid_path,
-                        "super_chunk_shape": tuple(int(v) for v in chunk_step.tolist()),
-                        "out_origin": tuple(int(v) for v in aligned_out_origin.tolist()),
-                        "zarr_format": zarr_format,
-                    }
+                    worker_config.update(s0_config)
                     label = f"s{k} (from s0, step={step})"
                 else:
-                    worker_func = process_cascade_chunk_for_dask
-                    worker_config = {
-                        "read_path": os.path.join(pyramid_path, f"s{k - 1}"),
-                        "write_path": os.path.join(pyramid_path, f"s{k}"),
-                        "step_factor": list(step),
-                        "zarr_format": zarr_format,
-                        "super_chunk_shape": tuple(int(v) for v in chunk_step.tolist()),
-                        "downsample_method": self.downsample_method,
-                    }
+                    worker_config["read_path"] = os.path.join(pyramid_path, f"s{k - 1}")
                     label = f"s{k} (from s{k - 1}, step={step})"
-
-                passes.append((worker_func, sc_grid, worker_config, label))
-                f_arr = np.asarray(factor, dtype=np.int64)
-                prev_shape = ((aligned_out_shape + f_arr - 1) // f_arr).astype(np.int64)
+                passes.append((process_cascade_chunk_for_dask, sc_grid, worker_config, label))
             return passes
 
         passes = _build_cascade_passes() if self.downsample_cascade else _build_direct_pass()
@@ -2537,6 +2479,12 @@ class Meshify:
         # each worker another 2× memory).
         max_retries = int(getattr(self, "memory_retry_max", 3))
         attempt_processes = starting_processes
+        # A pyramid an earlier run left that can't be reused (checked
+        # above) is rebuilt from scratch: levels are only ever added to a
+        # group, and the old group may be in another format or list
+        # levels of another ROI.
+        if os.path.lexists(pyramid_path):
+            _safely_remove_pyramid(pyramid_path, num_workers=max(1, int(self.num_workers)))
         for attempt in range(max_retries + 1):
             per_worker_mb = _per_worker_mb_for(attempt_processes)
             logger.info(
@@ -2553,6 +2501,7 @@ class Meshify:
                 output_zarr_path=pyramid_path,
                 factors_per_lod=factors_per_lod_full,
                 missing_lods=[k for k, _ in needed_uniform],
+                out_origin=aligned_out_origin,
                 out_shape=aligned_out_shape,
                 out_chunk_shape_voxels=tuple(out_chunk_shape),
                 dtype=seg_arr.data.dtype,
@@ -2608,7 +2557,7 @@ class Meshify:
                         if not sc_grid:
                             continue
                         npartitions = dask_util.guesstimate_npartitions(len(sc_grid), workers)
-                        bag = db.from_sequence(sc_grid, npartitions=npartitions).map(
+                        bag = db.from_sequence(list(sc_grid), npartitions=npartitions).map(
                             worker_func, worker_config=worker_config,
                         )
                         with Timing_Messager(

@@ -255,6 +255,7 @@ environments:
       - pypi: https://files.pythonhosted.org/packages/46/68/a1c721fdc55a778751e954f770f1c8cbadf6e180d49e550a2e71c256bd52/compresso-3.3.3-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/47/0b/bdf449df87be3f07b23091ceafee8c3ef569cf6d2fb7edec6e3b12b3faa4/bokeh-3.9.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/47/8d/d529b5d697919ba8c11ad626e835d4039be708a35b0d22de83a269a6682c/pyasn1_modules-0.4.2-py3-none-any.whl
+      - pypi: https://files.pythonhosted.org/packages/49/ea/667775e995f24b1a3b68fe0d69e27eff27bcd2003fbcb5ed46bd34bc1010/worldarray-0.3.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/4b/f8/d0118a2f5f23b02cd166fa385c60f9b0d4f9194f574e2b31cef350ad7223/charset_normalizer-3.4.7-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/4e/b7/28dff0bc2f992df437aaeeaeffba8f2f1ec031f054cedfc0390ea4300370/dracopy-2.0.0-cp312-cp312-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/51/ac/e5d886f892666d2d1e5cb8c1a41146e1d79ae8896477b1153a21711d3b44/fasteners-0.20-py3-none-any.whl
@@ -265,7 +266,6 @@ environments:
       - pypi: https://files.pythonhosted.org/packages/58/cf/1070a82c88a89f441e1bbb65a676224847b98247403a03c04b0c49feb0fc/fpzip-1.2.5-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/58/da/459c89f3dbb8344f6b2a374850d13522cc9a89726faea4319568034f1f1f/pysimdjson-7.0.2-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/59/91/aa6bde563e0085a02a435aa99b49ef75b0a4b062635e606dab23ce18d720/inflection-0.5.1-py2.py3-none-any.whl
-      - pypi: https://files.pythonhosted.org/packages/59/a6/e8f1fd486d42924ccf4bf24349827ddfcb16fb897e91e3555db50d040b91/worldarray-0.1.1-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/59/f8/24495180ff0ab4cb3b7b7ce985ca5497897818145d0d35551f0a087fb4f0/funlib.geometry-0.3.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/5a/ea/119e9b64e74762ec279f4c742c353e35602437f29ae3ddc2b0cb43071dba/chardet-7.4.1-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/5d/a0/7d793dce3fa811fe047d6ae2431c672364b462850c6235ae306c0efd025f/pyasn1-0.6.3-py3-none-any.whl
@@ -515,6 +515,7 @@ environments:
       - pypi: https://files.pythonhosted.org/packages/44/73/53f7d2e0ce86c9b850301c1c9165dedbac9ac88a6045aa1cb8ad37176c17/simplejpeg-1.9.0-cp312-cp312-macosx_11_0_arm64.whl
       - pypi: https://files.pythonhosted.org/packages/47/0b/bdf449df87be3f07b23091ceafee8c3ef569cf6d2fb7edec6e3b12b3faa4/bokeh-3.9.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/47/8d/d529b5d697919ba8c11ad626e835d4039be708a35b0d22de83a269a6682c/pyasn1_modules-0.4.2-py3-none-any.whl
+      - pypi: https://files.pythonhosted.org/packages/49/ea/667775e995f24b1a3b68fe0d69e27eff27bcd2003fbcb5ed46bd34bc1010/worldarray-0.3.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/51/ac/e5d886f892666d2d1e5cb8c1a41146e1d79ae8896477b1153a21711d3b44/fasteners-0.20-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/53/3e/405b59cfa13021a56bba395a6b3aca8cec012b45bf177b0eaf7a202cde2c/contourpy-1.3.3-cp312-cp312-macosx_11_0_arm64.whl
       - pypi: https://files.pythonhosted.org/packages/53/b1/320ee3b3d8b1b95f48d02a081f28e23caf9bd044ff11e6c1597ffe65fa2f/chardet-7.4.1-cp312-cp312-macosx_11_0_arm64.whl
@@ -522,7 +523,6 @@ environments:
       - pypi: https://files.pythonhosted.org/packages/57/77/606f138bf70b14865842b3ec9a58dc1ba97153f466e5876fe4ced980f91f/dask_jobqueue-0.9.0-py2.py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/59/8c/77f5097695f4dd8255ecbd08b2a1ed8ba8b953d337804dd7080f199e12bf/tornado-6.5.5-cp39-abi3-macosx_10_9_universal2.whl
       - pypi: https://files.pythonhosted.org/packages/59/91/aa6bde563e0085a02a435aa99b49ef75b0a4b062635e606dab23ce18d720/inflection-0.5.1-py2.py3-none-any.whl
-      - pypi: https://files.pythonhosted.org/packages/59/a6/e8f1fd486d42924ccf4bf24349827ddfcb16fb897e91e3555db50d040b91/worldarray-0.1.1-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/59/f8/24495180ff0ab4cb3b7b7ce985ca5497897818145d0d35551f0a087fb4f0/funlib.geometry-0.3.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/5d/a0/7d793dce3fa811fe047d6ae2431c672364b462850c6235ae306c0efd025f/pyasn1-0.6.3-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/5e/f8/50bfaf4658431ff9de45c5c3935af7ab01157a4903c603cd0eee6e78e087/google_resumable_media-2.8.2-py3-none-any.whl
@@ -827,6 +827,7 @@ environments:
       - pypi: https://files.pythonhosted.org/packages/46/68/a1c721fdc55a778751e954f770f1c8cbadf6e180d49e550a2e71c256bd52/compresso-3.3.3-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/47/0b/bdf449df87be3f07b23091ceafee8c3ef569cf6d2fb7edec6e3b12b3faa4/bokeh-3.9.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/47/8d/d529b5d697919ba8c11ad626e835d4039be708a35b0d22de83a269a6682c/pyasn1_modules-0.4.2-py3-none-any.whl
+      - pypi: https://files.pythonhosted.org/packages/49/ea/667775e995f24b1a3b68fe0d69e27eff27bcd2003fbcb5ed46bd34bc1010/worldarray-0.3.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/4b/f8/d0118a2f5f23b02cd166fa385c60f9b0d4f9194f574e2b31cef350ad7223/charset_normalizer-3.4.7-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/4e/b7/28dff0bc2f992df437aaeeaeffba8f2f1ec031f054cedfc0390ea4300370/dracopy-2.0.0-cp312-cp312-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/51/ac/e5d886f892666d2d1e5cb8c1a41146e1d79ae8896477b1153a21711d3b44/fasteners-0.20-py3-none-any.whl
@@ -836,7 +837,6 @@ environments:
       - pypi: https://files.pythonhosted.org/packages/58/cf/1070a82c88a89f441e1bbb65a676224847b98247403a03c04b0c49feb0fc/fpzip-1.2.5-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/58/da/459c89f3dbb8344f6b2a374850d13522cc9a89726faea4319568034f1f1f/pysimdjson-7.0.2-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/59/91/aa6bde563e0085a02a435aa99b49ef75b0a4b062635e606dab23ce18d720/inflection-0.5.1-py2.py3-none-any.whl
-      - pypi: https://files.pythonhosted.org/packages/59/a6/e8f1fd486d42924ccf4bf24349827ddfcb16fb897e91e3555db50d040b91/worldarray-0.1.1-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/59/f8/24495180ff0ab4cb3b7b7ce985ca5497897818145d0d35551f0a087fb4f0/funlib.geometry-0.3.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/5a/ea/119e9b64e74762ec279f4c742c353e35602437f29ae3ddc2b0cb43071dba/chardet-7.4.1-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/5d/a0/7d793dce3fa811fe047d6ae2431c672364b462850c6235ae306c0efd025f/pyasn1-0.6.3-py3-none-any.whl
@@ -1082,13 +1082,13 @@ environments:
       - pypi: https://files.pythonhosted.org/packages/44/73/53f7d2e0ce86c9b850301c1c9165dedbac9ac88a6045aa1cb8ad37176c17/simplejpeg-1.9.0-cp312-cp312-macosx_11_0_arm64.whl
       - pypi: https://files.pythonhosted.org/packages/47/0b/bdf449df87be3f07b23091ceafee8c3ef569cf6d2fb7edec6e3b12b3faa4/bokeh-3.9.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/47/8d/d529b5d697919ba8c11ad626e835d4039be708a35b0d22de83a269a6682c/pyasn1_modules-0.4.2-py3-none-any.whl
+      - pypi: https://files.pythonhosted.org/packages/49/ea/667775e995f24b1a3b68fe0d69e27eff27bcd2003fbcb5ed46bd34bc1010/worldarray-0.3.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/51/ac/e5d886f892666d2d1e5cb8c1a41146e1d79ae8896477b1153a21711d3b44/fasteners-0.20-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/53/3e/405b59cfa13021a56bba395a6b3aca8cec012b45bf177b0eaf7a202cde2c/contourpy-1.3.3-cp312-cp312-macosx_11_0_arm64.whl
       - pypi: https://files.pythonhosted.org/packages/53/b1/320ee3b3d8b1b95f48d02a081f28e23caf9bd044ff11e6c1597ffe65fa2f/chardet-7.4.1-cp312-cp312-macosx_11_0_arm64.whl
       - pypi: https://files.pythonhosted.org/packages/57/77/606f138bf70b14865842b3ec9a58dc1ba97153f466e5876fe4ced980f91f/dask_jobqueue-0.9.0-py2.py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/59/8c/77f5097695f4dd8255ecbd08b2a1ed8ba8b953d337804dd7080f199e12bf/tornado-6.5.5-cp39-abi3-macosx_10_9_universal2.whl
       - pypi: https://files.pythonhosted.org/packages/59/91/aa6bde563e0085a02a435aa99b49ef75b0a4b062635e606dab23ce18d720/inflection-0.5.1-py2.py3-none-any.whl
-      - pypi: https://files.pythonhosted.org/packages/59/a6/e8f1fd486d42924ccf4bf24349827ddfcb16fb897e91e3555db50d040b91/worldarray-0.1.1-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/59/f8/24495180ff0ab4cb3b7b7ce985ca5497897818145d0d35551f0a087fb4f0/funlib.geometry-0.3.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/5d/a0/7d793dce3fa811fe047d6ae2431c672364b462850c6235ae306c0efd025f/pyasn1-0.6.3-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/5e/f8/50bfaf4658431ff9de45c5c3935af7ab01157a4903c603cd0eee6e78e087/google_resumable_media-2.8.2-py3-none-any.whl
@@ -1391,6 +1391,7 @@ environments:
       - pypi: https://files.pythonhosted.org/packages/46/68/a1c721fdc55a778751e954f770f1c8cbadf6e180d49e550a2e71c256bd52/compresso-3.3.3-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/47/0b/bdf449df87be3f07b23091ceafee8c3ef569cf6d2fb7edec6e3b12b3faa4/bokeh-3.9.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/47/8d/d529b5d697919ba8c11ad626e835d4039be708a35b0d22de83a269a6682c/pyasn1_modules-0.4.2-py3-none-any.whl
+      - pypi: https://files.pythonhosted.org/packages/49/ea/667775e995f24b1a3b68fe0d69e27eff27bcd2003fbcb5ed46bd34bc1010/worldarray-0.3.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/4b/f8/d0118a2f5f23b02cd166fa385c60f9b0d4f9194f574e2b31cef350ad7223/charset_normalizer-3.4.7-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/4e/b7/28dff0bc2f992df437aaeeaeffba8f2f1ec031f054cedfc0390ea4300370/dracopy-2.0.0-cp312-cp312-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/51/ac/e5d886f892666d2d1e5cb8c1a41146e1d79ae8896477b1153a21711d3b44/fasteners-0.20-py3-none-any.whl
@@ -1400,7 +1401,6 @@ environments:
       - pypi: https://files.pythonhosted.org/packages/58/cf/1070a82c88a89f441e1bbb65a676224847b98247403a03c04b0c49feb0fc/fpzip-1.2.5-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/58/da/459c89f3dbb8344f6b2a374850d13522cc9a89726faea4319568034f1f1f/pysimdjson-7.0.2-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/59/91/aa6bde563e0085a02a435aa99b49ef75b0a4b062635e606dab23ce18d720/inflection-0.5.1-py2.py3-none-any.whl
-      - pypi: https://files.pythonhosted.org/packages/59/a6/e8f1fd486d42924ccf4bf24349827ddfcb16fb897e91e3555db50d040b91/worldarray-0.1.1-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/59/f8/24495180ff0ab4cb3b7b7ce985ca5497897818145d0d35551f0a087fb4f0/funlib.geometry-0.3.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/5a/ea/119e9b64e74762ec279f4c742c353e35602437f29ae3ddc2b0cb43071dba/chardet-7.4.1-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/5d/a0/7d793dce3fa811fe047d6ae2431c672364b462850c6235ae306c0efd025f/pyasn1-0.6.3-py3-none-any.whl
@@ -1650,13 +1650,13 @@ environments:
       - pypi: https://files.pythonhosted.org/packages/44/73/53f7d2e0ce86c9b850301c1c9165dedbac9ac88a6045aa1cb8ad37176c17/simplejpeg-1.9.0-cp312-cp312-macosx_11_0_arm64.whl
       - pypi: https://files.pythonhosted.org/packages/47/0b/bdf449df87be3f07b23091ceafee8c3ef569cf6d2fb7edec6e3b12b3faa4/bokeh-3.9.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/47/8d/d529b5d697919ba8c11ad626e835d4039be708a35b0d22de83a269a6682c/pyasn1_modules-0.4.2-py3-none-any.whl
+      - pypi: https://files.pythonhosted.org/packages/49/ea/667775e995f24b1a3b68fe0d69e27eff27bcd2003fbcb5ed46bd34bc1010/worldarray-0.3.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/51/ac/e5d886f892666d2d1e5cb8c1a41146e1d79ae8896477b1153a21711d3b44/fasteners-0.20-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/53/3e/405b59cfa13021a56bba395a6b3aca8cec012b45bf177b0eaf7a202cde2c/contourpy-1.3.3-cp312-cp312-macosx_11_0_arm64.whl
       - pypi: https://files.pythonhosted.org/packages/53/b1/320ee3b3d8b1b95f48d02a081f28e23caf9bd044ff11e6c1597ffe65fa2f/chardet-7.4.1-cp312-cp312-macosx_11_0_arm64.whl
       - pypi: https://files.pythonhosted.org/packages/57/77/606f138bf70b14865842b3ec9a58dc1ba97153f466e5876fe4ced980f91f/dask_jobqueue-0.9.0-py2.py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/59/8c/77f5097695f4dd8255ecbd08b2a1ed8ba8b953d337804dd7080f199e12bf/tornado-6.5.5-cp39-abi3-macosx_10_9_universal2.whl
       - pypi: https://files.pythonhosted.org/packages/59/91/aa6bde563e0085a02a435aa99b49ef75b0a4b062635e606dab23ce18d720/inflection-0.5.1-py2.py3-none-any.whl
-      - pypi: https://files.pythonhosted.org/packages/59/a6/e8f1fd486d42924ccf4bf24349827ddfcb16fb897e91e3555db50d040b91/worldarray-0.1.1-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/59/f8/24495180ff0ab4cb3b7b7ce985ca5497897818145d0d35551f0a087fb4f0/funlib.geometry-0.3.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/5d/a0/7d793dce3fa811fe047d6ae2431c672364b462850c6235ae306c0efd025f/pyasn1-0.6.3-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/5e/f8/50bfaf4658431ff9de45c5c3935af7ab01157a4903c603cd0eee6e78e087/google_resumable_media-2.8.2-py3-none-any.whl
@@ -6724,7 +6724,7 @@ packages:
   - zmesh
   - funlib-geometry
   - tensorstore
-  - worldarray>=0.1.1,<1
+  - worldarray>=0.3,<1
   - numba
   - neuroglancer
   - fastremap
@@ -7282,6 +7282,14 @@ packages:
   requires_dist:
   - pyasn1>=0.6.1,<0.7.0
   requires_python: '>=3.8'
+- pypi: https://files.pythonhosted.org/packages/49/ea/667775e995f24b1a3b68fe0d69e27eff27bcd2003fbcb5ed46bd34bc1010/worldarray-0.3.0-py3-none-any.whl
+  name: worldarray
+  version: 0.3.0
+  sha256: 7dd4af6aa99958dee434432aae20cb8da04d23c89b209a02ee9277232b61a2ec
+  requires_dist:
+  - numpy>=1.26
+  - tensorstore>=0.1.60
+  requires_python: '>=3.10'
 - pypi: https://files.pythonhosted.org/packages/4b/f8/d0118a2f5f23b02cd166fa385c60f9b0d4f9194f574e2b31cef350ad7223/charset_normalizer-3.4.7-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl
   name: charset-normalizer
   version: 3.4.7
@@ -7383,14 +7391,6 @@ packages:
   version: 0.5.1
   sha256: f38b2b640938a4f35ade69ac3d053042959b62a0f1076a5bbaa1b9526605a8a2
   requires_python: '>=3.5'
-- pypi: https://files.pythonhosted.org/packages/59/a6/e8f1fd486d42924ccf4bf24349827ddfcb16fb897e91e3555db50d040b91/worldarray-0.1.1-py3-none-any.whl
-  name: worldarray
-  version: 0.1.1
-  sha256: 691ec6f698d73d3b6331ca6156d0b605c0c454378e96aa8b249aba0b637bdb9b
-  requires_dist:
-  - numpy>=1.26
-  - tensorstore>=0.1.60
-  requires_python: '>=3.10'
 - pypi: https://files.pythonhosted.org/packages/59/f8/24495180ff0ab4cb3b7b7ce985ca5497897818145d0d35551f0a087fb4f0/funlib.geometry-0.3.0-py3-none-any.whl
   name: funlib-geometry
   version: 0.3.0
