@@ -783,3 +783,62 @@ class TestExistingPyramidScalesBothFormats:
         out_path, result = self._build(tmp_path, zarr_format=3)
         assert os.path.isfile(os.path.join(out_path, "zarr.json"))
         assert result == {1: 2, 2: 4}
+
+
+class TestPyramidLevelsCompressed:
+    """Built levels are zstd-compressed in both zarr formats. Uncompressed
+    128^3 uint16 label chunks are 4 MiB each, which made kept pyramids
+    slow to browse over HTTP; mostly-background labels compress ~100x."""
+
+    @pytest.mark.parametrize("zarr_format", [2, 3])
+    def test_levels_are_zstd_and_round_trip(self, tmp_path, zarr_format):
+        import tensorstore as ts
+
+        vol = np.zeros((64, 64, 64), dtype=np.uint16)
+        vol[8:40, 8:40, 8:40] = 7
+        vol[44:60, 20:30, 30:50] = 3
+        out_path = str(tmp_path / "pyramid.zarr")
+        build_missing_pyramid_levels(
+            s0_reader=lambda o, s: vol[o[0]:o[0]+s[0], o[1]:o[1]+s[1], o[2]:o[2]+s[2]].copy(),
+            s0_dataset_shape_voxels=np.array(vol.shape),
+            s0_voxel_size_zyx=[8.0, 8.0, 8.0],
+            s0_translation_zyx=[4.0, 4.0, 4.0],
+            dtype=vol.dtype,
+            num_lods=2,
+            existing_factors=set(),
+            output_zarr_path=out_path,
+            downsample_func=downsample_labels_3d,
+            out_chunk_shape_voxels=(32, 32, 32),
+            zarr_format=zarr_format,
+        )
+
+        s1_path = os.path.join(out_path, "s1")
+        if zarr_format == 3:
+            with open(os.path.join(s1_path, "zarr.json")) as f:
+                codecs = json.load(f)["codecs"]
+            assert [c["name"] for c in codecs] == ["bytes", "zstd"]
+            driver = "zarr3"
+        else:
+            with open(os.path.join(s1_path, ".zarray")) as f:
+                compressor = json.load(f)["compressor"]
+            assert compressor["id"] == "blosc"
+            assert compressor["cname"] == "zstd"
+            driver = "zarr"
+
+        # Every stored chunk is smaller than its uncompressed size.
+        raw_chunk_bytes = 32 ** 3 * vol.dtype.itemsize
+        chunk_files = [
+            os.path.join(root, name)
+            for root, _, names in os.walk(s1_path)
+            for name in names
+            if name not in ("zarr.json", ".zarray", ".zattrs")
+        ]
+        assert chunk_files
+        assert all(os.path.getsize(p) < raw_chunk_bytes for p in chunk_files)
+
+        s1 = ts.open({
+            "driver": driver,
+            "kvstore": {"driver": "file", "path": s1_path},
+        }).result().read().result()
+        ref_s1, _ = downsample_labels_3d(vol, (2, 2, 2))
+        np.testing.assert_array_equal(s1, ref_s1)

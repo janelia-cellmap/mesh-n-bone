@@ -146,7 +146,8 @@ use_existing_scales: true        # Set false to FORCE in-worker downsampling at 
 # (v2 or v3) as the input, and s0 is symlinked in (not copied) when the
 # formats match — so `_intermediate_scales.zarr` is directly browsable
 # as one consistent OME-NGFF group (e.g. in neuroglancer), not just
-# usable internally by mesh-n-bone.
+# usable internally by mesh-n-bone. Built levels are zstd-compressed
+# (blosc-zstd for zarr v2), so they stay small to serve over HTTP.
 delete_intermediate_scales: true # Delete the auto-built `_intermediate_scales.zarr` once the
                                  # multires pipeline finishes. Set false to keep the pyramid
                                  # around for re-running with different mesh params on the same
