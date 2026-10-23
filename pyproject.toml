@@ -44,7 +44,7 @@ dependencies = [
   # Volumetric data
   "funlib.geometry",
   "tensorstore",
-  "worldarray>=0.3,<1",
+  "worldarray>=0.5,<1",
   "numba",
 
   # Skeletonization
