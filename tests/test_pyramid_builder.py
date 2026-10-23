@@ -21,10 +21,9 @@ from mesh_n_bone.meshify.downsample import (
 from mesh_n_bone.util.pyramid_builder import (
     align_roi_voxels,
     build_missing_pyramid_levels,
-    build_multiscales_metadata,
     downsample_super_chunk,
+    level_placements,
     per_lod_factors_for_anisotropy,
-    write_multiscales_metadata,
 )
 
 
@@ -111,52 +110,42 @@ class TestRoiAlignment:
         assert out_s.tolist() == [16, 24, 24]
 
 
-class TestMultiscalesMetadata:
+class TestLevelPlacements:
     def test_isotropic_translations(self):
         # s0_vs = 8, s0_tr = 4 (= corner + vs/2 of an origin at 0)
-        md = build_multiscales_metadata(
-            s0_voxel_size_zyx=[8.0, 8.0, 8.0],
-            s0_translation_zyx=[4.0, 4.0, 4.0],
-            per_lod_factors=[(1, 1, 1), (2, 2, 2), (4, 4, 4), (8, 8, 8)],
+        p = level_placements(
+            [8.0, 8.0, 8.0], [4.0, 4.0, 4.0],
+            [(1, 1, 1), (2, 2, 2), (4, 4, 4), (8, 8, 8)],
         )
-        ds = md["multiscales"][0]["datasets"]
         # s0: scale=8, tr=4
-        assert ds[0]["coordinateTransformations"][0]["scale"] == [8.0, 8.0, 8.0]
-        assert ds[0]["coordinateTransformations"][1]["translation"] == [4.0, 4.0, 4.0]
+        assert p[0] == ((8.0, 8.0, 8.0), (4.0, 4.0, 4.0))
         # s1: scale=16, tr = 4 + 0.5*8*(2-1) = 8
-        assert ds[1]["coordinateTransformations"][0]["scale"] == [16.0, 16.0, 16.0]
-        assert ds[1]["coordinateTransformations"][1]["translation"] == [8.0, 8.0, 8.0]
+        assert p[1] == ((16.0, 16.0, 16.0), (8.0, 8.0, 8.0))
         # s2: scale=32, tr = 4 + 0.5*8*(4-1) = 16
-        assert ds[2]["coordinateTransformations"][0]["scale"] == [32.0, 32.0, 32.0]
-        assert ds[2]["coordinateTransformations"][1]["translation"] == [16.0, 16.0, 16.0]
+        assert p[2] == ((32.0, 32.0, 32.0), (16.0, 16.0, 16.0))
         # s3: scale=64, tr = 4 + 0.5*8*(8-1) = 32
-        assert ds[3]["coordinateTransformations"][0]["scale"] == [64.0, 64.0, 64.0]
-        assert ds[3]["coordinateTransformations"][1]["translation"] == [32.0, 32.0, 32.0]
+        assert p[3] == ((64.0, 64.0, 64.0), (32.0, 32.0, 32.0))
 
     def test_anisotropic_translations_per_axis(self):
         # s0_vs = [20, 8, 8], s0_tr = [10, 4, 4]
         # LOD 1 cumulative factor (1, 2, 2) → vs=[20,16,16], tr=[10, 4+0.5*8*1, 4+0.5*8*1]=[10, 8, 8]
-        md = build_multiscales_metadata(
-            s0_voxel_size_zyx=[20.0, 8.0, 8.0],
-            s0_translation_zyx=[10.0, 4.0, 4.0],
-            per_lod_factors=[(1, 1, 1), (1, 2, 2), (2, 4, 4)],
+        p = level_placements(
+            [20.0, 8.0, 8.0], [10.0, 4.0, 4.0],
+            [(1, 1, 1), (1, 2, 2), (2, 4, 4)],
         )
-        ds = md["multiscales"][0]["datasets"]
-        assert ds[1]["coordinateTransformations"][0]["scale"] == [20.0, 16.0, 16.0]
-        assert ds[1]["coordinateTransformations"][1]["translation"] == [10.0, 8.0, 8.0]
+        assert p[1] == ((20.0, 16.0, 16.0), (10.0, 8.0, 8.0))
         # LOD 2 factor (2, 4, 4) → vs=[40,32,32], tr=[10+0.5*20*1, 4+0.5*8*3, 4+0.5*8*3]=[20, 16, 16]
-        assert ds[2]["coordinateTransformations"][0]["scale"] == [40.0, 32.0, 32.0]
-        assert ds[2]["coordinateTransformations"][1]["translation"] == [20.0, 16.0, 16.0]
+        assert p[2] == ((40.0, 32.0, 32.0), (20.0, 16.0, 16.0))
 
-    def test_axes_metadata(self):
-        md = build_multiscales_metadata(
-            s0_voxel_size_zyx=[1.0, 1.0, 1.0],
-            s0_translation_zyx=[0.0, 0.0, 0.0],
-            per_lod_factors=[(1, 1, 1)],
+    def test_levels_are_placed_from_the_roi_origin(self):
+        """A level built from an aligned ROI origin of 16 s0 voxels
+        starts there: s1's voxel 0 is the mode of s0 voxels 16 and 17,
+        centred at 4 + 8 * 16.5 = 136."""
+        p = level_placements(
+            [8.0, 8.0, 8.0], [4.0, 4.0, 4.0], [(1, 1, 1), (2, 2, 2)],
+            origin_voxels=np.array([16, 16, 16]),
         )
-        axes = md["multiscales"][0]["axes"]
-        assert [a["name"] for a in axes] == ["z", "y", "x"]
-        assert all(a["type"] == "space" and a["unit"] == "nanometer" for a in axes)
+        assert p[1] == ((16.0, 16.0, 16.0), (136.0, 136.0, 136.0))
 
 
 class TestFencepostCorrectness:
@@ -271,7 +260,8 @@ class TestEndToEndPyramidBuild:
         assert os.path.exists(os.path.join(out_path, ".zattrs"))
         with open(os.path.join(out_path, ".zattrs")) as f:
             md = json.load(f)
-        assert len(md["multiscales"][0]["datasets"]) == 3
+        # The levels on disk: no s0 is linked in, so none is listed.
+        assert [d["path"] for d in md["multiscales"][0]["datasets"]] == ["s1", "s2"]
 
         # s1 and s2 zarrs exist and match the global downsample
         import zarr
@@ -309,6 +299,14 @@ class TestEndToEndPyramidBuild:
         s0_link = os.path.join(out_path, "s0")
         assert os.path.islink(s0_link)
         assert os.path.exists(os.path.join(s0_link, "marker.txt"))
+        # ...and listed, placed as the source is.
+        with open(os.path.join(out_path, ".zattrs")) as f:
+            s0_entry = json.load(f)["multiscales"][0]["datasets"][0]
+        assert s0_entry["path"] == "s0"
+        assert s0_entry["coordinateTransformations"] == [
+            {"type": "scale", "scale": [1.0, 1.0, 1.0]},
+            {"type": "translation", "translation": [0.5, 0.5, 0.5]},
+        ]
 
     def test_no_symlink_when_source_is_zarr_v3(self, tmp_path):
         """This pyramid's own group metadata and its s1+ arrays are
@@ -676,10 +674,11 @@ class TestUnalignedRoiHalo:
             f"min read origin was {min_read_origin}"
         )
 
-    def test_halo_clipped_at_dataset_bounds(self, tmp_path):
-        """When the halo would extend past the dataset, the read is clipped
-        and zero-padding (or partial cubes) take over. The output should
-        still complete cleanly — no exceptions, output array fully written."""
+    @pytest.mark.parametrize("cascade", [False, True])
+    def test_halo_clipped_at_dataset_bounds(self, tmp_path, cascade):
+        """When the halo would extend past the dataset, the part past it
+        is read as 0, so the boundary cubes downsample a zero-padded
+        block and every chunk is written whole."""
         # 18-voxel dataset, ROI [3, 18) (size 15), max factor 4 → halo
         # rounds out to [0, 20). Dataset bounds clip the read at 18.
         rng = np.random.default_rng(1)
@@ -699,13 +698,16 @@ class TestUnalignedRoiHalo:
             roi_origin_voxels=np.array([3, 3, 3]),
             roi_shape_voxels=np.array([15, 15, 15]),
             alignment_mode="halo",
+            cascade=cascade,
         )
         # Output region: [0, 20) rounded outward, but dataset only has 18.
-        # Builder must handle this without crashing.
         import zarr
         s1 = zarr.open_array(os.path.join(out_path, "s1"), mode="r")
         # s1 covers output region 20 voxels / 2 = 10 voxels
         assert s1.shape == (10, 10, 10)
+        padded = np.pad(vol, ((0, 2), (0, 2), (0, 2)))
+        ref_s1, _ = downsample_labels_3d(padded, (2, 2, 2))
+        np.testing.assert_array_equal(s1[:], ref_s1)
 
 
 class TestUnalignedRoiSnap:
@@ -748,10 +750,10 @@ class TestUnalignedRoiSnap:
 class TestExistingPyramidScalesBothFormats:
     """``_existing_pyramid_scales`` (the "reuse a prior run's pyramid"
     shortcut) must parse group metadata from EITHER a zarr v2 pyramid
-    (.zattrs) or a zarr v3 one (zarr.json, attributes nested under
-    "attributes") — otherwise a v3-formatted pyramid (built once the
-    source's own format is matched) would silently never be recognized
-    for reuse on a second run, always rebuilding from scratch."""
+    (.zattrs, OME 0.4) or a zarr v3 one (zarr.json, OME 0.5) — otherwise
+    a v3-formatted pyramid (built once the source's own format is
+    matched) would silently never be recognized for reuse on a second
+    run, always rebuilding from scratch."""
 
     def _build(self, tmp_path, zarr_format):
         from mesh_n_bone.meshify.meshify import _existing_pyramid_scales
@@ -772,17 +774,90 @@ class TestExistingPyramidScalesBothFormats:
             out_chunk_shape_voxels=(4, 4, 4),
             zarr_format=zarr_format,
         )
-        return out_path, _existing_pyramid_scales(out_path)
+        return out_path, _existing_pyramid_scales(out_path, [1.0, 1.0, 1.0])
 
     def test_parses_zarr_v2_pyramid(self, tmp_path):
         out_path, result = self._build(tmp_path, zarr_format=2)
         assert os.path.isfile(os.path.join(out_path, ".zattrs"))
-        assert result == {1: 2, 2: 4}
+        assert result == {2: f"{out_path}/s1", 4: f"{out_path}/s2"}
 
     def test_parses_zarr_v3_pyramid(self, tmp_path):
         out_path, result = self._build(tmp_path, zarr_format=3)
         assert os.path.isfile(os.path.join(out_path, "zarr.json"))
-        assert result == {1: 2, 2: 4}
+        assert result == {2: f"{out_path}/s1", 4: f"{out_path}/s2"}
+        with open(os.path.join(out_path, "zarr.json")) as f:
+            assert f.read().count('"version": "0.5"') == 1
+
+    def test_parses_a_zarr_v3_pyramid_from_earlier_versions(self, tmp_path):
+        """Earlier versions wrote an OME 0.4 document into the v3 group."""
+        from mesh_n_bone.meshify.meshify import _existing_pyramid_scales
+        import tensorstore as ts
+
+        out_path = str(tmp_path / "old_v3.zarr")
+        datasets = [
+            {"path": f"s{k}", "coordinateTransformations": [
+                {"type": "scale", "scale": [8.0 * 2 ** k] * 3},
+                {"type": "translation", "translation": [4.0 * 2 ** k] * 3},
+            ]}
+            for k in range(3)
+        ]
+        os.makedirs(out_path)
+        with open(os.path.join(out_path, "zarr.json"), "w") as f:
+            json.dump({"zarr_format": 3, "node_type": "group", "attributes": {
+                "multiscales": [{"version": "0.4", "name": "", "axes": [
+                    {"name": a, "type": "space", "unit": "nanometer"} for a in "zyx"
+                ], "datasets": datasets}],
+            }}, f)
+        for k in (1, 2):  # s0 was a symlink that is gone now
+            ts.open({
+                "driver": "zarr3",
+                "kvstore": {"driver": "file", "path": os.path.join(out_path, f"s{k}")},
+                "metadata": {"shape": [4, 4, 4], "data_type": "uint8", "chunk_grid": {
+                    "name": "regular", "configuration": {"chunk_shape": [4, 4, 4]}}},
+                "create": True,
+            }).result()
+        assert _existing_pyramid_scales(out_path, [8.0, 8.0, 8.0]) == {
+            2: f"{out_path}/s1", 4: f"{out_path}/s2",
+        }
+
+
+class TestPyramidRoiPlacement:
+    """Levels built from a custom ROI are placed where their voxels came
+    from. Earlier versions placed every level from s0's voxel 0 while
+    filling it from the aligned ROI origin, so a cube at s0 voxels
+    32..48 (world 256..384) showed up at 128..256 in s1."""
+
+    @pytest.mark.parametrize("cascade", [False, True])
+    def test_level_content_sits_where_s0_has_it(self, tmp_path, cascade):
+        import worldarray as wa
+
+        vol = np.zeros((64, 64, 64), dtype=np.uint8)
+        vol[32:48, 32:48, 32:48] = 1
+        out_path = str(tmp_path / "pyramid.zarr")
+        build_missing_pyramid_levels(
+            s0_reader=lambda o, s: vol[o[0]:o[0]+s[0], o[1]:o[1]+s[1], o[2]:o[2]+s[2]].copy(),
+            s0_dataset_shape_voxels=np.array(vol.shape),
+            s0_voxel_size_zyx=[8.0, 8.0, 8.0],
+            s0_translation_zyx=[4.0, 4.0, 4.0],
+            dtype=vol.dtype,
+            num_lods=3,
+            existing_factors=set(),
+            output_zarr_path=out_path,
+            downsample_func=downsample_labels_3d,
+            out_chunk_shape_voxels=(8, 8, 8),
+            roi_origin_voxels=np.array([16, 16, 16]),
+            roi_shape_voxels=np.array([48, 48, 48]),
+            alignment_mode="snap",
+            cascade=cascade,
+        )
+        for level in ("s1", "s2"):
+            arr = wa.open(f"{out_path}/{level}")
+            data = arr.read_index((0, 0, 0), arr.shape)
+            idx = np.argwhere(data)
+            lo = np.asarray(arr.corner) + idx.min(axis=0) * np.asarray(arr.voxel_size)
+            hi = np.asarray(arr.corner) + (idx.max(axis=0) + 1) * np.asarray(arr.voxel_size)
+            np.testing.assert_allclose(lo, [256.0] * 3)
+            np.testing.assert_allclose(hi, [384.0] * 3)
 
 
 class TestPyramidLevelsCompressed:
