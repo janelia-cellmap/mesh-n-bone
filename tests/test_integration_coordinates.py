@@ -260,3 +260,135 @@ class TestSphereGeometry:
                     mesh.centroid, expected_center, atol=lod_voxel,
                     err_msg=f"LOD {lod} sphere centroid wrong"
                 )
+
+
+class TestPlacementAcrossFormats:
+    """One cube stored five ways with the same physical placement meshes
+    to the same bounds, to a tenth of a voxel.
+
+    Voxel size 4 nm, voxel 0's corner at the origin (its centre at 2 nm),
+    label at voxels [8, 24) per axis: the cube occupies world [32, 96) nm,
+    where Neuroglancer draws it. Stores that write the corner (funlib
+    ``offset``, precomputed ``voxel_offset``) and stores that write the
+    centre (OME-NGFF ``translation``) must agree.
+    """
+
+    VOXEL = 4.0
+    TRUTH = (32.0, 96.0)
+
+    @staticmethod
+    def _write_store(root, kind, translation=2.0):
+        import json
+        import tensorstore as ts
+
+        vol = np.zeros((32, 32, 32), dtype=np.uint32)
+        vol[8:24, 8:24, 8:24] = 1
+
+        def put(directory, key, obj):
+            os.makedirs(directory, exist_ok=True)
+            with open(os.path.join(directory, key), "w") as f:
+                json.dump(obj, f)
+
+        def zarr2(path, attrs=None):
+            ts.open({
+                "driver": "zarr",
+                "kvstore": {"driver": "file", "path": path},
+                "metadata": {"shape": [32, 32, 32], "chunks": [16, 16, 16],
+                             "dtype": "<u4", "compressor": None},
+            }, create=True, delete_existing=True).result().write(vol).result()
+            if attrs:
+                put(path, ".zattrs", attrs)
+
+        ome = {"multiscales": [{
+            "version": "0.4",
+            "axes": [{"name": a, "type": "space", "unit": "nanometer"} for a in "zyx"],
+            "datasets": [{"path": "s0", "coordinateTransformations": [
+                {"type": "scale", "scale": [4, 4, 4]},
+                {"type": "translation", "translation": [translation] * 3},
+            ]}],
+        }]}
+        funlib = {"voxel_size": [4, 4, 4], "axis_names": ["z", "y", "x"]}
+        if kind == "precomputed":
+            path = os.path.join(root, "seg")
+            ts.open({
+                "driver": "neuroglancer_precomputed",
+                "kvstore": {"driver": "file", "path": path},
+                "multiscale_metadata": {"data_type": "uint32", "num_channels": 1,
+                                        "type": "segmentation"},
+                "scale_metadata": {"size": [32, 32, 32], "resolution": [4, 4, 4],
+                                   "voxel_offset": [0, 0, 0], "chunk_size": [16, 16, 16],
+                                   "encoding": "raw", "key": "s0"},
+            }, create=True, delete_existing=True).result().write(vol.T[..., None]).result()
+            return path
+        if kind == "unplaced":
+            # No placement metadata at all: voxels of 1, corner at the origin.
+            path = os.path.join(root, "plain.zarr")
+            zarr2(path)
+            return path
+        group = os.path.join(root, "seg.zarr")
+        put(group, ".zgroup", {"zarr_format": 2})
+        if kind in ("ome", "ome_and_corner_offset", "ome_and_equal_offset"):
+            put(group, ".zattrs", ome)
+        array_attrs = {
+            "ome": None,
+            "funlib": {**funlib, "offset": [0, 0, 0]},
+            "ome_and_corner_offset": {**funlib, "offset": [0, 0, 0]},
+            "ome_and_equal_offset": {**funlib, "offset": [2, 2, 2]},
+        }[kind]
+        zarr2(os.path.join(group, "s0"), array_attrs)
+        return os.path.join(group, "s0")
+
+    @pytest.mark.parametrize("kind", [
+        "ome",                    # OME translation: voxel 0's centre
+        "funlib",                 # funlib offset: voxel 0's corner
+        "ome_and_corner_offset",  # funlib prepare_ds: both, offset = corner
+        "ome_and_equal_offset",   # cellmap-analyze writer: offset = translation
+        "precomputed",            # voxel_offset: voxel 0's corner
+    ])
+    def test_cube_bounds_match_across_formats(self, tmp_output_dir, kind):
+        path = self._write_store(os.path.join(tmp_output_dir, kind), kind)
+        out = os.path.join(tmp_output_dir, f"out_{kind}")
+        _run_meshify(path, out)
+        mesh = trimesh.load(os.path.join(out, "meshes", "1.ply"))
+        tol = 0.1 * self.VOXEL
+        np.testing.assert_allclose(mesh.bounds[0], [self.TRUTH[0]] * 3, atol=tol)
+        np.testing.assert_allclose(mesh.bounds[1], [self.TRUTH[1]] * 3, atol=tol)
+
+    @pytest.mark.parametrize("roi", [
+        None,
+        # A ROI that doesn't start at the dataset origin must not shift
+        # the mesh either.
+        {"begin": [16.5, 16.5, 16.5], "end": [112.5, 112.5, 112.5]},
+    ])
+    def test_fractional_translation(self, tmp_output_dir, roi):
+        # Translation 2.5 rounds to 2 for Meshify's integer block frame, so
+        # vertices must be mapped back onto the true 0.5 nm.
+        path = self._write_store(
+            os.path.join(tmp_output_dir, "frac"), "ome", translation=2.5,
+        )
+        out = os.path.join(tmp_output_dir, "out_frac")
+        _run_meshify(path, out, roi=roi)
+        mesh = trimesh.load(os.path.join(out, "meshes", "1.ply"))
+        tol = 0.1 * self.VOXEL
+        np.testing.assert_allclose(mesh.bounds[0], [self.TRUTH[0] + 0.5] * 3, atol=tol)
+        np.testing.assert_allclose(mesh.bounds[1], [self.TRUTH[1] + 0.5] * 3, atol=tol)
+
+    def test_unplaced_array_has_its_corner_at_the_origin(self, tmp_output_dir):
+        path = self._write_store(os.path.join(tmp_output_dir, "plain"), "unplaced")
+        out = os.path.join(tmp_output_dir, "out_plain")
+        _run_meshify(path, out)
+        mesh = trimesh.load(os.path.join(out, "meshes", "1.ply"))
+        # Voxels of 1: label at [8, 24) occupies world [8, 24).
+        np.testing.assert_allclose(mesh.bounds[0], [8.0] * 3, atol=0.1)
+        np.testing.assert_allclose(mesh.bounds[1], [24.0] * 3, atol=0.1)
+
+    def test_voxel_size_nm_scales_the_translation_too(self, tmp_output_dir):
+        # An unplaced array given voxels of 4 nm: its corner stays at the
+        # origin, so the cube lands where the 4 nm stores put it.
+        path = self._write_store(os.path.join(tmp_output_dir, "plain"), "unplaced")
+        out = os.path.join(tmp_output_dir, "out_plain_nm")
+        _run_meshify(path, out, voxel_size_nm=[self.VOXEL] * 3)
+        mesh = trimesh.load(os.path.join(out, "meshes", "1.ply"))
+        tol = 0.1 * self.VOXEL
+        np.testing.assert_allclose(mesh.bounds[0], [self.TRUTH[0]] * 3, atol=tol)
+        np.testing.assert_allclose(mesh.bounds[1], [self.TRUTH[1]] * 3, atol=tol)

@@ -387,6 +387,24 @@ class TestMeshifyDownsampleStrategyExistingScales:
                 f"Factor {factor} mapped to wrong path {path}"
             )
 
+    def test_discover_skips_a_missing_level(self, tmp_output_dir):
+        """A level listed in the multiscales but absent on disk is
+        skipped; the levels that exist are still reused."""
+        import shutil
+
+        s0_path, zarr_path = self._create_multiscale_zarr(tmp_output_dir, num_levels=3)
+        shutil.rmtree(os.path.join(zarr_path, "s2"))
+        m = Meshify(
+            input_path=s0_path,
+            output_directory=os.path.join(tmp_output_dir, "out_missing"),
+            num_workers=1,
+            do_multires=False,
+            check_mesh_validity=False,
+            do_analysis=False,
+            do_simplification=False,
+        )
+        assert set(m._discover_existing_scales()) == {1, 2}
+
     def test_discover_returns_empty_for_non_multiscale_input(self, tmp_output_dir):
         """Input zarr without OME-NGFF multiscales metadata yields {}."""
         vol = np.zeros((32, 32, 32), dtype=np.uint64)

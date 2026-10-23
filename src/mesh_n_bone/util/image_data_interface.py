@@ -1,346 +1,45 @@
-"""TensorStore-based data reading utilities for segmentation volumes."""
+"""Volume reads through worldarray, in Meshify's integer block frame.
 
-import logging
-import os
-import time
-import random
+worldarray opens every format mesh-n-bone reads (zarr v2/v3, N5,
+neuroglancer precomputed; local or remote), resolves where the array
+sits, and reads index boxes with padding and retries. This module keeps
+the two things mesh-n-bone needs on top of it.
+"""
 
-import numpy as np
-import tensorstore as ts
-from funlib.geometry import Coordinate, Roi
-
-from mesh_n_bone.util.zarr_io import (
-    _is_http_url,
-    _is_remote_url,
-    _path_join,
-    _read_json_file,
-    _strip_precomputed_prefix,
-    kvstore_for_path,
-)
-from mesh_n_bone.util.precomputed_io import (
-    is_precomputed_path,
-    open_precomputed_tensorstore,
-)
-
-logger = logging.getLogger(__name__)
+import worldarray as wa
 
 
-def _read_shape_from_slices(valid_slices):
-    """Return the array shape implied by TensorStore slices."""
-    return tuple(max(0, int(s.stop) - int(s.start)) for s in valid_slices)
+def open_volume(path, context=None):
+    """Open *path* as a :class:`worldarray.WorldArray` in its stored units.
 
-
-def _read_size_mib(dataset, valid_slices):
-    """Estimate uncompressed read size in MiB from slices and dtype."""
-    shape = _read_shape_from_slices(valid_slices)
-    try:
-        itemsize = np.dtype(dataset.dtype.numpy_dtype).itemsize
-    except (AttributeError, TypeError):
-        itemsize = np.dtype(dataset.dtype).itemsize
-    return (float(np.prod(shape)) * itemsize) / 2**20
-
-
-def _is_remote_dataset_path(source_path):
-    """Return True if a source path points at remote object storage/HTTP."""
-    if source_path is None:
-        return False
-    return _is_remote_url(_strip_precomputed_prefix(source_path))
-
-
-def _default_read_timeout_seconds(dataset, valid_slices, source_path=None):
-    """Choose a TensorStore read timeout from source locality and read size.
-
-    Small reads keep the old 5 second timeout. Large remote reads get more
-    time so a slow object-store response does not immediately create retry
-    pressure across hundreds of Dask worker processes.
+    A group opens at its first level (an OME-NGFF multiscales group's
+    first dataset, a precomputed volume's first scale), as mesh-n-bone
+    always has; an array, or a precomputed path that names a scale
+    (``.../seg/8.0x8.0x8.0``), opens as itself. The result's
+    ``level_path`` reopens exactly that level. Each open gets its own
+    capped tensorstore context unless *context* is given (see
+    :func:`worldarray.capped_context`), so dozens of worker processes on
+    one host stay at a few threads each.
     """
-    size_mib = _read_size_mib(dataset, valid_slices)
-    if _is_remote_dataset_path(source_path):
-        return min(120.0, max(5.0, size_mib / 16.0))
-    return min(30.0, max(5.0, size_mib / 256.0))
+    if context is None:
+        context = wa.capped_context()
+    return wa.open(path, level="first", units=None, context=context)
 
 
-def _capped_tensorstore_context_spec():
-    """Tensorstore Context spec that limits internal thread pools.
+def read_block(volume, roi, voxel_size, offset, fill_value=0):
+    """Read funlib *roi* from *volume* in Meshify's block frame.
 
-    Tensorstore defaults every concurrency resource (HTTP fetch pools,
-    data-copy / decompression pool, file I/O pool) to a high number,
-    typically N_CPU. In a dask-worker process — where dask itself
-    already runs us in a 1-thread-per-worker model — those default
-    pools combine with the dozens of worker processes stacked on a
-    single LSF host to produce thousands of runnable threads and
-    nodes-over-100%-load complaints from cluster admins. Cap each
-    pool to a small fixed limit so per-process thread count is bounded.
+    Voxel ``i`` sits at ``offset + i * voxel_size``, where *offset* is
+    the integer-rounded translation (voxel 0's centre), and *roi* is
+    snapped outward to that grid. Reading by index rather than by world
+    box keeps neighbouring blocks exact when Meshify works on rounded
+    values of a non-integer translation or voxel size. Of a multi-channel
+    volume, channel 0 is read, as mesh-n-bone always has; the part of
+    *roi* outside the volume is filled with *fill_value*.
     """
-    return {
-        # In-memory copying + decompression (e.g. gzip/blosc for zarr/n5).
-        "data_copy_concurrency": {"limit": 1},
-        # Local file I/O (irrelevant for remote sources but caps anyway).
-        "file_io_concurrency": {"limit": 1},
-        # Remote fetch pools. Keep these at one per worker process; Dask
-        # supplies the process-level parallelism, and large remote reads
-        # otherwise multiply into thousands of simultaneous requests.
-        "gcs_request_concurrency": {"limit": 1},
-        "s3_request_concurrency": {"limit": 1},
-        "http_request_concurrency": {"limit": 1},
-        # Disable tensorstore's decoded-chunk cache. Default is unbounded,
-        # so for long-lived worker processes (e.g. dask LSF workers that
-        # cache opened handles in _PYRAMID_WORKER_TS_CACHE across multiple
-        # super-chunks), the cache accumulates decoded chunks until the
-        # worker is OOM-killed. We don't benefit from caching anyway —
-        # each super-chunk reads/writes a non-overlapping region.
-        "cache_pool": {"total_bytes_limit": 0},
-    }
-
-
-def _detect_zarr_driver(dataset_path):
-    """Detect the tensorstore driver for *dataset_path* by content probing.
-
-    Tries marker files in order: precomputed ``info``, zarr v3
-    ``zarr.json``, zarr v2 ``.zarray``, N5 ``attributes.json``. The
-    optional ``precomputed://`` URL prefix is stripped before probing
-    (it's accepted for backward compatibility but no longer required;
-    the format is inferred from content, like neuroglancer).
-
-    Falls back to a ``.n5`` / ``.zarr`` filename heuristic for the
-    rare case where no marker file is reachable (e.g. when running
-    against private buckets with no anonymous access).
-
-    Parameters
-    ----------
-    dataset_path : str
-        Local filesystem path or remote URL (``gs://``, ``s3://``,
-        ``http(s)://``, optionally with a ``precomputed://`` prefix).
-
-    Returns
-    -------
-    str
-        ``"zarr"``, ``"zarr3"``, ``"n5"``, or ``"neuroglancer_precomputed"``.
-    """
-    explicit_precomputed = is_precomputed_path(dataset_path)
-    if explicit_precomputed:
-        return "neuroglancer_precomputed"
-
-    canonical = _strip_precomputed_prefix(dataset_path)
-
-    # Precomputed: ``info`` lives at the dataset root. Try the path
-    # itself first, then its parent (covers paths like
-    # ``.../segmentation/8.0x8.0x8.0`` where the trailing segment is a
-    # scale key rather than a real subdirectory).
-    if _read_json_file(_path_join(canonical, "info")) is not None:
-        return "neuroglancer_precomputed"
-    from mesh_n_bone.util.zarr_io import _path_dirname
-    parent = _path_dirname(canonical)
-    if parent and parent != canonical:
-        if _read_json_file(_path_join(parent, "info")) is not None:
-            return "neuroglancer_precomputed"
-
-    if _read_json_file(_path_join(canonical, "zarr.json")) is not None:
-        return "zarr3"
-    if _read_json_file(_path_join(canonical, ".zarray")) is not None:
-        return "zarr"
-    if _read_json_file(_path_join(canonical, "attributes.json")) is not None:
-        return "n5"
-
-    # No marker reachable (likely private bucket without anonymous
-    # access). Fall back to filename hints.
-    if canonical.rfind(".n5") > canonical.rfind(".zarr"):
-        return "n5"
-    return "zarr"
-
-
-def open_ds_tensorstore(dataset_path, mode="r", filetype=None):
-    """Open a zarr/n5 dataset with TensorStore.
-
-    Parameters
-    ----------
-    dataset_path : str
-        Full filesystem path to the dataset (container + internal path).
-    mode : str
-        ``"r"`` for read-only, ``"w"`` for write.
-
-    Returns
-    -------
-    tensorstore.TensorStore
-        Opened dataset handle.
-    """
-    filetype = filetype or _detect_zarr_driver(dataset_path)
-    if filetype == "neuroglancer_precomputed":
-        if mode != "r":
-            raise ValueError("neuroglancer precomputed datasets are read-only")
-        return open_precomputed_tensorstore(dataset_path)
-
-    canonical = _strip_precomputed_prefix(dataset_path)
-    if _is_remote_url(canonical) and mode != "r":
-        raise ValueError("Remote TensorStore datasets are read-only")
-
-    kvstore, kv_path = kvstore_for_path(canonical)
-    if kv_path:
-        kvstore["path"] = kv_path.rstrip("/") + "/"
-
-    spec = {
-        "driver": filetype,
-        "kvstore": kvstore,
-        "context": _capped_tensorstore_context_spec(),
-    }
-    if mode == "r":
-        dataset_future = ts.open(spec, read=True, write=False)
-    else:
-        dataset_future = ts.open(spec, read=False, write=True)
-    return dataset_future.result()
-
-
-def read_with_retries(
-    dataset, valid_slices, max_retries=10, timeout=None, source_path=None,
-):
-    """Read from TensorStore with exponential backoff on timeout.
-
-    Parameters
-    ----------
-    dataset : tensorstore.TensorStore
-        Opened dataset handle.
-    valid_slices : tuple of slice
-        Slices to read.
-    max_retries : int
-        Maximum retry attempts.
-    timeout : float or None
-        Base timeout in seconds per attempt. ``None`` chooses a default
-        from read size and whether *source_path* is local or remote.
-    source_path : str, optional
-        Dataset path used only to distinguish local reads from remote reads.
-
-    Returns
-    -------
-    numpy.ndarray
-        Data read from the dataset.
-    """
-    if timeout is None:
-        timeout = _default_read_timeout_seconds(dataset, valid_slices, source_path)
-
-    for attempt in range(1, max_retries + 1):
-        attempt_timeout = timeout * attempt
-        try:
-            return dataset[valid_slices].read().result(timeout=attempt_timeout)
-        except TimeoutError as e:
-            logger.error(
-                f"[Attempt {attempt}/{max_retries}] "
-                f"Timeout after {attempt_timeout:.1f}s "
-                f"reading slices={valid_slices!r}: {e}"
-            )
-            if attempt == max_retries:
-                raise
-            delay = 1.0 * (1.3 ** (attempt - 1))
-            jitter = random.uniform(0, 1.0)
-            time.sleep(delay + jitter)
-
-
-def to_ndarray_tensorstore(dataset, roi, voxel_size, offset, swap_axes=False,
-                           fill_value=0, max_retries=10, timeout=None,
-                           source_path=None):
-    """Read a region of a TensorStore dataset as a numpy array.
-
-    Handles padding when the ROI extends beyond dataset bounds.
-
-    Parameters
-    ----------
-    dataset : tensorstore.TensorStore
-        Opened dataset handle.
-    roi : funlib.geometry.Roi or None
-        Region of interest in physical coordinates.  ``None`` reads
-        the entire dataset.
-    voxel_size : Coordinate
-        Native voxel size of the dataset.
-    offset : Coordinate
-        Spatial offset of the dataset origin.
-    swap_axes : bool
-        If ``True``, reverse axis order (for N5 format).
-    fill_value : int or float
-        Padding value for out-of-bounds regions.
-    max_retries : int
-        Maximum retry attempts for reading.
-    timeout : float or None
-        Base timeout in seconds per read attempt. ``None`` chooses a default
-        from read size and whether *source_path* is local or remote.
-    source_path : str, optional
-        Dataset path used only to distinguish local reads from remote reads.
-
-    Returns
-    -------
-    numpy.ndarray
-        Data array for the requested region.
-    """
-    if swap_axes:
-        if roi:
-            roi = Roi(roi.begin[::-1], roi.shape[::-1])
-        if offset:
-            offset = Coordinate(offset[::-1])
-        # Reverse voxel_size too — the division below uses it on the
-        # already-reversed ROI, so they must be in the same axis order.
-        voxel_size = Coordinate(reversed(tuple(voxel_size)))
-
-    domain = dataset.domain
-    if len(domain) > 3:
-        channel_offset = 1
-        domain = domain[1:]
-    else:
-        channel_offset = 0
-
-    if roi is None:
-        return dataset.read().result()
-
-    if offset is None:
-        offset = Coordinate(np.zeros(roi.dims, dtype=int))
-
-    # Subtract offset first so snap_to_grid aligns to the dataset's
-    # voxel grid (offset + k*voxel_size), not multiples of voxel_size.
-    # Without this, datasets with non-zero offset (e.g., 60nm) get
-    # misaligned reads where adjacent blocks read different physical
-    # voxels for what should be overlap.
-    roi -= offset
-    roi = roi.snap_to_grid(voxel_size)
-    roi /= voxel_size
-
-    roi_slices = roi.to_slices()
-
-    valid_slices = tuple(
-        slice(max(s.start, inclusive_min), min(s.stop, exclusive_max))
-        for s, inclusive_min, exclusive_max in zip(
-            roi_slices, domain.inclusive_min, domain.exclusive_max
-        )
-    )
-
-    no_overlap = any(vs.start >= vs.stop for vs in valid_slices)
-
-    pad_width = [
-        [valid_slice.start - s.start, s.stop - valid_slice.stop]
-        for s, valid_slice in zip(roi_slices, valid_slices)
-    ]
-
-    if channel_offset > 0:
-        pad_width = [[0, 0]] + pad_width
-        channels = slice(dataset.domain[0].inclusive_min, dataset.domain[0].exclusive_max)
-        valid_slices = (channels,) + valid_slices
-
-    if no_overlap:
-        output_shape = (
-            ([dataset.shape[0]] if channel_offset > 0 else [])
-            + [s.stop - s.start for s in roi_slices]
-        )
-        return np.full(output_shape, fill_value, dtype=dataset.dtype.numpy_dtype)
-
-    data = read_with_retries(
-        dataset, valid_slices, max_retries, timeout, source_path=source_path,
-    )
-
-    if np.any(np.array(pad_width)):
-        data = np.pad(
-            data,
-            pad_width=pad_width,
-            mode="constant",
-            constant_values=fill_value,
-        )
-
-    if swap_axes:
-        data = np.swapaxes(data, 0 + channel_offset, 2 + channel_offset)
-
-    return data
+    roi = (roi - offset).snap_to_grid(voxel_size) / voxel_size
+    lead = len(volume.shape) - roi.dims
+    begin = [0] * lead + list(roi.begin)
+    end = [1] * lead + list(roi.end)
+    block = volume.read_index(begin, end, padding=fill_value)
+    return block.reshape(block.shape[lead:])

@@ -475,3 +475,82 @@ class TestCliRoiHelp:
         )
         assert result.returncode == 0
         assert "--roi" in result.stdout
+
+
+def _ome_group(path, levels, shape=(64, 64, 64)):
+    """Write an OME-NGFF v0.4 zarr v2 group of empty arrays; *levels* is
+    ``[(name, voxel_size, translation), ...]``."""
+    import json
+    import tensorstore as ts
+
+    os.makedirs(path, exist_ok=True)
+    with open(os.path.join(path, ".zgroup"), "w") as f:
+        json.dump({"zarr_format": 2}, f)
+    datasets = []
+    for k, (name, vs, tr) in enumerate(levels):
+        ts.open({
+            "driver": "zarr",
+            "kvstore": {"driver": "file", "path": os.path.join(path, name)},
+            "metadata": {"shape": [max(1, s >> (2 * k)) for s in shape],
+                         "chunks": [16, 16, 16], "dtype": "<u4"},
+        }, create=True).result()
+        datasets.append({"path": name, "coordinateTransformations": [
+            {"type": "scale", "scale": [vs] * 3},
+            {"type": "translation", "translation": [tr] * 3},
+        ]})
+    with open(os.path.join(path, ".zattrs"), "w") as f:
+        json.dump({"multiscales": [{
+            "version": "0.4",
+            "axes": [{"name": a, "type": "space", "unit": "nanometer"} for a in "zyx"],
+            "datasets": datasets,
+        }]}, f)
+
+
+class TestCustomRoiSnapping:
+    def test_fractional_dict_roi_is_not_truncated(self, tmp_output_dir):
+        """Voxel centres sit at 2.5 + 4i. A begin of 14.6 starts at voxel
+        4 (centre 18.5); truncating it to 14 would also take voxel 3
+        (centre 14.5)."""
+        from mesh_n_bone.meshify.meshify import Meshify
+
+        group = os.path.join(tmp_output_dir, "frac.zarr")
+        _ome_group(group, [("s0", 4.0, 2.5)])
+        m = Meshify(
+            do_multires=False, input_path=f"{group}/s0",
+            output_directory=os.path.join(tmp_output_dir, "out"),
+            roi={"begin": [14.6] * 3, "end": [112.5] * 3},
+            num_workers=1, do_analysis=False,
+        )
+        # Integer frame: voxel i at round(2.5) + 4i = 2 + 4i.
+        assert tuple(m.roi.begin) == (18, 18, 18)
+        assert tuple(m.roi.end) == (114, 114, 114)
+
+    def test_custom_roi_is_resnapped_at_a_coarser_level(
+        self, tmp_output_dir, monkeypatch,
+    ):
+        """s0 voxels of 8.5 nm (8 in the integer frame), s1 of 34 nm.
+        World ROI [850, 1700) holds the s1 voxels whose centres
+        17 + 34i lie in it: i in [25, 50)."""
+        from mesh_n_bone.meshify.meshify import Meshify
+
+        group = os.path.join(tmp_output_dir, "aniso.zarr")
+        _ome_group(group, [("s0", 8.5, 4.25), ("s1", 34.0, 17.0)], shape=(256,) * 3)
+        m = Meshify(
+            do_multires=False, input_path=f"{group}/s0",
+            output_directory=os.path.join(tmp_output_dir, "out"),
+            roi={"begin": [850] * 3, "end": [1700] * 3},
+            num_workers=1, do_analysis=False,
+        )
+        s0_roi = m.roi
+        seen = []
+        monkeypatch.setattr(Meshify, "get_chunked_meshes",
+                            lambda self, _dir: seen.append(self.roi))
+        monkeypatch.setattr(Meshify, "assemble_meshes", lambda self, _dir: None)
+
+        m._generate_meshes_at_scale(
+            os.path.join(tmp_output_dir, "lod1"), input_dataset_path=f"{group}/s1",
+        )
+
+        assert tuple(seen[0].begin) == (17 + 25 * 34,) * 3
+        assert tuple(seen[0].shape) == (25 * 34,) * 3
+        assert m.roi == s0_roi
