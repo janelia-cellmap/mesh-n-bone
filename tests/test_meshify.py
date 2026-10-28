@@ -613,12 +613,15 @@ class TestPerLodTargetReduction:
     target_reduction=0.933 / 16nm input / decimation_factor=6, the formula
     must yield reductions that produce a constant 6x face-count drop per LOD."""
 
-    def _make_meshify(self, target_reduction=0.933, decimation_factor=6):
+    def _make_meshify(self, target_reduction=0.933, decimation_factor=6,
+                      voxel_size=(16.0, 16.0, 16.0)):
         from unittest.mock import MagicMock
         from mesh_n_bone.meshify.meshify import Meshify
         m = MagicMock(spec=Meshify)
         m.target_reduction = target_reduction
         m.decimation_factor = decimation_factor
+        m.true_voxel_size = np.asarray(voxel_size, dtype=float)
+        m._lod_factors = Meshify._lod_factors.__get__(m, Meshify)
         m._per_lod_target_reduction = (
             Meshify._per_lod_target_reduction.__get__(m, Meshify)
         )
@@ -649,6 +652,33 @@ class TestPerLodTargetReduction:
         m = self._make_meshify(target_reduction=0.9, decimation_factor=4)
         for k in range(4):
             assert m._per_lod_target_reduction(k) == pytest.approx(0.9, abs=1e-9)
+
+    def test_anisotropic_steps_keep_the_face_budget(self):
+        """A LOD that halves only y and x of (16, 8, 8) nm voxels drops
+        raw MC faces by less than 4x, so it must decimate more than an
+        isotropic step to land at 1/decimation_factor of the previous
+        LOD's faces; the isotropic formula would give a 4x drop there."""
+        from mesh_n_bone.meshify.meshify import _surface_crossings
+        m = self._make_meshify(target_reduction=0.933, decimation_factor=6,
+                               voxel_size=(16.0, 8.0, 8.0))
+        iso = self._make_meshify(target_reduction=0.933, decimation_factor=6)
+        assert m._lod_factors(3) == [(1, 1, 1), (1, 2, 2), (2, 4, 4)]
+        assert m._per_lod_target_reduction(0) == pytest.approx(0.933)
+        voxels = [np.array([16.0, 8.0, 8.0]) * f for f in m._lod_factors(3)]
+        raw = [_surface_crossings(v) for v in voxels]
+        prev_faces = raw[0] * (1 - m._per_lod_target_reduction(0))
+        for k in (1, 2):
+            faces_k = raw[k] * (1 - m._per_lod_target_reduction(k))
+            assert prev_faces / faces_k == pytest.approx(6.0, rel=1e-6)
+            prev_faces = faces_k
+        # (16,8,8) -> (16,16,16) drops raw faces 8/3x, not 4x, so LOD 1
+        # keeps 2/3 of the fraction the isotropic schedule would.
+        assert raw[0] / raw[1] == pytest.approx(8 / 3)
+        keep_aniso = 1 - m._per_lod_target_reduction(1)
+        keep_iso = 1 - iso._per_lod_target_reduction(1)
+        assert keep_aniso / keep_iso == pytest.approx(2 / 3, rel=1e-6)
+        # Once the voxels are isotropic, each further LOD is a 4x step.
+        assert (1 - m._per_lod_target_reduction(2)) / keep_aniso == pytest.approx(4 / 6)
 
     def test_hemibrain_anchor_values(self):
         """Formula values at the hemibrain-match config land within ~35%

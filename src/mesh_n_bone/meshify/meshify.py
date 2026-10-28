@@ -457,16 +457,16 @@ def _write_assembly_memory_plan(output_directory, estimates, waves):
 
 
 def _existing_pyramid_scales(pyramid_path, s0_voxel_size):
-    """Return ``{uniform_factor: level_path}`` of usable scales on disk,
+    """Return ``{(fz, fy, fx): level_path}`` of usable scales on disk,
     or ``None`` if there is no readable pyramid at *pyramid_path*.
 
     Reads the pyramid's OME-NGFF multiscales through worldarray (0.4 in
     zarr v2, 0.5 in zarr v3, or the 0.4 document earlier versions wrote
     into zarr v3) and returns, for each listed level whose array actually
-    exists, its downsample factor relative to *s0_voxel_size* when that
-    factor is the same whole number > 1 on every axis. Used to skip a
-    fresh build when a prior run already wrote the pyramid (e.g. debug
-    re-runs).
+    exists, its per-axis downsample factor relative to *s0_voxel_size*
+    when that is a whole number on every axis and > 1 on at least one.
+    Used to skip a fresh build when a prior run already wrote the
+    pyramid (e.g. debug re-runs).
     """
     if not os.path.isdir(pyramid_path):
         return None
@@ -485,9 +485,12 @@ def _existing_pyramid_scales(pyramid_path, s0_voxel_size):
         ratios = np.asarray(
             [meta.voxel_size[i] for i in meta.spatial], dtype=float,
         ) / s0_voxel_size
-        factor = int(round(ratios[0]))
-        if factor > 1 and np.allclose(ratios, factor, rtol=0, atol=1e-6):
-            result[factor] = meta.path
+        factor = np.rint(ratios)
+        if (
+            np.all(factor >= 1) and np.any(factor > 1)
+            and np.allclose(ratios, factor, rtol=0, atol=1e-6)
+        ):
+            result[tuple(int(f) for f in factor)] = meta.path
     return result
 
 
@@ -665,6 +668,32 @@ def _normalize_target_ids(value):
     return frozenset(int(i) for i in value)
 
 
+def _per_axis_factor(factor):
+    """``factor`` as a ``(z, y, x)`` tuple of ints, or ``None`` when it is
+    ``None`` or 1 on every axis. A user's scalar ``downsample_factor``
+    applies to every axis; a LOD's factor is already per axis, and halves
+    the finer axes of an anisotropic volume first (``Meshify._lod_factors``).
+    """
+    if factor is None:
+        return None
+    f = tuple(int(v) for v in np.broadcast_to(np.asarray(factor), (3,)))
+    if any(v < 1 for v in f):
+        raise ValueError(
+            f"downsample factor must be at least 1 on every axis, got {factor!r}"
+        )
+    return None if f == (1, 1, 1) else f
+
+
+def _surface_crossings(voxel_size):
+    """Voxels a surface of every orientation crosses per unit area, on
+    voxels of size ``(a, b, c)``: ``1/(b c) + 1/(a c) + 1/(a b)``.
+    Marching cubes makes about one face per crossed voxel, so this is how
+    raw face counts scale with voxel size: 4x fewer per doubling of all
+    three axes, less when a LOD step doubles only the finer axes."""
+    a, b, c = (float(v) for v in voxel_size)
+    return (a + b + c) / (a * b * c)
+
+
 def _get_chunked_mesh_worker(block_index, tmpdirname, config):
     """Run marching cubes on a single block and write per-segment PLYs.
 
@@ -707,13 +736,13 @@ def _get_chunked_mesh_worker(block_index, tmpdirname, config):
         volume, block.roi, voxel_size, roi_offset, fill_value=0,
     )
 
-    downsample_factor = config["downsample_factor"]
-    if downsample_factor:
+    # Per axis: an anisotropic volume's first LODs halve only its finer axes.
+    downsample_factor = _per_axis_factor(config["downsample_factor"])
+    if downsample_factor is not None:
         dm = config["downsample_method"]
         if dm == "nearest":
-            segmentation_block = segmentation_block[
-                ::downsample_factor, ::downsample_factor, ::downsample_factor
-            ].copy()
+            fz, fy, fx = downsample_factor
+            segmentation_block = segmentation_block[::fz, ::fy, ::fx].copy()
         else:
             methods = {
                 "mode_suppress_zero": downsample_labels_3d_suppress_zero,
@@ -753,8 +782,11 @@ def _get_chunked_mesh_worker(block_index, tmpdirname, config):
     block_offset = np.array(block.roi.get_begin())
     # Correct for the half-kernel shift introduced by downsampling:
     # a downsampled voxel at index 0 represents original voxels [0, ds),
-    # centered at (ds-1)/2 original voxels from the origin.
-    ds_shift = (downsample_factor - 1) / 2 * np.array(voxel_size) if downsample_factor else np.zeros(3)
+    # centered at (ds-1)/2 original voxels from the origin, per axis.
+    ds_shift = (
+        (np.array(downsample_factor) - 1) / 2 * np.array(voxel_size)
+        if downsample_factor is not None else np.zeros(3)
+    )
     mesher.mesh(segmentation_block, close=False)
     for id in mesher.ids():
         original_id = inv_remap[int(id)] if inv_remap is not None else int(id)
@@ -772,7 +804,7 @@ def _get_chunked_mesh_worker(block_index, tmpdirname, config):
             half_pad = 0.5 * np.array(output_voxel_size)[::-1]
             mesh_tri.vertices -= half_pad
 
-            ds = config["downsample_factor"] or 1
+            ds = np.array(downsample_factor or (1, 1, 1))
             block_size_voxels = np.array(config["read_write_block_shape_pixels"]) // ds
             block_size_world = (block_size_voxels * output_voxel_size)[::-1]
 
@@ -922,19 +954,22 @@ class Meshify:
           - ``"downsample"``: mesh each LOD from a coarser volume,
             preferring pre-existing OME-NGFF multiscale levels when
             available (see ``use_existing_scales``); otherwise
-            downsampling in-worker via ``downsample_method``. Each
-            LOD's effective ``target_reduction`` is auto-computed so
-            the per-LOD face count drops by ``decimation_factor``
-            (4x raw-MC drop from voxel doubling, plus
-            ``4 / decimation_factor`` extra decimation per LOD).
-            Default — produces hemibrain-density face counts when
-            paired with the matched ``target_reduction`` and
-            ``decimation_factor`` defaults.
+            downsampling in-worker via ``downsample_method``. LOD k is
+            the input downsampled by 2^k on every axis; an anisotropic
+            input halves only its finer axes until the voxels are
+            near-isotropic (worldarray's schedule, which cellmap-analyze
+            builds pyramids with). Each LOD's effective
+            ``target_reduction`` is auto-computed so the per-LOD face
+            count drops by ``decimation_factor`` (a 4x raw-MC drop when
+            a LOD doubles all three axes, less when it doubles two, plus
+            extra decimation to make up the rest). Default — produces
+            hemibrain-density face counts when paired with the matched
+            ``target_reduction`` and ``decimation_factor`` defaults.
     use_existing_scales : bool
         When ``True`` (default) and ``multires_strategy="downsample"``,
-        each LOD prefers reading the matching pre-existing OME-NGFF
-        multiscale level (``s_k``) over re-downsampling the input
-        in-worker. Set ``False`` to force every LOD to downsample the
+        each LOD prefers reading the pre-existing OME-NGFF multiscale
+        level with its per-axis factor (``s_k``) over re-downsampling
+        the input in-worker. Set ``False`` to force every LOD to downsample the
         input via ``downsample_method`` instead — useful when the
         dataset's own downsampling is poor quality or you want
         consistent ``mode_suppress_zero`` behavior at every LOD that the
@@ -2048,21 +2083,22 @@ class Meshify:
                 else:
                     self.roi = new_arr.roi
             elif downsample_factor is not None:
+                # Per axis; the configured scalar downsample_factor, if
+                # any, is already folded into a LOD's factor.
                 self.downsample_factor = downsample_factor
+                factor = np.array(_per_axis_factor(downsample_factor) or (1, 1, 1))
                 self.output_voxel_size_funlib = Coordinate(
-                    np.array(self.base_voxel_size_funlib) * downsample_factor
+                    np.array(self.base_voxel_size_funlib) * factor
                 )
-                self.true_voxel_size = orig_true_voxel / (orig_downsample or 1) * downsample_factor
+                base_factor = np.array(_per_axis_factor(orig_downsample) or (1, 1, 1))
+                self.true_voxel_size = orig_true_voxel / base_factor * factor
 
             if target_reduction_override is not None:
                 self.target_reduction = target_reduction_override
 
             os.makedirs(self.output_directory, exist_ok=True)
-            scale_tag = (
-                f"s{int(np.log2(self.downsample_factor))}"
-                if self.downsample_factor
-                else "s0"
-            )
+            factor = _per_axis_factor(self.downsample_factor)
+            scale_tag = f"s{int(np.log2(max(factor)))}" if factor else "s0"
             tmp_chunked_dir = (
                 self.output_directory
                 + ("/tmp_chunked_" + scale_tag
@@ -2091,15 +2127,20 @@ class Meshify:
             self.roi = orig_roi
 
     def _discover_existing_scales(self):
-        """Return ``{relative_downsample_factor: dataset_path}`` for OME-NGFF
-        multiscale levels available in the input zarr, relative to the
-        input dataset's own scale.
+        """Return ``{(fz, fy, fx): dataset_path}`` for OME-NGFF multiscale
+        levels available in the input zarr, keyed by each level's per-axis
+        downsample factor relative to the input dataset's own scale.
 
-        For example, if ``input_path`` is ``.../seg/s0`` (scale=[1,1,1])
-        and the group exposes s0..s3, this returns ``{1: '...s0', 2:
-        '...s1', 4: '...s2', 8: '...s3'}``. If the input is already s1,
-        the same group gives ``{1: '...s1', 2: '...s2', 4: '...s3'}``
+        For example, if ``input_path`` is ``.../seg/s0`` (scale=[8,8,8])
+        and the group exposes s0..s3 halving every axis, this returns
+        ``{(1,1,1): '...s0', (2,2,2): '...s1', (4,4,4): '...s2', (8,8,8):
+        '...s3'}``. An anisotropic input (scale=[16,8,8]) whose pyramid
+        halves the finer axes first, as cellmap-analyze's does, gives
+        ``{(1,1,1): '...s0', (1,2,2): '...s1', (2,4,4): '...s2'}``. If the
+        input is already s1, the same group gives the levels from s1 on
         (s0 is finer than input → not useful for a downsample pyramid).
+        Each level's factor must be a whole number of input voxels on
+        every axis; ``_lod_factors`` says which factors the LODs need.
 
         Cached after first call. Returns ``{}`` when the input has no
         recognisable multiscales metadata (precomputed sources, plain
@@ -2134,17 +2175,14 @@ class Meshify:
                         continue
                     voxel_size = [meta.voxel_size[i] for i in meta.spatial]
                     ratios = np.asarray(voxel_size, dtype=float) / input_scale
-                    if not np.allclose(ratios, ratios[0], rtol=0, atol=1e-6):
+                    factor = np.rint(ratios)
+                    # Coarser than the input by a whole number of voxels
+                    # on every axis (not necessarily the same number).
+                    if np.any(factor < 1) or not np.allclose(
+                        ratios, factor, rtol=0, atol=1e-6,
+                    ):
                         continue
-                    ratio = float(ratios[0])
-                    if ratio < 1.0 - 1e-6:
-                        continue
-                    ratio_int = int(round(ratio))
-                    if abs(ratio - ratio_int) > 1e-6:
-                        continue
-                    if ratio_int < 1 or (ratio_int & (ratio_int - 1)) != 0:
-                        continue
-                    result[ratio_int] = meta.path
+                    result[tuple(int(f) for f in factor)] = meta.path
         except Exception as e:
             logger.warning(
                 "Could not discover existing multiscale levels (%s); "
@@ -2159,42 +2197,24 @@ class Meshify:
         downsample multires strategy.
 
         Looks at what the source group exposes, computes the per-axis
-        cumulative factors needed for ``num_lods``, and builds whatever's
-        missing under ``{output_directory}/_intermediate_scales.zarr``.
+        cumulative factors needed for ``num_lods`` (``_lod_factors``), and
+        builds whatever's missing under
+        ``{output_directory}/_intermediate_scales.zarr``.
 
-        Returns ``{int_factor: dataset_path}`` mapping ONLY the
+        Returns ``{(fz, fy, fx): dataset_path}`` mapping ONLY the
         newly-built scales (so the caller can merge with the source's
-        existing scales). The mapping key is a single int — only valid
-        for isotropic-factor levels — to match the existing
-        ``_discover_existing_scales`` cache shape. Anisotropic factor
-        tuples aren't yet honored by the downstream LOD dispatch, so
-        the builder skips emitting them into the cache (they still get
-        written to disk for future use); falls back to in-worker
-        downsampling for those LODs.
+        existing scales), keyed like ``_discover_existing_scales``.
         """
-        from mesh_n_bone.util.pyramid_builder import (
-            per_lod_factors_for_anisotropy,
-            build_missing_pyramid_levels,
-        )
         from funlib.geometry import Coordinate, Roi
 
-        voxel_size = np.asarray(self.true_voxel_size, dtype=float)
-        factors_per_lod = per_lod_factors_for_anisotropy(voxel_size, num_lods)
+        factors_per_lod = self._lod_factors(num_lods)
 
         existing = self._discover_existing_scales() if self.use_existing_scales else {}
-        # Only build levels where the factor is "uniform" — i.e. (k,k,k) —
-        # since downstream LOD dispatch is by single int factor. Anisotropic
-        # output is still written to disk (useful for future runs or external
-        # tools) but isn't fed back into the cache.
-        needed_uniform = []
-        for k, factor in enumerate(factors_per_lod):
-            if k == 0:
-                continue
-            if factor[0] == factor[1] == factor[2]:
-                if factor[0] not in existing:
-                    needed_uniform.append((k, factor))
-        if not needed_uniform:
-            # Nothing to build OR everything is anisotropic (no cache benefit)
+        needed = [
+            (k, factor) for k, factor in enumerate(factors_per_lod)
+            if k > 0 and factor not in existing
+        ]
+        if not needed:
             return {}
 
         pyramid_path = os.path.join(
@@ -2207,10 +2227,10 @@ class Meshify:
         # the (potentially slow) downsample pass each time.
         existing_pyramid = _existing_pyramid_scales(pyramid_path, self.true_voxel_size)
         if existing_pyramid is not None:
-            need_factors = {int(factor[0]) for _, factor in needed_uniform}
-            if need_factors.issubset(set(existing_pyramid.keys())):
+            need_factors = {factor for _, factor in needed}
+            if need_factors.issubset(existing_pyramid):
                 logger.info(
-                    "pyramid_builder: reusing existing %s (scales %s)",
+                    "pyramid_builder: reusing existing %s (factors %s)",
                     pyramid_path, sorted(need_factors),
                 )
                 return {f: existing_pyramid[f] for f in need_factors}
@@ -2287,7 +2307,7 @@ class Meshify:
             # memory/compute bounded as num_lods grows.
             cascade_steps = []
             prev_k, prev_factor = None, (1, 1, 1)
-            for k, factor in needed_uniform:
+            for k, factor in needed:
                 read_from_s0 = not (prev_k is not None and k == prev_k + 1)
                 step = factor if read_from_s0 else tuple(
                     int(a // b) for a, b in zip(factor, prev_factor)
@@ -2296,7 +2316,7 @@ class Meshify:
                 prev_k, prev_factor = k, factor
             max_factor = np.max(np.array([s for _, _, s, _ in cascade_steps]), axis=0)
         else:
-            max_factor = np.max(np.array([f for _, f in needed_uniform]), axis=0)
+            max_factor = np.max(np.array([f for _, f in needed]), axis=0)
         itemsize = int(np.dtype(seg_arr.data.dtype).itemsize)
         # 1.0 (s0 read) + 1/8 (LOD 1 output) + ~1/8 (downsample scratch)
         # plus ~1x slack for tensorstore decode/encode buffers, output-handle
@@ -2351,16 +2371,13 @@ class Meshify:
         # Resolve ROI alignment up-front (we need the aligned out_shape to
         # build the output zarr arrays)
         from mesh_n_bone.util.pyramid_builder import (
-            per_lod_factors_for_anisotropy,
             align_roi_voxels,
             prepare_pyramid_metadata_and_arrays,
             process_super_chunk_for_dask,
             process_cascade_chunk_for_dask,
         )
         max_factor_per_axis = max_factor  # alias
-        factors_per_lod_full = per_lod_factors_for_anisotropy(
-            self.true_voxel_size, num_lods,
-        )
+        factors_per_lod_full = factors_per_lod
         aligned_out_origin, aligned_out_shape, _, _ = align_roi_voxels(
             roi_voxel_origin, roi_voxel_shape,
             max_factor_per_axis, self.pyramid_alignment_mode,
@@ -2379,9 +2396,9 @@ class Meshify:
         logger.info(
             "pyramid_builder: input exposes scales %s; auto-building %d "
             "missing scale(s) %s under %s (alignment_mode=%s, strategy=%s)",
-            sorted(existing.keys()) or [1],
-            len(needed_uniform),
-            [factor for _, factor in needed_uniform],
+            sorted(existing.keys()) or [(1, 1, 1)],
+            len(needed),
+            [factor for _, factor in needed],
             pyramid_path, self.pyramid_alignment_mode,
             "cascade" if self.downsample_cascade else "direct-from-source",
         )
@@ -2410,7 +2427,7 @@ class Meshify:
             worker_config = {
                 **s0_config,
                 "factors_per_lod": [list(f) for f in factors_per_lod_full],
-                "missing_lods": [k for k, _ in needed_uniform],
+                "missing_lods": [k for k, _ in needed],
                 "downsample_method": self.downsample_method,
                 "pyramid_path": pyramid_path,
             }
@@ -2500,7 +2517,7 @@ class Meshify:
             prepare_pyramid_metadata_and_arrays(
                 output_zarr_path=pyramid_path,
                 factors_per_lod=factors_per_lod_full,
-                missing_lods=[k for k, _ in needed_uniform],
+                missing_lods=[k for k, _ in needed],
                 out_origin=aligned_out_origin,
                 out_shape=aligned_out_shape,
                 out_chunk_shape_voxels=tuple(out_chunk_shape),
@@ -2589,37 +2606,62 @@ class Meshify:
 
         # Return mapping of newly-built factors -> path within the pyramid
         return {
-            factor[0]: os.path.join(pyramid_path, f"s{k}")
-            for k, factor in needed_uniform
+            factor: os.path.join(pyramid_path, f"s{k}")
+            for k, factor in needed
         }
+
+    def _lod_factors(self, num_lods=None):
+        """The per-axis downsample factor ``(fz, fy, fx)`` of each LOD
+        relative to the input, LOD 0 first (``(1, 1, 1)``).
+
+        Isotropic voxels halve every axis per LOD: ``(2, 2, 2)``, ``(4, 4,
+        4)``, ... An anisotropic input halves only the axes within 1.5x of
+        its finest voxel size until the voxels are near-isotropic, so
+        ``(16, 8, 8)`` nm gives ``(1, 2, 2)``, ``(2, 4, 4)``, ...
+        (:func:`worldarray.level_factors`, the schedule cellmap-analyze
+        builds its pyramids with, so an input's own levels are reused).
+        """
+        from mesh_n_bone.util.pyramid_builder import per_lod_factors_for_anisotropy
+
+        return per_lod_factors_for_anisotropy(
+            np.asarray(self.true_voxel_size, dtype=float),
+            self.num_lods if num_lods is None else num_lods,
+        )
 
     def _per_lod_target_reduction(self, lod: int) -> float:
         """Per-LOD target_reduction for the downsample multires strategy.
 
-        Raw MC face count drops by 4x per scale step (voxel doubling).
         We want each LOD to land at the previous LOD's face count divided
-        by ``decimation_factor`` (default 6 for hemibrain). So the keep
-        ratio at LOD k is::
+        by ``decimation_factor`` (default 6 for hemibrain). Raw MC face
+        count scales with the voxels a surface crosses per unit area
+        (``_surface_crossings``): it drops 4x when a LOD doubles all
+        three axes, less when it doubles only the finer axes of an
+        anisotropic volume. So the keep ratio at LOD k is::
 
-            keep(k) = (1 - target_reduction) * (4 / decimation_factor)**k
+            keep(k) = (1 - target_reduction)
+                      * crossings(voxel_0) / crossings(voxel_k)
+                      / decimation_factor**k
 
-        For ``target_reduction=0.933`` (hemibrain s1 LOD-0 anchor) and
-        ``decimation_factor=6``, this gives 0.933, 0.955, 0.970, 0.980 at
-        LODs 0..3 — matching hemibrain's measured face counts within ~1-2%.
+        which for isotropic voxels is ``(1 - target_reduction) * (4 /
+        decimation_factor)**k``. For ``target_reduction=0.933`` (hemibrain
+        s1 LOD-0 anchor) and ``decimation_factor=6``, that gives 0.933,
+        0.955, 0.970, 0.980 at LODs 0..3 — matching hemibrain's measured
+        face counts within ~1-2%.
         """
         keep_0 = max(0.0, 1.0 - float(self.target_reduction))
-        ratio = 4.0 / float(self.decimation_factor)
-        keep_k = keep_0 * (ratio ** lod)
+        voxel_0 = np.asarray(self.true_voxel_size, dtype=float)
+        voxel_k = voxel_0 * np.asarray(self._lod_factors(lod + 1)[lod])
+        raw_drop = _surface_crossings(voxel_0) / _surface_crossings(voxel_k)
+        keep_k = keep_0 * raw_drop / float(self.decimation_factor) ** lod
         return max(0.0, min(1.0, 1.0 - keep_k))
 
     def _get_downsample_factor_for_lod(self, lod):
-        """Get the total downsample factor for a given LOD level.
-
-        If the base config already has a downsample_factor, multiply it.
-        Otherwise, use 2^lod (lod=0 means no downsampling).
+        """The per-axis factor LOD ``lod`` downsamples the input by
+        in-worker: the LOD's own factor (``_lod_factors``) times the
+        configured ``downsample_factor``, if any.
         """
-        base = self.downsample_factor or 1
-        return base * (2 ** lod)
+        base = np.array(_per_axis_factor(self.downsample_factor) or (1, 1, 1))
+        return tuple(int(v) for v in base * np.asarray(self._lod_factors(lod + 1)[lod]))
 
     def get_multiscale_meshes(self):
         """Generate meshes and create neuroglancer multiresolution output.
@@ -2633,7 +2675,9 @@ class Meshify:
             Best for thin/elongated structures (e.g. mitochondria).
 
         "downsample":
-            1. For each LOD, downsample the volume by 2^lod
+            1. For each LOD, downsample the volume by its per-axis
+               factor (2^lod on every axis for isotropic voxels; the
+               finer axes first for anisotropic ones, see ``_lod_factors``)
             2. Run marching cubes at each downsampled resolution
             3. Feed all LODs into the neuroglancer multires pipeline
             Best for thick/compact structures.
@@ -2891,23 +2935,24 @@ class Meshify:
         ``target_reduction`` unchanged.
 
         If the input zarr exposes OME-NGFF multiscales metadata, each
-        LOD prefers reading from the matching pre-existing scale (e.g.
-        ``s_k`` for LOD k) rather than downsampling the input in-worker.
-        Falls back to in-worker downsampling per-LOD when no matching
-        scale exists.
+        LOD prefers reading from the pre-existing scale with the LOD's
+        per-axis factor (``_lod_factors``; e.g. ``s_k`` for LOD k) rather
+        than downsampling the input in-worker. Falls back to in-worker
+        downsampling per-LOD when no matching scale exists.
         """
         existing_scales = (
             self._discover_existing_scales() if self.use_existing_scales else {}
         )
         base_ds = self.downsample_factor or 1
+        factors = self._lod_factors()
 
         # If any LOD's required factor is missing from the input zarr's
         # OME-NGFF multiscales, build the missing scales upfront into an
         # intermediate pyramid zarr. This avoids the slow per-LOD
         # in-worker fallback (reads s0 once instead of N times).
         if self.use_existing_scales and base_ds == 1 and self.num_lods > 1:
-            needed_uniform = [2 ** lod for lod in lods if lod > 0]
-            if any(f not in existing_scales for f in needed_uniform):
+            needed = [factors[lod] for lod in lods if lod > 0]
+            if any(f not in existing_scales for f in needed):
                 try:
                     new_scales = self._build_missing_pyramid_scales(self.num_lods)
                     existing_scales = {**existing_scales, **new_scales}
@@ -2923,10 +2968,9 @@ class Meshify:
 
         for lod in lods:
             scale_dir = f"{mesh_lods_dir}/s{lod}"
-            target_factor = 2 ** lod
             tr_lod = self._per_lod_target_reduction(lod)
 
-            existing_path = existing_scales.get(target_factor)
+            existing_path = existing_scales.get(factors[lod])
             if existing_path is not None and base_ds == 1:
                 # Read directly from a pre-computed scale; no in-worker downsample
                 logger.info(

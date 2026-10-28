@@ -121,6 +121,33 @@ class TestCubeCoordinates:
                 err_msg=f"LOD {lod} extent differs from expected {expected_extent}"
             )
 
+    @pytest.mark.parametrize("use_existing_scales", [True, False])
+    def test_anisotropic_lods_stay_in_place(self, zarr_cube_anisotropic,
+                                            tmp_output_dir, use_existing_scales):
+        """With voxel_size=[8,4,4] the LODs downsample by (1,2,2) then
+        (2,4,4): each LOD's mesh sits where the cube is, within that
+        LOD's own voxel size on each axis, whether the LOD reads the
+        auto-built pyramid or downsamples in-worker."""
+        zarr_path, expected_min, expected_max, expected_center = zarr_cube_anisotropic
+        output_dir = os.path.join(tmp_output_dir, f"cube_aniso_{use_existing_scales}")
+        meshify = _run_meshify(
+            zarr_path, output_dir, do_multires=True, num_lods=3,
+            multires_strategy="downsample", delete_decimated_meshes=False,
+            delete_intermediate_scales=False,
+            use_existing_scales=use_existing_scales,
+        )
+        assert meshify._lod_factors() == [(1, 1, 1), (1, 2, 2), (2, 4, 4)]
+        built = os.path.exists(os.path.join(output_dir, "_intermediate_scales.zarr"))
+        assert built == use_existing_scales
+
+        for lod, factor in enumerate(meshify._lod_factors()):
+            mesh = trimesh.load(os.path.join(output_dir, "mesh_lods", f"s{lod}", "1.ply"))
+            # Marching cubes can shift a face by up to that axis's voxel.
+            tol = (np.array([8.0, 4.0, 4.0]) * factor)[::-1]
+            assert np.all(np.abs(mesh.bounds[0] - expected_min) <= tol), (lod, mesh.bounds)
+            assert np.all(np.abs(mesh.bounds[1] - expected_max) <= tol), (lod, mesh.bounds)
+            assert np.all(np.abs(mesh.centroid - expected_center) <= tol), (lod, mesh.centroid)
+
 
 class TestOmeNgffCoordinates:
     """Test that OME-NGFF multiscales metadata is correctly picked up."""

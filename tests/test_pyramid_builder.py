@@ -779,12 +779,12 @@ class TestExistingPyramidScalesBothFormats:
     def test_parses_zarr_v2_pyramid(self, tmp_path):
         out_path, result = self._build(tmp_path, zarr_format=2)
         assert os.path.isfile(os.path.join(out_path, ".zattrs"))
-        assert result == {2: f"{out_path}/s1", 4: f"{out_path}/s2"}
+        assert result == {(2, 2, 2): f"{out_path}/s1", (4, 4, 4): f"{out_path}/s2"}
 
     def test_parses_zarr_v3_pyramid(self, tmp_path):
         out_path, result = self._build(tmp_path, zarr_format=3)
         assert os.path.isfile(os.path.join(out_path, "zarr.json"))
-        assert result == {2: f"{out_path}/s1", 4: f"{out_path}/s2"}
+        assert result == {(2, 2, 2): f"{out_path}/s1", (4, 4, 4): f"{out_path}/s2"}
         with open(os.path.join(out_path, "zarr.json")) as f:
             assert f.read().count('"version": "0.5"') == 1
 
@@ -817,7 +817,31 @@ class TestExistingPyramidScalesBothFormats:
                 "create": True,
             }).result()
         assert _existing_pyramid_scales(out_path, [8.0, 8.0, 8.0]) == {
-            2: f"{out_path}/s1", 4: f"{out_path}/s2",
+            (2, 2, 2): f"{out_path}/s1", (4, 4, 4): f"{out_path}/s2",
+        }
+
+    def test_anisotropic_levels_are_keyed_per_axis(self, tmp_path):
+        """A pyramid built for (16, 8, 8) voxels halves y and x first;
+        its levels are found by their per-axis factors."""
+        from mesh_n_bone.meshify.meshify import _existing_pyramid_scales
+
+        rng = np.random.default_rng(2)
+        vol = rng.integers(low=0, high=4, size=(8, 16, 16), dtype=np.uint8)
+        out_path = str(tmp_path / "aniso.zarr")
+        build_missing_pyramid_levels(
+            s0_reader=lambda o, s: vol[o[0]:o[0]+s[0], o[1]:o[1]+s[1], o[2]:o[2]+s[2]].copy(),
+            s0_dataset_shape_voxels=np.array(vol.shape),
+            s0_voxel_size_zyx=[16.0, 8.0, 8.0],
+            s0_translation_zyx=[8.0, 4.0, 4.0],
+            dtype=vol.dtype,
+            num_lods=3,
+            existing_factors=set(),
+            output_zarr_path=out_path,
+            downsample_func=downsample_labels_3d,
+            out_chunk_shape_voxels=(4, 4, 4),
+        )
+        assert _existing_pyramid_scales(out_path, [16.0, 8.0, 8.0]) == {
+            (1, 2, 2): f"{out_path}/s1", (2, 4, 4): f"{out_path}/s2",
         }
 
 
