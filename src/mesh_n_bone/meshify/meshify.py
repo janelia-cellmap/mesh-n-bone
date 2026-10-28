@@ -954,11 +954,12 @@ class Meshify:
           - ``"downsample"``: mesh each LOD from a coarser volume,
             preferring pre-existing OME-NGFF multiscale levels when
             available (see ``use_existing_scales``); otherwise
-            downsampling in-worker via ``downsample_method``. LOD k is
-            the input downsampled by 2^k on every axis; an anisotropic
-            input halves only its finer axes until the voxels are
+            downsampling in-worker via ``downsample_method``. The
+            input's own levels are the first LODs, in order; LODs past
+            them downsample by 2 on every axis, or only on the finer
+            axes of an anisotropic volume until its voxels are
             near-isotropic (worldarray's schedule, which cellmap-analyze
-            builds pyramids with). Each LOD's effective
+            builds pyramids with; see ``_lod_factors``). Each LOD's effective
             ``target_reduction`` is auto-computed so the per-LOD face
             count drops by ``decimation_factor`` (a 4x raw-MC drop when
             a LOD doubles all three axes, less when it doubles two, plus
@@ -967,9 +968,9 @@ class Meshify:
             ``target_reduction`` and ``decimation_factor`` defaults.
     use_existing_scales : bool
         When ``True`` (default) and ``multires_strategy="downsample"``,
-        each LOD prefers reading the pre-existing OME-NGFF multiscale
-        level with its per-axis factor (``s_k``) over re-downsampling
-        the input in-worker. Set ``False`` to force every LOD to downsample the
+        the LODs are the input's pre-existing OME-NGFF multiscale levels
+        (``s_k``), read as they are, before any re-downsampling of the
+        input in-worker. Set ``False`` to force every LOD to downsample the
         input via ``downsample_method`` instead — useful when the
         dataset's own downsampling is poor quality or you want
         consistent ``mode_suppress_zero`` behavior at every LOD that the
@@ -2140,7 +2141,7 @@ class Meshify:
         input is already s1, the same group gives the levels from s1 on
         (s0 is finer than input → not useful for a downsample pyramid).
         Each level's factor must be a whole number of input voxels on
-        every axis; ``_lod_factors`` says which factors the LODs need.
+        every axis; ``_lod_factors`` makes the LODs from these levels.
 
         Cached after first call. Returns ``{}`` when the input has no
         recognisable multiscales metadata (precomputed sources, plain
@@ -2614,19 +2615,39 @@ class Meshify:
         """The per-axis downsample factor ``(fz, fy, fx)`` of each LOD
         relative to the input, LOD 0 first (``(1, 1, 1)``).
 
-        Isotropic voxels halve every axis per LOD: ``(2, 2, 2)``, ``(4, 4,
-        4)``, ... An anisotropic input halves only the axes within 1.5x of
-        its finest voxel size until the voxels are near-isotropic, so
-        ``(16, 8, 8)`` nm gives ``(1, 2, 2)``, ``(2, 4, 4)``, ...
-        (:func:`worldarray.level_factors`, the schedule cellmap-analyze
-        builds its pyramids with, so an input's own levels are reused).
+        With ``use_existing_scales``, the input's own levels come first,
+        finest to coarsest, whatever schedule they were built on: each
+        LOD is the next level no finer on any axis than the one before.
+        LODs beyond them follow :func:`worldarray.level_factors` from the
+        last LOD's voxel size: every axis is halved for isotropic voxels,
+        only the axes within 1.5x of the finest voxel size for anisotropic
+        ones, until the voxels are near-isotropic. So a ``(16, 8, 8)`` nm
+        input with no levels gives ``(1, 2, 2)``, ``(2, 4, 4)``, ... (the
+        schedule cellmap-analyze builds pyramids with), and one whose
+        pyramid halves every axis gives ``(2, 2, 2)``, ``(4, 4, 4)``, ...
+        and then, past its last level, ``(4, 8, 8)``.
         """
-        from mesh_n_bone.util.pyramid_builder import per_lod_factors_for_anisotropy
+        import worldarray as wa
 
-        return per_lod_factors_for_anisotropy(
-            np.asarray(self.true_voxel_size, dtype=float),
-            self.num_lods if num_lods is None else num_lods,
-        )
+        num_lods = self.num_lods if num_lods is None else num_lods
+        factors = [(1, 1, 1)]
+        if self.use_existing_scales:
+            candidates = sorted(
+                (f for f in self._discover_existing_scales() if f != (1, 1, 1)),
+                key=lambda f: (int(np.prod(f)), f),
+            )
+            for candidate in candidates:
+                if len(factors) >= num_lods:
+                    break
+                prev = factors[-1]
+                if all(c >= p for c, p in zip(candidate, prev)) and candidate != prev:
+                    factors.append(candidate)
+        voxel_size = np.asarray(self.true_voxel_size, dtype=float) * np.asarray(factors[-1])
+        for step in wa.level_factors(
+            [float(v) for v in voxel_size], 1.5, max_levels=max(0, num_lods - len(factors)),
+        ):
+            factors.append(tuple(int(f * s) for f, s in zip(factors[-1], step)))
+        return factors
 
     def _per_lod_target_reduction(self, lod: int) -> float:
         """Per-LOD target_reduction for the downsample multires strategy.
@@ -2675,9 +2696,10 @@ class Meshify:
             Best for thin/elongated structures (e.g. mitochondria).
 
         "downsample":
-            1. For each LOD, downsample the volume by its per-axis
-               factor (2^lod on every axis for isotropic voxels; the
-               finer axes first for anisotropic ones, see ``_lod_factors``)
+            1. For each LOD, read the input's own level, or downsample
+               the volume by the LOD's per-axis factor (2 per LOD on
+               every axis for isotropic voxels; the finer axes first for
+               anisotropic ones, see ``_lod_factors``)
             2. Run marching cubes at each downsampled resolution
             3. Feed all LODs into the neuroglancer multires pipeline
             Best for thick/compact structures.

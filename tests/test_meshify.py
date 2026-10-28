@@ -621,6 +621,7 @@ class TestPerLodTargetReduction:
         m.target_reduction = target_reduction
         m.decimation_factor = decimation_factor
         m.true_voxel_size = np.asarray(voxel_size, dtype=float)
+        m.use_existing_scales = False
         m._lod_factors = Meshify._lod_factors.__get__(m, Meshify)
         m._per_lod_target_reduction = (
             Meshify._per_lod_target_reduction.__get__(m, Meshify)

@@ -132,11 +132,12 @@ multires_strategy: downsample    # LOD strategy: decimate (face-decimate s0 mesh
 # extra config needed beyond having OME-NGFF multiscales metadata on the
 # input zarr. For precomputed sources or zarrs without multiscales,
 # every LOD downsamples in-worker via `downsample_method`.
-# The factor is per axis. Isotropic voxels halve every axis per LOD; an
-# anisotropic input halves only the axes within 1.5x of its finest voxel
-# size until the voxels are near-isotropic, so 16x8x8 nm data has LODs at
-# 16x16x16, 32x32x32, ... That is also how cellmap-analyze builds its
-# pyramids, so those levels are reused as they are.
+# The input's own levels are the first LODs, in order, whatever factors
+# they were built with. LODs past them are downsampled by 2 per axis:
+# every axis for isotropic voxels; for an anisotropic input only the axes
+# within 1.5x of its finest voxel size, until the voxels are
+# near-isotropic, so 16x8x8 nm data gets LODs at 16x16x16, 32x32x32, ...
+# (which is also how cellmap-analyze builds its pyramids).
 use_existing_scales: true        # Set false to FORCE in-worker downsampling at every LOD,
                                  # ignoring any pre-built s_k scales on the input zarr. Use
                                  # when you don't trust the source's downsampling and want

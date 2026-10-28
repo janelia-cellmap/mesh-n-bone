@@ -414,7 +414,63 @@ class TestMeshifyDownsampleStrategyExistingScales:
         assert {f: p.rsplit("/", 1)[-1] for f, p in scales.items()} == {
             (1, 1, 1): "s0", (1, 2, 2): "s1", (2, 4, 4): "s2",
         }
-        assert m._lod_factors(3) == [(1, 1, 1), (1, 2, 2), (2, 4, 4)]
+        # The levels are the LODs; past them, every axis is halved.
+        assert m._lod_factors(4) == [(1, 1, 1), (1, 2, 2), (2, 4, 4), (4, 8, 8)]
+
+    def test_lods_follow_a_pyramid_that_halves_every_axis(self, tmp_output_dir):
+        """An anisotropic input whose own pyramid halves every axis is
+        read level for level too; only LODs past its last level move
+        toward isotropic voxels."""
+        import json
+        s0_path, zarr_path = self._create_multiscale_zarr(tmp_output_dir, num_levels=3)
+        # Relabel the isotropic fixture's levels as (16, 8, 8) nm halved
+        # on every axis: 32x16x16, 64x32x32.
+        meta_path = os.path.join(zarr_path, "zarr.json")
+        with open(meta_path) as f:
+            meta = json.load(f)
+        for k, ds in enumerate(meta["attributes"]["multiscales"][0]["datasets"]):
+            ds["coordinateTransformations"] = [
+                {"type": "scale", "scale": [16.0 * 2 ** k, 8.0 * 2 ** k, 8.0 * 2 ** k]},
+            ]
+        with open(meta_path, "w") as f:
+            json.dump(meta, f)
+        output_dir = os.path.join(tmp_output_dir, "out_uniform_aniso")
+        m = Meshify(
+            input_path=s0_path,
+            output_directory=output_dir,
+            num_workers=1,
+            do_multires=True,
+            num_lods=4,
+            multires_strategy="downsample",
+            delete_intermediate_scales=False,
+            target_faces_per_lod0_chunk=200,
+            check_mesh_validity=False,
+            do_analysis=False,
+            do_simplification=True,
+        )
+        assert m._lod_factors() == [(1, 1, 1), (2, 2, 2), (4, 4, 4), (4, 8, 8)]
+        calls = []
+        orig = m._generate_meshes_at_scale.__func__
+        def _spy(self_, output_mesh_dir, downsample_factor=None,
+                  target_reduction_override=None, input_dataset_path=None):
+            calls.append((downsample_factor, input_dataset_path))
+            return orig(self_, output_mesh_dir,
+                         downsample_factor=downsample_factor,
+                         target_reduction_override=target_reduction_override,
+                         input_dataset_path=input_dataset_path)
+        m._generate_meshes_at_scale = _spy.__get__(m, Meshify)
+
+        m.get_meshes()
+
+        # s1 and s2 are read as they are; only LOD 3 is built, from s0.
+        assert [(f, p.rsplit("/", 2)[-2:]) for f, p in calls] == [
+            (None, ["multiscale.zarr", "s0"]),
+            (None, ["multiscale.zarr", "s1"]),
+            (None, ["multiscale.zarr", "s2"]),
+            (None, ["_intermediate_scales.zarr", "s3"]),
+        ]
+        pyramid = os.path.join(output_dir, "_intermediate_scales.zarr")
+        assert sorted(d for d in os.listdir(pyramid) if d.startswith("s")) == ["s0", "s3"]
 
     def test_discover_skips_a_missing_level(self, tmp_output_dir):
         """A level listed in the multiscales but absent on disk is
