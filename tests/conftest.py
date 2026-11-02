@@ -272,6 +272,22 @@ def zarr_cube_with_offset(tmp_output_dir):
 
 
 @pytest.fixture
+def zarr_cube_anisotropic(tmp_output_dir):
+    """Like ``zarr_cube_with_offset`` with voxel_size=[8,4,4] (ZYX): a
+    160 nm cube at voxels [4:24, 8:48, 8:48] of a 32x64x64 volume, so
+    the LODs halve y and x before z.
+    """
+    return _make_zarr_cube(
+        tmp_output_dir,
+        voxel_size=[8, 4, 4],
+        offset=[100, 200, 300],
+        vol_shape=(32, 64, 64),
+        cube_slice=(slice(4, 24), slice(8, 48), slice(8, 48)),
+        chunk_shape=(16, 16, 16),
+    )
+
+
+@pytest.fixture
 def zarr_sphere(tmp_output_dir):
     """Zarr volume containing a voxelized sphere for volume verification.
 
