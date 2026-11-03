@@ -1,0 +1,221 @@
+name: mesh-n-bone
+description: Generate multiresolution Neuroglancer meshes from segmentation volumes (zarr, N5, precomputed), parallelized with Dask on the cluster.
+version: "0.9.0"
+
+requirements:
+  - "pixi>=0.40"
+
+runnables:
+  - id: meshify
+    type: job
+    name: Meshify segmentation volume
+    description: >-
+      Run marching cubes on a label volume, assemble across chunks, simplify
+      and smooth, and write Neuroglancer multiresolution Draco meshes. With
+      the output left blank, a label inside an OME-Zarr labels/ folder is
+      meshed to labels/<name>_mesh next to it, and a zarr root that lists
+      labels is meshed label by label.
+    command: pixi run python fileglancer/run_meshify.py
+
+    parameters:
+      - flag: --input
+        name: Label volume
+        type: directory
+        description: >-
+          An OME-Zarr label group (e.g. .../labels/mitochondria) or array, an
+          N5 or neuroglancer-precomputed volume, or a zarr root whose labels/
+          group lists the labels to mesh. The format is auto-detected. For a
+          multiscale group the finest level is meshed and the coarser levels
+          become the levels of detail. Volumes stored x, y, z are handled.
+        required: true
+
+      - flag: --output
+        name: Output directory
+        type: directory
+        exists: false
+        description: >-
+          Where to write the meshes. Leave blank to place them next to the
+          label as labels/<name>_mesh (see Output layout).
+        required: false
+
+      - section: Output layout
+        collapsed: true
+        parameters:
+          - flag: --mesh-suffix
+            name: Mesh folder suffix
+            type: string
+            default: "_mesh"
+            description: >-
+              Suffix of a mesh folder derived from its label's name when the
+              output is blank: labels/<name><suffix>.
+
+      - section: Mesh generation
+        collapsed: true
+        parameters:
+          - flag: --downsample-factor
+            name: Downsample factor
+            type: integer
+            min: 1
+            description: Optional integer factor to downsample the volume before meshing.
+          - flag: --downsample-method
+            name: Downsample method
+            type: enum
+            options: [mode, mode_suppress_zero, binary, nearest]
+            default: mode
+
+      - section: Simplification & smoothing
+        collapsed: true
+        parameters:
+          - flag: --target-reduction
+            name: Target face reduction
+            type: number
+            min: 0
+            max: 1
+            default: 0.933
+            description: Fraction of faces to remove during simplification (0 to 1).
+          - flag: --n-smoothing-iter
+            name: Smoothing iterations
+            type: integer
+            min: 0
+            default: 2
+            description: Taubin smoothing iterations.
+          - flag: --simplification
+            name: Simplify meshes
+            type: boolean
+            boolean_style: value
+            default: true
+          - flag: --use-fixed-edge-simplification
+            name: Blockwise simplification (preserve chunk-boundary edges)
+            type: boolean
+            boolean_style: value
+            default: false
+            description: >-
+              Simplify each block independently while preserving edges along
+              chunk boundaries, so seams stay aligned. Faster and uses less
+              memory than global simplification, at the cost of slightly
+              denser meshes near block borders.
+          - flag: --strict
+            name: Strict mode (watertight check + mesh-metrics CSV)
+            type: boolean
+            boolean_style: value
+            default: false
+            description: >-
+              Require every mesh to be watertight, winding-consistent and of
+              positive volume (the run fails otherwise) and write a per-mesh
+              metrics CSV (volume, surface area, curvature, thickness). Off
+              by default: real data is rarely fully watertight, especially
+              with a ROI.
+
+      - section: Multiresolution output
+        collapsed: false
+        parameters:
+          - flag: --multires
+            name: Multiresolution Neuroglancer output
+            type: boolean
+            boolean_style: value
+            default: true
+          - flag: --num-lods
+            name: Levels of detail
+            type: integer
+            min: 1
+            default: 4
+          - flag: --multires-strategy
+            name: LOD strategy
+            type: enum
+            options: [downsample, decimate]
+            default: downsample
+            description: >-
+              downsample: mesh each level of detail from a coarser version of
+              the volume (the input's own pyramid levels when it has them).
+              decimate: mesh once and decimate.
+          - flag: --decimation-factor
+            name: Face reduction per LOD
+            type: integer
+            min: 2
+            default: 6
+          - flag: --use-existing-scales
+            name: Use the input's pyramid levels
+            type: boolean
+            boolean_style: value
+            default: true
+            description: >-
+              Mesh the levels of detail from the input's own coarser levels
+              when it has them, and build the missing ones once. Off:
+              downsample inside the workers for every level.
+          - flag: --downsample-cascade
+            name: Build missing levels from the previous level
+            type: boolean
+            boolean_style: value
+            default: false
+          - flag: --delete-intermediate-scales
+            name: Delete the levels built for this run
+            type: boolean
+            boolean_style: value
+            default: true
+          - flag: --sharded
+            name: Sharded output
+            type: boolean
+            boolean_style: value
+            default: true
+            description: Pack the meshes into shards so thousands load in a few requests.
+          - flag: --keep-decimated-meshes
+            name: Keep per-LOD mesh files
+            type: boolean
+            boolean_style: value
+            default: false
+
+      - section: Coordinates & selection
+        collapsed: true
+        parameters:
+          - flag: --voxel-size-nm
+            name: Voxel size override (nm, z,y,x)
+            type: string
+            description: >-
+              Override the voxel size when the volume's metadata is missing
+              or wrong. Comma-separated z,y,x in nanometers.
+            pattern: "^[0-9]+(\\.[0-9]+)?,[0-9]+(\\.[0-9]+)?,[0-9]+(\\.[0-9]+)?$"
+          - flag: --roi
+            name: ROI (z0,y0,x0,z1,y1,x1)
+            type: string
+            description: >-
+              Only mesh this region, in the volume's world units, z, y, x,
+              whatever order the volume is stored in.
+            pattern: "^-?[0-9]+(\\.[0-9]+)?(,-?[0-9]+(\\.[0-9]+)?){5}$"
+          - flag: --ids
+            name: Segment ids
+            type: string
+            description: >-
+              Only mesh these segments: a comma-separated list of ids, or the
+              path of a CSV file with one id per row.
+
+      - section: Segment properties
+        collapsed: true
+        parameters:
+          - flag: --segment-properties-csv
+            name: Segment properties CSV
+            type: file
+            description: CSV with per-segment metadata (must include an Object ID column).
+
+      - section: Compute
+        collapsed: false
+        parameters:
+          - flag: --num-workers
+            name: Dask workers
+            type: integer
+            min: 1
+            default: 48
+            description: >-
+              Worker processes across the child LSF jobs. With
+              fileglancer/dask-config.yaml (8 processes per job), 48 workers
+              are 6 child jobs.
+          - flag: --lsf-project
+            name: LSF project for the worker jobs
+            type: string
+            description: >-
+              Charge group for the dask worker jobs (the name only, without
+              -P). Leave blank if the cluster does not require one.
+
+    resources:
+      cpus: 2
+      memory: "30 GB"
+      walltime: "08:00"
