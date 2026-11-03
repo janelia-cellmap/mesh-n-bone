@@ -12,7 +12,6 @@ import tempfile
 import trimesh
 import zarr
 
-from funlib.geometry import Coordinate
 
 from mesh_n_bone.meshify.meshify import Meshify
 
@@ -25,6 +24,34 @@ def _create_zarr_volume(tmpdir, vol, voxel_size=(8, 8, 8), chunk_shape=(16, 16, 
     arr.attrs["voxel_size"] = list(voxel_size)
     arr.attrs["offset"] = [0, 0, 0]
     return f"{zarr_path}/labels/s0"
+
+
+class TestInWorkerDownsamplingAcrossBlocks:
+    def test_downsampled_blocks_keep_the_whole_object(self, tmp_output_dir):
+        """A sphere meshed from 16-voxel blocks downsampled 2x in the
+        worker has the volume of the full-resolution mesh: each block's
+        clip planes sit at its own extent, so no block loses the voxels
+        past a fraction of its size."""
+        n = 64
+        zz, yy, xx = np.mgrid[:n, :n, :n]
+        vol = (((zz - 32) ** 2 + (yy - 32) ** 2 + (xx - 32) ** 2) < 24 ** 2).astype(np.uint32)
+        path = _create_zarr_volume(tmp_output_dir, vol, voxel_size=(4, 4, 4))
+
+        def volume_of(downsample_factor, tag):
+            out = os.path.join(tmp_output_dir, f"out_{tag}")
+            Meshify(
+                input_path=path, output_directory=out, num_workers=1,
+                do_multires=False, do_analysis=False, check_mesh_validity=False,
+                read_write_block_shape_pixels=[16, 16, 16],
+                downsample_factor=downsample_factor,
+                n_smoothing_iter=0, target_reduction=0.0,
+            ).get_meshes()
+            return trimesh.load(os.path.join(out, "meshes", "1.ply"), process=False).volume
+
+        full, downsampled = volume_of(None, "full"), volume_of(2, "ds2")
+        sphere = 4 / 3 * np.pi * (24 * 4) ** 3
+        assert full == pytest.approx(sphere, rel=0.05)
+        assert downsampled == pytest.approx(full, rel=0.1)
 
 
 class TestMeshifyFromZarr:

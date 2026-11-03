@@ -242,6 +242,8 @@ The format is auto-detected by probing for the relevant marker file (`info` → 
 
 Volumes are read through [worldarray](https://github.com/JaneliaSciComp/worldarray), which also decides where they sit. Every format is placed by one rule: a translation is the centre of voxel 0, as in OME-NGFF. Formats that store voxel 0's corner instead (funlib `offset`, precomputed `voxel_offset`, or no placement metadata at all) are moved half a voxel on reading. Meshes therefore land where Neuroglancer draws the segmentation, whichever way the volume was stored.
 
+Every volume is read in z, y, x order, whatever order it is stored in: a volume whose axes are named `x, y, z` (as [TensorSwitch](https://github.com/JaneliaSciComp/tensorswitch) writes) is transposed on reading (worldarray's `axes_order="zyx"`), with its voxel size, translation and existing pyramid levels reordered to match. A `roi` is therefore always given z, y, x in the volume's world units. Mesh-n-bone's own pyramid levels (`_intermediate_scales.zarr`) are written z, y, x; for a volume stored in another order, that pyramid lists only the levels it built, not `s0`.
+
 If no specific scale is provided, the highest-resolution scale is used by default — for OME-Zarr multiscales groups (root or subgroup) that's the first dataset listed in the metadata; for precomputed, scale index 0 from the `info` file. To use a different scale, either name the array directly (`.../seg.zarr/s2`) or, for precomputed, append the scale `key` from the `info` file (e.g. `gs://neuroglancer-janelia-flyem-hemibrain/v1.0/segmentation/16.0x16.0x16.0`).
 
 Example using the public hemibrain segmentation at native res:

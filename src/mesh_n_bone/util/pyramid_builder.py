@@ -256,20 +256,12 @@ def _open_level(path):
 
 
 def _read_s0_box(worker_config, begin, end):
-    """Read s0 voxels ``[begin, end)`` of the source dataset in the
-    meshify worker's frame; the part past the dataset is 0."""
-    from funlib.geometry import Coordinate, Roi
+    """Read s0 voxels ``[begin, end)`` (z, y, x indices) of the source
+    dataset; the part past the dataset is 0."""
     from mesh_n_bone.util.image_data_interface import read_block
 
-    ds_offset = Coordinate(worker_config["dataset_offset"])
-    voxel_size = Coordinate(worker_config["voxel_size"])
-    begin, end = np.asarray(begin, dtype=np.int64), np.asarray(end, dtype=np.int64)
-    roi = Roi(
-        ds_offset + Coordinate(begin.tolist()) * voxel_size,
-        Coordinate((end - begin).tolist()) * voxel_size,
-    )
     s0 = _ts_handle_for_input(worker_config["s0_dataset_path"])
-    return read_block(s0, roi, voxel_size, ds_offset, fill_value=0)
+    return read_block(s0, begin, end, fill_value=0)
 
 
 def _release_memory():
@@ -712,6 +704,26 @@ def _try_symlink_s0(pyramid_path, s0_source_path, zarr_format=2):
     # — so this is mostly a safety net for n5/precomputed sources, which
     # can't be represented as a zarr array at all.)
     expected_format = "zarr3" if zarr_format == 3 else "zarr2"
+    try:
+        # The pyramid's own levels are written z, y, x and its group
+        # entry says so. A source stored in another order (an x, y, z
+        # OME-Zarr) is read z, y, x through worldarray but its array
+        # metadata still says x, y, z, which would contradict the group's
+        # axes. Leave s0 absent then; nothing reads it from the pyramid.
+        stored = wa.metadata(s0_source_path, open=False)
+        stored_names = tuple(stored.axes[i] for i in stored.spatial)
+        if stored.axes_named and stored_names != ("z", "y", "x"):
+            logger.warning(
+                "pyramid_builder: not symlinking s0 from %s into %s — the "
+                "source's axes are stored %s, not z, y, x. s0 stays absent "
+                "from the pyramid.", s0_source_path, target, stored_names,
+            )
+            return False
+    except Exception as e:
+        logger.warning(
+            "pyramid_builder: could not read the axes of %s (%s); "
+            "proceeding with symlink attempt.", s0_source_path, e,
+        )
     try:
         actual_format = wa.detect(s0_source_path).format
         if actual_format != expected_format:

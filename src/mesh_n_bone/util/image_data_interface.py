@@ -1,4 +1,4 @@
-"""Volume reads through worldarray, in Meshify's integer block frame.
+"""Volume reads through worldarray, in z, y, x voxel indices.
 
 worldarray opens every format mesh-n-bone reads (zarr v2/v3, N5,
 neuroglancer precomputed; local or remote), resolves where the array
@@ -8,9 +8,16 @@ the two things mesh-n-bone needs on top of it.
 
 import worldarray as wa
 
+# Meshify's block math is z, y, x by position, so every volume is opened
+# in that order whatever order it is stored in (an x, y, z OME-Zarr, as
+# TensorSwitch writes). worldarray moves the axes named z, y and x to the
+# end in that order and keeps other axes (a channel) in front.
+AXES_ORDER = "zyx"
+
 
 def open_volume(path, context=None):
-    """Open *path* as a :class:`worldarray.WorldArray` in its stored units.
+    """Open *path* as a :class:`worldarray.WorldArray`, z, y, x, in its
+    stored units.
 
     A group opens at its first level (an OME-NGFF multiscales group's
     first dataset, a precomputed volume's first scale), as mesh-n-bone
@@ -23,23 +30,20 @@ def open_volume(path, context=None):
     """
     if context is None:
         context = wa.capped_context()
-    return wa.open(path, level="first", units=None, context=context)
+    return wa.open(
+        path, level="first", units=None, context=context, axes_order=AXES_ORDER,
+    )
 
 
-def read_block(volume, roi, voxel_size, offset, fill_value=0):
-    """Read funlib *roi* from *volume* in Meshify's block frame.
+def read_block(volume, begin, end, fill_value=0):
+    """Read the voxels ``[begin, end)`` of *volume*, z, y, x indices.
 
-    Voxel ``i`` sits at ``offset + i * voxel_size``, where *offset* is
-    the integer-rounded translation (voxel 0's centre), and *roi* is
-    snapped outward to that grid. Reading by index rather than by world
-    box keeps neighbouring blocks exact when Meshify works on rounded
-    values of a non-integer translation or voxel size. Of a multi-channel
-    volume, channel 0 is read, as mesh-n-bone always has; the part of
-    *roi* outside the volume is filled with *fill_value*.
+    Of a multi-channel volume, channel 0 is read, as mesh-n-bone always
+    has; the part of the box outside the volume is filled with
+    *fill_value*.
     """
-    roi = (roi - offset).snap_to_grid(voxel_size) / voxel_size
-    lead = len(volume.shape) - roi.dims
-    begin = [0] * lead + list(roi.begin)
-    end = [1] * lead + list(roi.end)
+    lead = len(volume.shape) - 3
+    begin = [0] * lead + [int(v) for v in begin]
+    end = [1] * lead + [int(v) for v in end]
     block = volume.read_index(begin, end, padding=fill_value)
     return block.reshape(block.shape[lead:])
