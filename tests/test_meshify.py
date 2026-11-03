@@ -267,47 +267,53 @@ class TestAssemblyMemoryPlanning:
         assert cfg["jobqueue"]["lsf"]["ncpus"] == 12
 
 
-class TestBlockFromIndex:
-    """`block_from_index` should produce the same DaskBlocks as
-    `create_blocks` would, indexed by integer."""
+class TestMeshingBlocks:
+    """The block grid get_chunked_meshes meshes: worldarray blocks of the
+    level's voxels, tiling the ROI from its first voxel, each read grown
+    by one output voxel."""
 
-    def test_index_parity_with_eager_create_blocks(self):
-        from mesh_n_bone.util.dask_util import (
-            block_from_index, count_blocks, create_blocks,
-        )
-        from funlib.geometry import Coordinate, Roi
+    @staticmethod
+    def _meshify(roi, block_shape, downsample_factor=None, shape=(96, 64, 128)):
         from types import SimpleNamespace
+        from mesh_n_bone.meshify.meshify import Meshify
+        from mesh_n_bone.util.volume_geometry import IndexBox
 
-        roi = Roi((0, 0, 0), (96, 64, 128))
-        block_size_world = Coordinate(32, 32, 32)
-        ds = SimpleNamespace(
-            chunk_shape=block_size_world,
-            voxel_size=Coordinate(1, 1, 1),
-        )
-        eager = create_blocks(roi, ds)
-        n_eager = len(eager)
-        n_lazy = count_blocks(roi, block_size_world)
-        assert n_eager == n_lazy
-        for i in range(n_eager):
-            lazy = block_from_index(
-                i, roi.get_begin(), roi.get_end(), block_size_world,
-            )
-            assert lazy.index == eager[i].index == i
-            assert tuple(lazy.roi.get_begin()) == tuple(eager[i].roi.get_begin()), (
-                f"index {i}: {lazy.roi.get_begin()} != {eager[i].roi.get_begin()}"
-            )
-            assert tuple(lazy.roi.get_end()) == tuple(eager[i].roi.get_end())
+        m = object.__new__(Meshify)
+        m.segmentation_array = SimpleNamespace(shape=shape)
+        m.roi = IndexBox(*roi)
+        m.read_write_block_shape_pixels = np.array(block_shape)
+        m.downsample_factor = downsample_factor
+        return m
 
-    def test_padding_round_trip(self):
-        from mesh_n_bone.util.dask_util import block_from_index
-        from funlib.geometry import Coordinate
+    def test_blocks_tile_the_roi_from_its_first_voxel(self):
+        m = self._meshify(((0, 0, 0), (96, 64, 128)), (32, 32, 32))
+        blocks = m._meshing_blocks()
+        assert len(blocks) == 3 * 2 * 4
+        first, last = blocks[0], blocks[len(blocks) - 1]
+        assert first.begin == (0, 0, 0) and first.end == (32, 32, 32)
+        assert last.end == (96, 64, 128)
+        # One output voxel of context on every side; reads past the
+        # volume are not clipped (they are filled with background).
+        assert first.read_begin == (-1, -1, -1) and first.read_end == (33, 33, 33)
 
-        b = block_from_index(
-            0, (0, 0, 0), (32, 32, 32), (32, 32, 32), padding=Coordinate(4, 4, 4)
-        )
-        # padding=(4,4,4) grows the (0,0,0)+(32,32,32) block by 4 on each side
-        assert tuple(b.roi.get_begin()) == (-4, -4, -4)
-        assert tuple(b.roi.get_shape()) == (40, 40, 40)
+    def test_roi_end_is_rounded_up_to_whole_blocks(self):
+        m = self._meshify(((4, 4, 4), (36, 36, 36)), (16, 16, 16))
+        blocks = m._meshing_blocks()
+        assert len(blocks) == 8
+        assert blocks[0].begin == (4, 4, 4)
+        assert blocks[len(blocks) - 1].end == (36, 36, 36)
+
+    def test_downsampled_blocks_are_whole_output_voxels(self):
+        """With a (1, 2, 2) factor the block shape rounds up to a multiple
+        of the factor, and the context is one output voxel: 1, 2, 2 of
+        the level's voxels."""
+        m = self._meshify(((0, 0, 0), (32, 32, 32)), (10, 10, 10), (1, 2, 2))
+        assert m._block_shape_voxels() == (10, 10, 10)
+        m.downsample_factor = (2, 4, 4)
+        assert m._block_shape_voxels() == (10, 12, 12)
+        blocks = m._meshing_blocks()
+        b = blocks[0]
+        assert b.read_begin == (-2, -4, -4) and b.read_end == (12, 16, 16)
 
 
 class TestStagedReductions:
@@ -419,8 +425,9 @@ class TestStagedReductions:
         meshify.n_smoothing_iter = 0
         meshify.default_aggressiveness = 0.3
         meshify.smooth_before_simplify = True
-        meshify.true_voxel_size = np.array([1, 1, 1])
-        meshify.output_voxel_size_funlib = np.array([1, 1, 1])
+        meshify.true_voxel_size = np.array([1.0, 1.0, 1.0])
+        meshify.base_voxel_size = np.array([1.0, 1.0, 1.0])
+        meshify.true_offset = np.array([0.0, 0.0, 0.0])
         meshify.do_legacy_neuroglancer = False
         meshify.do_singleres_multires_neuroglancer = False
 
@@ -511,9 +518,8 @@ class TestDefaultBlockShape:
     def _make_mock_array(chunk_shape, dtype):
         """Minimal object with chunk_shape and dtype."""
         from types import SimpleNamespace
-        from funlib.geometry import Coordinate
         return SimpleNamespace(
-            chunk_shape=Coordinate(chunk_shape),
+            chunk_shape=tuple(chunk_shape),
             dtype=np.dtype(dtype),
         )
 

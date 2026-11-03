@@ -80,23 +80,22 @@ class TestOpenDatasetOmeFallback:
         path = _ome_zarr_factory(ome_version)
         ds = open_dataset(path)
         assert tuple(ds.voxel_size) == (8, 16, 32)
-        # offset propagates into the ROI begin in physical units.
-        assert tuple(ds.roi.begin) == (10, 20, 30)
+        # The OME translation is voxel 0's centre.
+        assert tuple(ds.translation) == (10, 20, 30)
 
     @pytest.mark.parametrize("ome_version", ["0.4", "0.5"])
-    def test_true_voxel_size_picks_up_ome(self, _ome_zarr_factory, ome_version):
+    def test_voxel_size_picks_up_ome(self, _ome_zarr_factory, ome_version):
         # Floats must survive the parent-group lookup.
         path = _ome_zarr_factory(ome_version)
         ds = open_dataset(path)
-        assert tuple(ds.true_voxel_size) == (8.0, 16.0, 32.0)
+        assert tuple(ds.voxel_size) == (8.0, 16.0, 32.0)
 
     @pytest.mark.parametrize("ome_version", ["0.4", "0.5"])
-    def test_true_offset_preserves_fractional_translation(
+    def test_translation_preserves_fraction(
         self, tmp_output_dir, ome_version,
     ):
         # OME translation with sub-unit precision must survive the
-        # parent-group lookup; the rounded
-        # ds.roi.offset would otherwise drop the fraction.
+        # parent-group lookup.
         zarr_path = os.path.join(tmp_output_dir, f"frac_trans_{ome_version}.zarr")
         root = zarr.open_group(zarr_path, mode="w", zarr_format=2)
         ds_path = "s0"
@@ -112,9 +111,7 @@ class TestOpenDatasetOmeFallback:
             root.attrs["ome"] = {"multiscales": ms, "version": "0.5"}
 
         ds = open_dataset(os.path.join(zarr_path, ds_path))
-        # ds.roi.offset is the rounded Coordinate (integer truncation/round).
-        # The raw accessor must keep the floats verbatim.
-        assert tuple(ds.true_offset) == (10.5, 20.25, 30.125)
+        assert tuple(ds.translation) == (10.5, 20.25, 30.125)
 
     def test_open_http_zarr_without_extension(
         self, tmp_output_dir, _http_directory_server,
@@ -135,7 +132,7 @@ class TestOpenDatasetOmeFallback:
 
         assert ds.shape == (4, 4, 4)
         assert tuple(ds.voxel_size) == (8, 16, 32)
-        assert tuple(ds.roi.begin) == (10, 20, 30)
+        assert tuple(ds.translation) == (10, 20, 30)
 
     def test_open_http_ome_group_without_extension_selects_first_dataset(
         self, tmp_output_dir, _http_directory_server,
@@ -155,8 +152,8 @@ class TestOpenDatasetOmeFallback:
         ds = open_dataset(url)
 
         assert ds.shape == (4, 4, 4)
-        assert ds._dataset_path == f"{url}/seg/s0"
-        assert tuple(ds.true_voxel_size) == (8.5, 16.5, 32.5)
+        assert ds.path == f"{url}/seg/s0"
+        assert tuple(ds.voxel_size) == (8.5, 16.5, 32.5)
 
 
 def _precomputed_scales(path, scales, num_channels=1, data=None):
@@ -209,8 +206,8 @@ class TestOpenDatasetFunlibOnParent:
 
         ds = open_dataset(os.path.join(group, "seg"))
 
-        assert tuple(ds.true_voxel_size) == (16, 16, 16)
-        assert tuple(ds.true_offset) == (40, 40, 40)
+        assert tuple(ds.voxel_size) == (16, 16, 16)
+        assert tuple(ds.translation) == (40, 40, 40)
 
 
 class TestOpenDatasetLevels:
@@ -221,13 +218,12 @@ class TestOpenDatasetLevels:
 
         ds = open_dataset(f"{path}/8nm")
 
-        assert tuple(ds.true_voxel_size) == (8, 8, 8)
-        assert ds._dataset_path.endswith("8nm")
+        assert tuple(ds.voxel_size) == (8, 8, 8)
+        assert ds.path.endswith("8nm")
         # The volume root still opens at its first scale.
-        assert tuple(open_dataset(path).true_voxel_size) == (4, 4, 4)
+        assert tuple(open_dataset(path).voxel_size) == (4, 4, 4)
 
     def test_multichannel_precomputed_reads_channel_zero(self, tmp_output_dir):
-        from funlib.geometry import Roi
         from mesh_n_bone.util.image_data_interface import open_volume, read_block
 
         path = os.path.join(tmp_output_dir, "pc2")
@@ -238,10 +234,7 @@ class TestOpenDatasetLevels:
                             num_channels=2, data=data)
 
         ds = open_dataset(path)
-        block = read_block(
-            open_volume(path), Roi(ds.roi.offset, (16, 16, 16)),
-            ds.voxel_size, ds.roi.offset,
-        )
+        block = read_block(open_volume(path), (0, 0, 0), (4, 4, 4))
 
         assert block.shape == (4, 4, 4)
         assert np.all(block == 1)

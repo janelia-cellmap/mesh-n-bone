@@ -118,8 +118,10 @@ class TestMeshifyRoiConfig:
             n_smoothing_iter=0,
             remove_smallest_components=False,
         )
-        assert m.roi.get_begin() == (0, 0, 0)
-        assert m.roi.get_end() == (16, 16, 16)
+        # Voxels of 1 with voxel 0's centre at the origin: the voxels
+        # whose centres lie in [0, 16) are 0..15.
+        assert m.roi.begin == (0, 0, 0)
+        assert m.roi.end == (16, 16, 16)
 
     def test_roi_offset_shape_dict(self, zarr_segmentation, tmp_output_dir):
         """Meshify should accept roi as a dict with offset+shape."""
@@ -137,8 +139,8 @@ class TestMeshifyRoiConfig:
             n_smoothing_iter=0,
             remove_smallest_components=False,
         )
-        assert m.roi.get_begin() == (4, 4, 4)
-        assert m.roi.get_end() == (24, 24, 24)
+        assert m.roi.begin == (4, 4, 4)
+        assert m.roi.end == (24, 24, 24)
 
     def test_roi_invalid_dict_raises(self, zarr_segmentation, tmp_output_dir):
         """Invalid dict keys should raise ValueError."""
@@ -155,10 +157,10 @@ class TestMeshifyRoiConfig:
             )
 
     def test_roi_invalid_type_raises(self, zarr_segmentation, tmp_output_dir):
-        """Non-dict, non-Roi roi should raise ValueError."""
+        """A roi that is not a dict should raise ValueError."""
         from mesh_n_bone.meshify.meshify import Meshify
 
-        with pytest.raises(ValueError, match="must be a Roi"):
+        with pytest.raises(ValueError, match="must be a dict"):
             Meshify(
                 do_multires=False,
                 input_path=zarr_segmentation,
@@ -521,14 +523,14 @@ class TestCustomRoiSnapping:
             roi={"begin": [14.6] * 3, "end": [112.5] * 3},
             num_workers=1, do_analysis=False,
         )
-        # Integer frame: voxel i at round(2.5) + 4i = 2 + 4i.
-        assert tuple(m.roi.begin) == (18, 18, 18)
-        assert tuple(m.roi.end) == (114, 114, 114)
+        # Voxel centres 2.5 + 4i in [14.6, 112.5): i in [4, 28).
+        assert m.roi.begin == (4, 4, 4)
+        assert m.roi.end == (28, 28, 28)
 
     def test_custom_roi_is_resnapped_at_a_coarser_level(
         self, tmp_output_dir, monkeypatch,
     ):
-        """s0 voxels of 8.5 nm (8 in the integer frame), s1 of 34 nm.
+        """s0 voxels of 8.5 nm, s1 of 34 nm.
         World ROI [850, 1700) holds the s1 voxels whose centres
         17 + 34i lie in it: i in [25, 50)."""
         from mesh_n_bone.meshify.meshify import Meshify
@@ -551,6 +553,6 @@ class TestCustomRoiSnapping:
             os.path.join(tmp_output_dir, "lod1"), input_dataset_path=f"{group}/s1",
         )
 
-        assert tuple(seen[0].begin) == (17 + 25 * 34,) * 3
-        assert tuple(seen[0].shape) == (25 * 34,) * 3
+        assert seen[0].begin == (25, 25, 25)
+        assert seen[0].shape == (25, 25, 25)
         assert m.roi == s0_roi

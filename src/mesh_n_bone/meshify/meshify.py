@@ -2,7 +2,6 @@
 
 from dataclasses import asdict, dataclass
 import copy
-from funlib.geometry import Roi, Coordinate
 import numpy as np
 import os
 import logging
@@ -19,7 +18,7 @@ from mesh_n_bone.util import dask_util
 from mesh_n_bone.util.logging import Timing_Messager
 from mesh_n_bone.util.zarr_io import open_dataset
 from mesh_n_bone.util.image_data_interface import open_volume, read_block
-from worldarray import index_range
+import worldarray as wa
 from mesh_n_bone.meshify.downsample import (
     downsample_labels_3d_suppress_zero,
     downsample_labels_3d,
@@ -40,20 +39,14 @@ _OME_UNIT_TO_ABBREVIATION = {
 
 
 def _snap_roi_to_voxels(seg_array, begin, end):
-    """Return the voxels whose centres lie in the world box [*begin*,
-    *end*), as a Roi in *seg_array*'s integer frame (voxel ``i`` at
-    ``roi.offset + i * voxel_size``).
+    """The voxels of *seg_array* whose centres lie in the world box
+    [*begin*, *end*), as an :class:`IndexBox`.
 
     A ROI aligned to voxel corners and one aligned to voxel centres both
     select whole voxels (worldarray's world-box rule), so a ROI written
     against either convention keeps meshing the voxels it always did.
     """
-    lo, hi = index_range(
-        begin, end, seg_array.true_voxel_size, seg_array.true_offset,
-    )
-    vs = seg_array.voxel_size
-    origin = seg_array.roi.offset + Coordinate(lo) * vs
-    return Roi(origin, Coordinate(np.subtract(hi, lo)) * vs)
+    return seg_array.index_box(begin, end)
 
 
 try:
@@ -471,8 +464,7 @@ def _existing_pyramid_scales(pyramid_path, s0_voxel_size):
     if not os.path.isdir(pyramid_path):
         return None
     try:
-        import worldarray as wa
-        pyramid = wa.open_pyramid(pyramid_path, units=None)
+        pyramid = wa.open_pyramid(pyramid_path, units=None, axes_order="zyx")
     except Exception:
         return None
     s0_voxel_size = np.asarray(s0_voxel_size, dtype=float)
@@ -699,41 +691,37 @@ def _get_chunked_mesh_worker(block_index, tmpdirname, config):
 
     This is a module-level function so only lightweight *config* dict
     (scalars, tuples, strings) is serialised to workers — no zarr arrays.
-    Receives only the block's sequential index; the block's ROI is
-    materialized inside the worker via
-    :func:`mesh_n_bone.util.dask_util.block_from_index`, so the driver
-    never has to hold a list of millions of block objects.
+    Receives only the block's sequential id; the block itself (its voxel
+    box and the padded box to read) comes from the ``worldarray.Blocks``
+    record in *config*, so the driver never has to hold a list of
+    millions of block objects.
 
     Parameters
     ----------
     block_index : int
-        Sequential block index produced by ``db.range(num_blocks)``.
+        Sequential block id produced by ``db.range(num_blocks)``.
     tmpdirname : str
         Temporary directory for writing per-segment block meshes.
     config : dict
-        Worker config from ``Meshify._get_worker_config()``. Must
-        include ``block_roi_begin``, ``block_roi_end``,
-        ``block_size_world`` and ``block_padding``.
+        Worker config from ``Meshify._get_worker_config()`` plus
+        ``blocks``, the ``worldarray.Blocks`` of the level's voxels.
     """
-    block = dask_util.block_from_index(
-        block_index,
-        config["block_roi_begin"],
-        config["block_roi_end"],
-        config["block_size_world"],
-        padding=config.get("block_padding"),
-    )
+    block = config["blocks"][block_index]
     dataset_path = config["dataset_path"]
     if dataset_path not in _thread_local_ts:
         _thread_local_ts[dataset_path] = open_volume(dataset_path)
     volume = _thread_local_ts[dataset_path]
 
-    voxel_size = Coordinate(config["voxel_size"])
-    roi_offset = Coordinate(config["roi_offset"])
-    output_voxel_size = Coordinate(config["output_voxel_size"])
+    # The level's voxel size and voxel 0's centre, in output units (nm),
+    # and the voxel size of the mesh: the level's times the downsample
+    # factor.
+    voxel_size = np.asarray(config["voxel_size"], dtype=float)
+    translation = np.asarray(config["translation"], dtype=float)
+    output_voxel_size = np.asarray(config["output_voxel_size"], dtype=float)
 
-    mesher = Mesher(output_voxel_size[::-1])
+    mesher = Mesher(tuple(output_voxel_size[::-1]))
     segmentation_block = read_block(
-        volume, block.roi, voxel_size, roi_offset, fill_value=0,
+        volume, block.read_begin, block.read_end, fill_value=0,
     )
 
     # Per axis: an anisotropic volume's first LODs halve only its finer axes.
@@ -779,7 +767,9 @@ def _get_chunked_mesh_worker(block_index, tmpdirname, config):
                 segmentation_block, remap, preserve_missing_labels=True,
             ).astype(np.uint16)
 
-    block_offset = np.array(block.roi.get_begin())
+    # Where the block's first read voxel (its padding) sits in the world:
+    # zmesh puts voxel i at i * voxel_size from the block's origin.
+    block_offset = translation + np.asarray(block.read_begin, dtype=float) * voxel_size
     # Correct for the half-kernel shift introduced by downsampling:
     # a downsampled voxel at index 0 represents original voxels [0, ds),
     # centered at (ds-1)/2 original voxels from the origin, per axis.
@@ -804,8 +794,11 @@ def _get_chunked_mesh_worker(block_index, tmpdirname, config):
             half_pad = 0.5 * np.array(output_voxel_size)[::-1]
             mesh_tri.vertices -= half_pad
 
+            # The block's own voxels (not its padding), in output voxels:
+            # the extent the clip planes keep. Blocks are whole multiples
+            # of the downsample factor (Meshify._block_shape_voxels).
             ds = np.array(downsample_factor or (1, 1, 1))
-            block_size_voxels = np.array(config["read_write_block_shape_pixels"]) // ds
+            block_size_voxels = (np.array(block.end) - np.array(block.begin)) // ds
             block_size_world = (block_size_voxels * output_voxel_size)[::-1]
 
             mesh_tri_simplified = simplify_mesh(
@@ -832,14 +825,14 @@ def _get_chunked_mesh_worker(block_index, tmpdirname, config):
             )
 
             os.makedirs(f"{tmpdirname}/{original_id}", exist_ok=True)
-            with open(f"{tmpdirname}/{original_id}/block_{block.index}.ply", "wb") as fp:
+            with open(f"{tmpdirname}/{original_id}/block_{block.id}.ply", "wb") as fp:
                 fp.write(mesh_simplified.to_ply())
         else:
             if len(mesh.vertices) == 0:
                 continue
             mesh.vertices += block_offset[::-1] + ds_shift[::-1]
             os.makedirs(f"{tmpdirname}/{original_id}", exist_ok=True)
-            with open(f"{tmpdirname}/{original_id}/block_{block.index}.ply", "wb") as fp:
+            with open(f"{tmpdirname}/{original_id}/block_{block.id}.ply", "wb") as fp:
                 fp.write(mesh.to_ply())
 
 
@@ -861,10 +854,11 @@ class Meshify:
         Path to the input segmentation dataset (Zarr or N5).
     output_directory : str
         Directory where output meshes and metadata are written.
-    roi : Roi or dict or None
-        Region of interest to process. Accepts a ``funlib.geometry.Roi``,
-        a dict with ``begin``/``end`` or ``offset``/``shape`` keys, or
-        ``None`` for the full volume.
+    roi : dict or None
+        Region of interest to process, in the volume's world units,
+        z, y, x: a dict with ``begin``/``end`` or ``offset``/``shape``
+        keys, or ``None`` for the full volume. The voxels whose centres
+        lie in it are meshed.
     max_num_voxels : float
         Maximum number of voxels in a segment before it is skipped.
     max_num_blocks : float
@@ -1038,7 +1032,7 @@ class Meshify:
         self,
         input_path: str,
         output_directory: str,
-        roi: Roi = None,
+        roi: dict | None = None,
         max_num_voxels=np.inf,
         max_num_blocks=np.inf,
         read_write_block_shape_pixels: list = None,
@@ -1092,23 +1086,19 @@ class Meshify:
         center_octree: bool = True,
     ):
         self.segmentation_array = open_dataset(input_path)
-        self._dataset_path = self.segmentation_array._dataset_path
+        self._dataset_path = self.segmentation_array.path
         self.output_directory = output_directory
         self.input_path = input_path
-        # "zarr2" | "zarr3" | "n5" | "precomputed". worldarray returns
-        # every format in C (z, y, x) order, so nothing is swapped here.
+        # "zarr2" | "zarr3" | "n5" | "precomputed". worldarray presents
+        # every format z, y, x, whatever order it is stored in.
         self._format = self.segmentation_array.format
 
-        # True (possibly non-integer) voxel size and translation (voxel
-        # 0's centre), as worldarray resolves them from OME-NGFF, funlib,
-        # COSEM, N5 or precomputed metadata. self.roi.offset stays
-        # integer for funlib Roi arithmetic, and the final mesh vertices
-        # get corrected with true_offset before output.
-        self.true_voxel_size = self.segmentation_array.true_voxel_size.copy()
-        self.true_offset = self.segmentation_array.true_offset.copy()
-        # The integer origin mesh vertices are in, kept on self because
-        # assembly drops segmentation_array before pickling.
-        self._dataset_origin = self.segmentation_array.roi.offset
+        # The level's voxel size and translation (voxel 0's centre), as
+        # worldarray resolves them from OME-NGFF, funlib, COSEM, N5 or
+        # precomputed metadata. Block math is in voxel indices; these
+        # floats place the mesh vertices in the world.
+        self.true_voxel_size = self.segmentation_array.voxel_size.copy()
+        self.true_offset = self.segmentation_array.translation.copy()
 
         units = self.segmentation_array.units
         if units is not None and coordinate_units == "nm":
@@ -1127,14 +1117,16 @@ class Meshify:
                 voxel_size_nm / self.true_voxel_size
             )
             self.true_voxel_size = voxel_size_nm.copy()
+        # The level's voxel size in output units, before any downsampling.
+        self.base_voxel_size = self.true_voxel_size.copy()
 
+        # self.roi: the voxels of the current level that get meshed, as an
+        # IndexBox (z, y, x indices).
         if roi is not None:
-            # Accept a Roi, or a dict with offset+shape or begin+end from
-            # YAML config. Bounds stay floats: _snap_roi_to_voxels picks
-            # the voxels whose centres lie inside them.
-            if isinstance(roi, Roi):
-                begin, end = roi.begin, roi.end
-            elif isinstance(roi, dict):
+            # A dict with offset+shape or begin+end from the YAML config,
+            # in world units. Bounds stay floats: _snap_roi_to_voxels
+            # picks the voxels whose centres lie inside them.
+            if isinstance(roi, dict):
                 if "begin" in roi and "end" in roi:
                     begin, end = roi["begin"], roi["end"]
                 elif "offset" in roi and "shape" in roi:
@@ -1146,8 +1138,7 @@ class Meshify:
                     )
             else:
                 raise ValueError(
-                    "roi must be a Roi object or a dict with "
-                    "'offset'+'shape' or 'begin'+'end' keys"
+                    "roi must be a dict with 'offset'+'shape' or 'begin'+'end' keys"
                 )
             # Kept in world units so each multiscale level snaps it to
             # its own voxels (_generate_meshes_at_scale).
@@ -1157,7 +1148,7 @@ class Meshify:
             self.roi = _snap_roi_to_voxels(self.segmentation_array, *self._roi_world)
             self.has_custom_roi = True
         else:
-            self.roi = self.segmentation_array.roi
+            self.roi = self.segmentation_array.box
             self.has_custom_roi = False
         self.num_workers = num_workers
 
@@ -1169,16 +1160,10 @@ class Meshify:
             )
 
         self.max_num_blocks = max_num_blocks
-        self.base_voxel_size_funlib = self.segmentation_array.voxel_size
 
-        self.output_voxel_size_funlib = max(
-            self.base_voxel_size_funlib, Coordinate(1, 1, 1)
-        )
         self.downsample_factor = downsample_factor
         if self.downsample_factor:
-            self.output_voxel_size_funlib = Coordinate(
-                np.array(self.output_voxel_size_funlib) * self.downsample_factor
-            )
+            # The mesh's voxel size: the level's times the factor.
             self.true_voxel_size *= self.downsample_factor
         self.target_reduction = target_reduction
 
@@ -1282,9 +1267,7 @@ class Meshify:
         max_mult = int((target_bytes / chunk_bytes) ** (1 / 3))
         # Don't exceed the ROI dimensions
         if hasattr(self, "roi") and self.roi is not None:
-            roi_pixels = np.array(self.roi.shape) / np.array(
-                self.segmentation_array.voxel_size
-            )
+            roi_pixels = np.array(self.roi.shape)
             max_by_roi = int(np.min(roi_pixels / chunk))
             max_mult = min(max_mult, max_by_roi)
         multiplier = max(1, max_mult)
@@ -1335,9 +1318,12 @@ class Meshify:
         """Return a lightweight, pickle-safe dict of parameters for workers."""
         return {
             "dataset_path": self._dataset_path,
-            "voxel_size": tuple(self.segmentation_array.voxel_size),
-            "roi_offset": tuple(self.segmentation_array.roi.offset),
-            "output_voxel_size": tuple(self.output_voxel_size_funlib),
+            # The level's voxel size and voxel 0's centre in output units
+            # (nm), and the mesh's voxel size (the level's times the
+            # downsample factor).
+            "voxel_size": tuple(float(v) for v in self.base_voxel_size),
+            "translation": tuple(float(v) for v in self.true_offset),
+            "output_voxel_size": tuple(float(v) for v in self.true_voxel_size),
             "downsample_factor": self.downsample_factor,
             "downsample_method": self.downsample_method,
             "use_fixed_edge_simplification": self.use_fixed_edge_simplification,
@@ -1353,6 +1339,40 @@ class Meshify:
                 tuple(sorted(self.target_ids)) if self.target_ids is not None else None
             ),
         }
+
+    def _block_shape_voxels(self):
+        """The meshing block shape, in voxels of the current level:
+        ``read_write_block_shape_pixels`` rounded up to a whole number of
+        output voxels, so a block downsampled by the per-axis factor is
+        whole voxels and its clip planes land on its own extent."""
+        factor = np.asarray(_per_axis_factor(self.downsample_factor) or (1, 1, 1))
+        shape = np.asarray(self.read_write_block_shape_pixels, dtype=np.int64)
+        return tuple(int(v) for v in np.ceil(shape / factor).astype(np.int64) * factor)
+
+    def _meshing_blocks(self):
+        """The blocks :meth:`get_chunked_meshes` meshes, as a
+        ``worldarray.Blocks`` record of the current level's voxels.
+
+        Blocks of :meth:`_block_shape_voxels` tile the ROI from its first
+        voxel; its end is rounded up to whole blocks, as it always was.
+        Each read box is the block grown by one output voxel (the
+        per-axis downsample factor in the level's voxels) on every side,
+        the padding marching cubes needs to close surfaces at block
+        boundaries; the part of a read past the volume is filled with
+        background.
+        """
+        factor = np.asarray(_per_axis_factor(self.downsample_factor) or (1, 1, 1))
+        block_shape = np.asarray(self._block_shape_voxels(), dtype=np.int64)
+        begin = np.asarray(self.roi.begin, dtype=np.int64)
+        count = np.ceil(np.asarray(self.roi.shape) / block_shape).astype(np.int64)
+        end = begin + count * block_shape
+        return wa.blocks(
+            self.segmentation_array.shape,
+            tuple(int(v) for v in block_shape),
+            context=tuple(int(f) for f in factor),
+            box=(tuple(int(v) for v in begin), tuple(int(v) for v in end)),
+            clip=False,
+        )
 
     @staticmethod
     def is_mesh_valid(mesh):
@@ -1373,29 +1393,23 @@ class Meshify:
     def get_chunked_meshes(self, dirname):
         """Generate per-block meshes for the entire ROI using Dask.
 
-        Driver enumerates blocks lazily by index — only the count is
-        computed up front (O(1)), and each worker materializes its own
-        block ROI from the index. This avoids building a list of
-        millions of block objects on the driver for large volumes, and
-        shrinks per-task graph payload from a Roi-carrying object down
-        to a single int.
+        Driver enumerates blocks lazily by id — the ``worldarray.Blocks``
+        record computes any block on demand, so only the count is
+        computed up front and each worker materializes its own block
+        from its id. This avoids building a list of millions of block
+        objects on the driver for large volumes, and keeps the per-task
+        graph payload at a single int.
 
         Parameters
         ----------
         dirname : str
             Directory where per-segment block mesh PLYs are written.
         """
-        block_size_world = (
-            self.read_write_block_shape_pixels * self.output_voxel_size_funlib
-        )
-        num_blocks = dask_util.count_blocks(self.roi, block_size_world)
+        blocks = self._meshing_blocks()
+        num_blocks = len(blocks)
 
         worker_config = self._get_worker_config()
-        # Pass enough info to reconstruct each block's ROI in the worker.
-        worker_config["block_roi_begin"] = tuple(self.roi.get_begin())
-        worker_config["block_roi_end"] = tuple(self.roi.get_end())
-        worker_config["block_size_world"] = tuple(int(v) for v in block_size_world)
-        worker_config["block_padding"] = tuple(self.output_voxel_size_funlib)
+        worker_config["blocks"] = blocks
 
         effective_workers = dask_util.effective_num_workers(
             self.num_workers, num_blocks, logger, "generate chunked meshes",
@@ -1769,12 +1783,13 @@ class Meshify:
                 if not getattr(self, "keep_chunked_meshes", False):
                     shutil.rmtree(f"{self.dirname}/{mesh_id}", ignore_errors=True)
                 return
-            chunk_size = (
-                self.read_write_block_shape_pixels * self.base_voxel_size_funlib
-            )
+            # Block boundaries sit every block shape from the ROI's first
+            # voxel (the grid get_chunked_meshes meshed), in world units.
+            chunk_size = np.asarray(self._block_shape_voxels()) * self.base_voxel_size
+            roi_origin = self.true_offset + np.asarray(self.roi.begin) * self.base_voxel_size
             mesh = mesh.deduplicate_chunk_boundaries(
                 chunk_size=chunk_size[::-1],
-                offset=self.roi.offset[::-1],
+                offset=roi_origin[::-1],
             )
             if self.do_simplification:
                 # The half-voxel shift places clip planes on the MC
@@ -1860,38 +1875,6 @@ class Meshify:
                 raise Exception(f"Mesh {mesh_id} contains no faces")
         except Exception as e:
             raise Exception(f"{mesh_id} failed, with error: {e}")
-
-        # Correct for differences between funlib's integer voxel_size /
-        # offset (used during marching cubes and Roi math) and the true
-        # float-precision values from OME-NGFF translation / scale.
-        # Rewriting from voxel-index space gives:
-        #   true_pos = true_offset + true_voxel * (int_pos - int_offset) / int_voxel
-        #            = true_offset + scale * (int_pos - int_offset)
-        # int_offset is the dataset's own integer origin, not a custom
-        # ROI's begin: vertices are in the dataset's integer frame.
-        voxel_mismatch = (
-            list(self.true_voxel_size) != list(self.output_voxel_size_funlib)
-        )
-        true_offset_attr = getattr(self, "true_offset", None)
-        int_origin = getattr(self, "_dataset_origin", None)
-        offset_mismatch = False
-        if true_offset_attr is not None and int_origin is not None:
-            int_offset_xyz = np.array(int_origin[::-1], dtype=float)
-            true_offset_xyz = np.array(true_offset_attr[::-1], dtype=float)
-            offset_mismatch = not np.allclose(int_offset_xyz, true_offset_xyz)
-        if voxel_mismatch or offset_mismatch:
-            scale = np.array(self.true_voxel_size[::-1]) / np.array(
-                self.output_voxel_size_funlib[::-1]
-            )
-            if int_origin is None:
-                int_origin = self.segmentation_array.roi.offset
-            int_offset_xyz = np.array(int_origin[::-1], dtype=float)
-            true_offset_xyz = np.array(
-                getattr(self, "true_offset", int_origin)[::-1], dtype=float
-            )
-            mesh.vertices -= int_offset_xyz
-            mesh.vertices *= scale
-            mesh.vertices += true_offset_xyz
 
         from mesh_n_bone.util.neuroglancer import (
             write_ngmesh,
@@ -2046,7 +2029,6 @@ class Meshify:
         # Save/restore state so we can temporarily override output + downsample
         orig_output = self.output_directory
         orig_downsample = self.downsample_factor
-        orig_voxel_size = self.output_voxel_size_funlib
         orig_true_voxel = self.true_voxel_size.copy()
         orig_do_legacy = self.do_legacy_neuroglancer
         orig_do_singleres = self.do_singleres_multires_neuroglancer
@@ -2054,9 +2036,8 @@ class Meshify:
         orig_seg_array = self.segmentation_array
         orig_dataset_path = self._dataset_path
         orig_input_path = self.input_path
-        orig_base_voxel = self.base_voxel_size_funlib
+        orig_base_voxel = self.base_voxel_size.copy()
         orig_true_offset = self.true_offset.copy()
-        orig_dataset_origin = getattr(self, "_dataset_origin", None)
         orig_roi = self.roi
 
         try:
@@ -2070,27 +2051,22 @@ class Meshify:
                 # dataset directly — no in-worker downsampling.
                 new_arr = open_dataset(input_dataset_path)
                 self.segmentation_array = new_arr
-                self._dataset_path = new_arr._dataset_path
+                self._dataset_path = new_arr.path
                 self.input_path = input_dataset_path
-                self.base_voxel_size_funlib = new_arr.voxel_size
-                self.output_voxel_size_funlib = new_arr.voxel_size
-                self.true_voxel_size = new_arr.true_voxel_size.copy()
-                self.true_offset = new_arr.true_offset.copy()
-                self._dataset_origin = new_arr.roi.offset
+                self.base_voxel_size = new_arr.voxel_size.copy()
+                self.true_voxel_size = new_arr.voxel_size.copy()
+                self.true_offset = new_arr.translation.copy()
                 self.downsample_factor = None
                 # A custom ROI is snapped to this level's own voxels.
                 if self.has_custom_roi:
                     self.roi = _snap_roi_to_voxels(new_arr, *self._roi_world)
                 else:
-                    self.roi = new_arr.roi
+                    self.roi = new_arr.box
             elif downsample_factor is not None:
                 # Per axis; the configured scalar downsample_factor, if
                 # any, is already folded into a LOD's factor.
                 self.downsample_factor = downsample_factor
                 factor = np.array(_per_axis_factor(downsample_factor) or (1, 1, 1))
-                self.output_voxel_size_funlib = Coordinate(
-                    np.array(self.base_voxel_size_funlib) * factor
-                )
                 base_factor = np.array(_per_axis_factor(orig_downsample) or (1, 1, 1))
                 self.true_voxel_size = orig_true_voxel / base_factor * factor
 
@@ -2114,7 +2090,6 @@ class Meshify:
         finally:
             self.output_directory = orig_output
             self.downsample_factor = orig_downsample
-            self.output_voxel_size_funlib = orig_voxel_size
             self.true_voxel_size = orig_true_voxel
             self.do_legacy_neuroglancer = orig_do_legacy
             self.do_singleres_multires_neuroglancer = orig_do_singleres
@@ -2122,9 +2097,8 @@ class Meshify:
             self.segmentation_array = orig_seg_array
             self._dataset_path = orig_dataset_path
             self.input_path = orig_input_path
-            self.base_voxel_size_funlib = orig_base_voxel
+            self.base_voxel_size = orig_base_voxel
             self.true_offset = orig_true_offset
-            self._dataset_origin = orig_dataset_origin
             self.roi = orig_roi
 
     def _discover_existing_scales(self):
@@ -2156,12 +2130,12 @@ class Meshify:
             # Precomputed scales are left alone (as before worldarray):
             # only OME-NGFF / N5 multiscales groups are reused.
             if self.segmentation_array.format != "precomputed":
-                import worldarray as wa
-
                 input_scale = np.asarray(
-                    self.segmentation_array.true_voxel_size, dtype=float,
+                    self.segmentation_array.voxel_size, dtype=float,
                 )
-                pyramid = wa.open_pyramid(self._dataset_path, units=None)
+                pyramid = wa.open_pyramid(
+                    self._dataset_path, units=None, axes_order="zyx",
+                )
                 # A lone array is a pyramid of one level: nothing to reuse.
                 names = pyramid.names if len(pyramid) > 1 else ()
                 for name in names:
@@ -2206,8 +2180,6 @@ class Meshify:
         newly-built scales (so the caller can merge with the source's
         existing scales), keyed like ``_discover_existing_scales``.
         """
-        from funlib.geometry import Coordinate, Roi
-
         factors_per_lod = self._lod_factors(num_lods)
 
         existing = self._discover_existing_scales() if self.use_existing_scales else {}
@@ -2236,22 +2208,16 @@ class Meshify:
                 )
                 return {f: existing_pyramid[f] for f in need_factors}
 
-        # ROI in voxel coordinates relative to the dataset's own (0, 0, 0)
+        # The ROI in voxel indices of the dataset
         seg_arr = self.segmentation_array
-        ds_offset = np.asarray(seg_arr.roi.offset, dtype=np.int64)
-        vs_int = np.asarray(seg_arr.voxel_size, dtype=np.int64)
-        roi_world_origin = np.asarray(self.roi.offset, dtype=np.int64)
-        roi_world_shape = np.asarray(self.roi.shape, dtype=np.int64)
-        roi_voxel_origin = (roi_world_origin - ds_offset) // vs_int
-        roi_voxel_shape = roi_world_shape // vs_int
+        roi_voxel_origin = np.asarray(self.roi.begin, dtype=np.int64)
+        roi_voxel_shape = np.asarray(self.roi.shape, dtype=np.int64)
 
         # Dataset shape in voxels
-        dataset_shape = np.asarray(seg_arr.data.shape[-3:], dtype=np.int64)
+        dataset_shape = np.asarray(seg_arr.shape, dtype=np.int64)
 
         # No driver-side tensorstore handle needed — workers re-open per-process.
         dataset_path = self._dataset_path
-        ds_offset_coord = Coordinate(seg_arr.roi.offset)
-        vs_coord = Coordinate(seg_arr.voxel_size)
 
         # Downsample function dispatch
         from mesh_n_bone.meshify.downsample import (
@@ -2318,7 +2284,7 @@ class Meshify:
             max_factor = np.max(np.array([s for _, _, s, _ in cascade_steps]), axis=0)
         else:
             max_factor = np.max(np.array([f for _, f in needed]), axis=0)
-        itemsize = int(np.dtype(seg_arr.data.dtype).itemsize)
+        itemsize = int(seg_arr.dtype.itemsize)
         # 1.0 (s0 read) + 1/8 (LOD 1 output) + ~1/8 (downsample scratch)
         # plus ~1x slack for tensorstore decode/encode buffers, output-handle
         # cache_pool retention across cascaded LODs (s1, s2, s3), and
@@ -2404,13 +2370,9 @@ class Meshify:
             "cascade" if self.downsample_cascade else "direct-from-source",
         )
 
-        import worldarray as wa
-
         # What every worker reading the source s0 needs to find it.
         s0_config = {
             "s0_dataset_path": dataset_path,
-            "dataset_offset": tuple(int(v) for v in seg_arr.roi.offset),
-            "voxel_size": tuple(int(v) for v in seg_arr.voxel_size),
             "out_origin": tuple(int(v) for v in aligned_out_origin.tolist()),
         }
 
@@ -2522,7 +2484,7 @@ class Meshify:
                 out_origin=aligned_out_origin,
                 out_shape=aligned_out_shape,
                 out_chunk_shape_voxels=tuple(out_chunk_shape),
-                dtype=seg_arr.data.dtype,
+                dtype=seg_arr.dtype,
                 s0_voxel_size_zyx=self.true_voxel_size.tolist(),
                 s0_translation_zyx=self.true_offset.tolist(),
                 s0_source_path=self._dataset_path,
@@ -2771,7 +2733,7 @@ class Meshify:
                         np.array(file_sizes, dtype=float),
                         self.lod_0_box_size,
                         target_faces_per_lod0_chunk=self.target_faces_per_lod0_chunk,
-                        voxel_size_nm=float(self.base_voxel_size_funlib[0]),
+                        voxel_size_nm=float(self.base_voxel_size[0]),
                         center_octree=self.center_octree,
                     )
 
@@ -2823,7 +2785,7 @@ class Meshify:
             with Timing_Messager("Writing sharded info file", logger):
                 sharded_mesh_util.write_sharded_info_file(
                     multires_path, spec, vertex_quantization_bits=16,
-                    lod_scale_multiplier=float(self.base_voxel_size_funlib[0]),
+                    lod_scale_multiplier=float(self.base_voxel_size[0]),
                 )
 
             if self.delete_unsharded_files:
@@ -2837,7 +2799,7 @@ class Meshify:
             with Timing_Messager("Writing info file", logger):
                 neuroglancer.write_info_file(
                     multires_path,
-                    lod_scale_multiplier=float(self.base_voxel_size_funlib[0]),
+                    lod_scale_multiplier=float(self.base_voxel_size[0]),
                 )
 
         # Run mesh metrics on the LOD-0 per-segment PLYs BEFORE they get
