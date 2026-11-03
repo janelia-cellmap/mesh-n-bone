@@ -1,73 +1,70 @@
 # Fileglancer integration
 
-mesh-n-bone exposes a [Fileglancer](https://github.com/JaneliaSciComp/fileglancer) app via the `runnables.yaml` manifest at the repo root. Fileglancer reads that manifest, renders a form for the parameters defined there, and runs the resulting command on the cluster.
+mesh-n-bone is a [Fileglancer](https://github.com/JaneliaSciComp/fileglancer) app: `runnables.yaml` at the repo root describes a form, Fileglancer renders it, and submitting it runs `mesh-n-bone meshify` as a cluster job.
 
 ## Files
 
-- [`../runnables.yaml`](../runnables.yaml) — the Fileglancer manifest. Defines one runnable, `meshify`, with form fields for input/output paths, simplification, multiresolution, ROI, etc.
-- [`run_meshify.py`](run_meshify.py) — small Python wrapper. Fileglancer passes flagged arguments; the wrapper writes a `run-config.yaml` and `dask-config.yaml` into `$FG_WORK_DIR/meshify-config/` and invokes `mesh-n-bone meshify` against them.
+- [`../runnables.yaml`](../runnables.yaml): the Fileglancer manifest. One runnable, `meshify`, with form fields for the input and output, mesh generation, simplification, multiresolution output, ROI and segment selection, segment properties and compute.
+- [`run_meshify.py`](run_meshify.py): the wrapper the job runs. Fileglancer passes the form as flags; the wrapper decides which runs to make and where their meshes go, writes a `run-config.yaml` and `dask-config.yaml` per run under `$FG_WORK_DIR/meshify-config/`, and invokes `mesh-n-bone meshify` on each.
+- [`dask-config.yaml`](dask-config.yaml): the dask-jobqueue settings of the worker jobs the driver launches, used instead of `lsf-config/dask-config.yaml`.
 
-The wrapper exists because `mesh-n-bone meshify` reads a config directory, while Fileglancer is built around individual CLI flags.
+## Registering the app
 
-## How to register the app
-
-On the Fileglancer **Apps** page, add the GitHub repo URL:
+In Fileglancer, open **Apps**, then **My Apps**, then **Add from URL**, and give the repository URL:
 
 ```
 https://github.com/janelia-cellmap/mesh-n-bone
 ```
 
-(Or a branch/tag-pinned URL while this lives outside `master`.)
+A branch or tag can be chosen; a release tag (`v0.9.0`) pins the version. Fileglancer clones the repo at that revision and, on the first launch, `pixi run` builds the environment from `pixi.lock` (a few minutes, once per revision). The job needs `pixi` on the cluster node and access to conda-forge and PyPI for that first build.
 
-Fileglancer clones the repo, looks up `runnables.yaml` at the root, and on first launch `pixi run` resolves the environment automatically before invoking the wrapper.
+## Where the meshes go
 
-## Local sanity check
+The **Label volume** field takes a label group of an OME-Zarr, an array, an N5 or precomputed volume, or a zarr root. Leave **Output directory** blank and the wrapper places the meshes by the OME-Zarr layout:
 
-Run the wrapper directly to confirm it produces a valid config and invokes the CLI:
+```
+crop-001.zarr/
+  labels/
+    mitochondria/        <- Label volume
+    mitochondria_mesh/   <- written here
+    nucleus/
+    nucleus_mesh/
+    zarr.json
+  raw/
+  zarr.json
+```
+
+- A label group (`.../labels/<name>`) or an array in it is meshed to `.../labels/<name>_mesh`.
+- A zarr root whose `labels/` group lists labels (`attributes.ome.labels` in zarr v3, `labels` in v2) is meshed label by label, each to its own `_mesh` folder, in one submission.
+- The suffix is the **Mesh folder suffix** field.
+- Any other input, including a remote URL, needs an explicit output directory. Fileglancer creates it if it does not exist.
+
+Each mesh folder is a Neuroglancer precomputed multiresolution mesh source with an `info` file and, by default, shards. To view it, add it to the label's segmentation layer as a second source, `precomputed://<url of the _mesh folder>`, where `<url>` is the Fileglancer data link of the folder.
+
+## Multiscale inputs
+
+A label group with its own pyramid (`s0`, `s1`, ...) is meshed from its finest level, and the coarser levels are the levels of detail, whatever factors they were built with, including anisotropic ones. Levels that are missing are built once under the output directory and deleted afterwards unless **Delete the levels built for this run** is off. Volumes stored x, y, z (as TensorSwitch writes them) are read z, y, x; a ROI is always given z, y, x in world units.
+
+## Compute
+
+Fileglancer's job is the driver (the **Resources** defaults: 2 cpus, 30 GB, 8 hours). The driver reads [`dask-config.yaml`](dask-config.yaml) from this directory, puts the form's **LSF project** into it, and launches the worker jobs with dask-jobqueue. The two compute fields are:
+
+- **Dask workers**: worker processes in total. With 8 processes per child job, 48 workers are 6 child jobs.
+- **LSF project**: the charge group of the worker jobs, the name only.
+
+Per child job, `dask-config.yaml` asks for 8 slots, 8 processes, 120 GB and one hour. Change it here for the Fileglancer flow; the command-line flow keeps using `lsf-config/dask-config.yaml`. The driver job's own charge group is set in Fileglancer's **Cluster** tab under extra `bsub` arguments (`-P <project>`); don't add `-n` there, the CPUs field sets it.
+
+## Trying the wrapper by hand
 
 ```bash
 pixi run python fileglancer/run_meshify.py \
-  --input examples/data/example.zarr/seg/s0 \
+  --input examples/data/example.zarr/seg \
   --output /tmp/meshify-fg-test \
-  --multires \
-  --num-workers 1
+  --num-workers 1 --dry-run
 ```
 
-`FG_WORK_DIR` defaults to the current working directory when not set, so the generated config lands in `./meshify-config/`.
-
-## How it maps to your CLI flow
-
-The wrapper mirrors your normal:
-
-```bash
-bsub -n 2 -P cellmap mesh-n-bone meshify lsf-config -n 144
-```
-
-Fileglancer's outer LSF job acts as the driver (Resources tab: 2 cpus / 4 GB). The driver reads [`dask-config.yaml`](dask-config.yaml) **from this directory** (not the production `lsf-config/`), substitutes the `project:` field with your `LSF project` form input, and runs `mesh-n-bone meshify` with `--num-workers`. dask-jobqueue spawns the worker LSF jobs.
-
-So the only LSF-related fields in the form are:
-
-- **Compute → Dask workers** (default `48`) — total worker processes
-- **Compute → LSF project** — charge group for the worker jobs (`cellmap`, etc.)
-
-If you want to change per-child-job cores/memory/walltime for the Fileglancer flow, edit [`dask-config.yaml`](dask-config.yaml) here. The production CLI still uses [`../lsf-config/dask-config.yaml`](../lsf-config/dask-config.yaml) and is not affected.
-
-Current `fileglancer/dask-config.yaml` per-child-job settings:
-
-| Field | Value |
-|---|---|
-| `ncpus` | 8 |
-| `processes` | 8 |
-| `cores` | 8 |
-| `memory` | 120 GB (15 GB × 8) |
-| `walltime` | 01:00 |
-
-So `--num-workers 48` with `processes: 8` fans out to 6 child LSF jobs.
-
-### Driver job's own charge group
-
-Fileglancer's manifest has no field for `bsub -P` on the driver itself. Set it in **Cluster tab → Submit Options → Extra Arguments** (e.g. `-P cellmap`). Don't add `-n` there — it conflicts with the structured CPUs field.
+`--dry-run` prints the runs and their configs without meshing. Without `FG_WORK_DIR`, the configs land in `./meshify-config/`.
 
 ## Adding more runnables
 
-Each subcommand (`to-neuroglancer`, `skeletonize`, `analyze`) follows the same pattern: add a runnable entry in `runnables.yaml` and a matching `run_<subcommand>.py` wrapper that materializes its config directory.
+Each subcommand (`to-neuroglancer`, `skeletonize`, `analyze`) can follow the same pattern: a runnable in `runnables.yaml` and a `run_<subcommand>.py` wrapper that writes its config directory.

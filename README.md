@@ -403,6 +403,10 @@ jobqueue:
     # ... other SGE-specific options
 ```
 
+### From Fileglancer
+
+mesh-n-bone is also a [Fileglancer](https://github.com/JaneliaSciComp/fileglancer) app: add this repository under **Apps** and submit `meshify` from a form. With the output left blank, a label inside an OME-Zarr `labels/` folder is meshed to `labels/<name>_mesh` next to it, and a zarr root that lists labels is meshed label by label. See [`fileglancer/README.md`](fileglancer/README.md).
+
 ## Testing
 
 ```bash
