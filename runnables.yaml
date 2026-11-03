@@ -1,0 +1,170 @@
+name: mesh-n-bone
+description: Generate neuroglancer-compatible meshes from segmentation volumes
+version: "0.1.7"
+
+runnables:
+  - id: meshify
+    name: Meshify segmentation volume
+    requirements:
+      - "pixi>=0.40"
+    description: >-
+      Run marching cubes on a Zarr/N5 segmentation, assemble across chunks,
+      simplify and smooth, and optionally write neuroglancer multiresolution
+      Draco-compressed output.
+    command: pixi run python fileglancer/run_meshify.py
+
+    parameters:
+      - flag: --input
+        name: Input segmentation
+        type: directory
+        description: >-
+          Path to a Zarr / N5 / neuroglancer-precomputed segmentation source.
+          Local paths, http(s)://, gs://, and s3:// are all supported; the
+          format is auto-detected by content. For multiscales sources
+          (OME-Zarr multiscales group, precomputed `info` with multiple scales),
+          the highest-resolution scale is used by default; to use a coarser
+          scale, point at a specific array (e.g. `.../seg.zarr/s2`) or, for
+          precomputed, append the scale `key` from the `info` file.
+        required: true
+
+      - flag: --output
+        name: Output directory
+        type: string
+        description: >-
+          Where to write meshes and multiresolution output. Created if it
+          doesn't exist. Use an absolute path. (Type is `string` rather than
+          `directory` so Fileglancer doesn't reject paths that don't exist
+          yet.)
+        required: true
+
+      - section: Mesh generation
+        collapsed: true
+        parameters:
+          - flag: --downsample-factor
+            name: Downsample factor
+            type: integer
+            min: 1
+            description: Optional integer factor to downsample volume before meshing.
+          - flag: --downsample-method
+            name: Downsample method
+            type: enum
+            options: [mode, mode_suppress_zero, binary]
+            default: mode_suppress_zero
+
+      - section: Simplification & smoothing
+        collapsed: true
+        parameters:
+          - flag: --target-reduction
+            name: Target face reduction
+            type: number
+            min: 0
+            max: 1
+            default: 0.99
+            description: Fraction of faces to remove during simplification (0–1).
+          - flag: --n-smoothing-iter
+            name: Smoothing iterations
+            type: integer
+            min: 0
+            default: 10
+            description: Taubin smoothing iterations.
+          - flag: --no-simplification
+            name: Disable simplification
+            type: boolean
+            default: false
+          - flag: --use-fixed-edge-simplification
+            name: Allow blockwise simplification (preserve chunk-boundary edges)
+            type: boolean
+            default: true
+            description: >-
+              Simplify each block independently while preserving edges along
+              chunk boundaries, so seams stay aligned. Faster and uses less
+              memory than global simplification, at the cost of slightly
+              denser meshes near chunk borders.
+          - flag: --strict
+            name: Strict mode (watertight check + mesh-metrics CSV)
+            type: boolean
+            default: false
+            description: >-
+              When on, requires every mesh to be watertight + winding-
+              consistent + have positive volume (run fails otherwise) and
+              writes a per-mesh metrics CSV (volume, surface area, curvature,
+              thickness). Off by default because real data is rarely fully
+              watertight, especially with an ROI; the metrics are meaningless
+              on non-watertight meshes anyway, so the two go together.
+
+      - section: Multiresolution output
+        collapsed: false
+        parameters:
+          - flag: --multires
+            name: Generate multiresolution output
+            type: boolean
+            default: true
+          - flag: --num-lods
+            name: Levels of detail
+            type: integer
+            min: 1
+            default: 3
+          - flag: --multires-strategy
+            name: LOD strategy
+            type: enum
+            options: [decimate, downsample]
+            default: decimate
+          - flag: --decimation-factor
+            name: Decimation factor per LOD
+            type: integer
+            min: 2
+            default: 4
+          - flag: --keep-decimated-meshes
+            name: Keep intermediate LOD mesh files
+            type: boolean
+            default: false
+
+      - section: Coordinates & ROI
+        collapsed: true
+        parameters:
+          - flag: --voxel-size-nm
+            name: Voxel size override (nm, ZYX)
+            type: string
+            description: >-
+              Override voxel size when dataset metadata is missing or incorrect.
+              Comma-separated z,y,x in nanometers.
+            pattern: "^[0-9]+(\\.[0-9]+)?,[0-9]+(\\.[0-9]+)?,[0-9]+(\\.[0-9]+)?$"
+          - flag: --roi
+            name: ROI (z0,y0,x0,z1,y1,x1)
+            type: string
+            description: >-
+              Restrict processing to this ZYX subregion in dataset world units.
+            pattern: "^-?[0-9]+(\\.[0-9]+)?(,-?[0-9]+(\\.[0-9]+)?){5}$"
+
+      - section: Segment properties
+        collapsed: true
+        parameters:
+          - flag: --segment-properties-csv
+            name: Segment properties CSV
+            type: file
+            description: CSV with per-segment metadata (must include an Object ID column).
+
+      - section: Compute
+        collapsed: false
+        parameters:
+          - flag: --num-workers
+            name: Dask workers
+            type: integer
+            min: 1
+            default: 48
+            description: >-
+              Total worker processes across child LSF jobs. With
+              fileglancer/dask-config.yaml (8 processes per job), 48 fans out
+              to 6 child jobs.
+          - flag: --lsf-project
+            name: LSF project name for worker jobs
+            type: string
+            description: >-
+              Optional charge group name for the dask worker LSF jobs (e.g.
+              cellmap). Enter the project name only, without the -P flag.
+              Leave blank if your cluster doesn't require a project.
+
+    resources:
+      cpus: 8
+      memory: "120 GB"
+      walltime: "04:00"
