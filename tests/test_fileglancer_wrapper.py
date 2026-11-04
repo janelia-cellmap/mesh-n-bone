@@ -201,6 +201,15 @@ class TestWhereTheMeshesGo:
         runs = wrapper.plan_runs(str(root / "labels" / "mito"), output="/somewhere/else")
         assert runs == [(None, str(root / "labels" / "mito"), "/somewhere/else")]
 
+    def test_explicit_output_with_a_zarr_root_gets_a_folder_per_label(self, tmp_path, wrapper):
+        """Trying the app on someone else's crop without writing into it."""
+        root = _zarr_root_with_labels(tmp_path / "crop.zarr", ["mito", "nuc"])
+        runs = wrapper.plan_runs(str(root), output="/somewhere/else", mesh_suffix="_mesh")
+        assert runs == [
+            ("mito", str(root / "labels" / "mito"), "/somewhere/else/mito_mesh"),
+            ("nuc", str(root / "labels" / "nuc"), "/somewhere/else/nuc_mesh"),
+        ]
+
     def test_other_inputs_need_an_output(self, tmp_path, wrapper):
         plain = tmp_path / "seg.zarr" / "s0"
         plain.mkdir(parents=True)
