@@ -144,7 +144,7 @@ def delete_decimated_mesh_files(output_path, lods, ids, num_workers):
                 raise ValueError(
                     f"{output_path}/mesh_lods/s0 is not a link to the original meshes."
                 )
-            os.system(f"unlink {output_path}/mesh_lods/s0")
+            os.unlink(f"{output_path}/mesh_lods/s0")
         else:
             for id in ids:
                 variable_args_list.append((id, current_lod))

@@ -13,6 +13,7 @@ from yaml.loader import SafeLoader
 import dask.bag as db
 import numpy as np
 import logging
+import threading
 
 logger = logging.getLogger(__name__)
 
@@ -391,6 +392,105 @@ def effective_num_workers(requested, num_tasks, logger=None, phase_name=None):
             label, effective, requested,
         )
     return effective
+
+
+def local_io_workers(num_items, num_workers, min_items_per_thread=20, max_multiplier=4):
+    """Thread-pool size for driver-side I/O over many small files.
+
+    Scanning, unlinking or renaming per-segment files is bound by the
+    shared filesystem's metadata round trips, not by CPU, so plain OS
+    threads in the driver scale it almost linearly until the metadata
+    server saturates. The pool grows with the item count, one thread per
+    ``min_items_per_thread`` items, and is capped at ``num_workers *
+    max_multiplier`` so a huge item count does not spawn an unbounded
+    number of threads. Unrelated to the cluster's worker count except as
+    that baseline.
+    """
+    if num_items <= 1:
+        return 1
+    scaled = max(1, num_items // max(1, int(min_items_per_thread)))
+    cap = max(1, int(num_workers)) * max(1, int(max_multiplier))
+    return max(1, min(scaled, cap))
+
+
+def parallel_io(items, fn, num_workers, logger=None, what="items", report_fraction=0.05):
+    """Apply ``fn`` to every item from a thread pool sized by
+    :func:`local_io_workers`, logging ``what: done/total`` every
+    ``report_fraction`` of the way so a long file loop never looks like
+    a hang. Results come back in input order; exceptions propagate.
+    """
+    items = list(items)
+    total = len(items)
+    if total == 0:
+        return []
+    report_every = max(1, int(total * report_fraction))
+    done = 0
+    lock = threading.Lock()
+
+    def _wrapped(item):
+        nonlocal done
+        result = fn(item)
+        with lock:
+            done += 1
+            if logger is not None and (done % report_every == 0 or done == total):
+                logger.info("%s: %d/%d", what, done, total)
+        return result
+
+    max_workers = local_io_workers(total, num_workers)
+    if max_workers > 1 and total > max_workers:
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            return list(ex.map(_wrapped, items))
+    return [_wrapped(item) for item in items]
+
+
+def _unlink_quietly(path):
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def parallel_delete_tree(dirpath, num_workers=8, logger=None):
+    """Delete everything under ``dirpath`` with the unlinks spread across
+    threads, for trees of millions of small per-segment files on a shared
+    filesystem where ``shutil.rmtree`` would unlink them one round trip at
+    a time.
+
+    Symlinks are never followed: any symlink met during the walk, file or
+    directory, is unlinked on the spot, and ``dirpath`` itself is left
+    alone if it is one. Real files are unlinked in parallel, then the now
+    empty directories are removed bottom-up.
+    """
+    if os.path.islink(dirpath) or not os.path.isdir(dirpath):
+        return
+    real_files, real_dirs = [], []
+    for root, dirs, files in os.walk(dirpath, topdown=True, followlinks=False):
+        real_dirs.append(root)
+        for name in files:
+            full = os.path.join(root, name)
+            if os.path.islink(full):
+                _unlink_quietly(full)
+            else:
+                real_files.append(full)
+        kept = []
+        for name in dirs:
+            full = os.path.join(root, name)
+            if os.path.islink(full):
+                _unlink_quietly(full)
+            else:
+                kept.append(name)
+        dirs[:] = kept
+    parallel_io(
+        real_files, _unlink_quietly, num_workers, logger=logger,
+        what=f"files deleted under {os.path.basename(dirpath.rstrip(os.sep))}",
+    )
+    for d in reversed(real_dirs):
+        try:
+            os.rmdir(d)
+        except OSError:
+            pass
 
 
 def guesstimate_npartitions(elements, num_workers, scaling=10):

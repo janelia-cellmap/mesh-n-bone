@@ -603,6 +603,7 @@ def run_multires(config_path, num_workers, roi=None):
                     ):
                         sharded_mesh_util.delete_unsharded_segment_files(
                             multires_output_path, mesh_ids,
+                            num_workers=max(1, int(num_workers)), logger=logger,
                         )
             else:
                 with Timing_Messager("Writing info file", logger):
@@ -619,7 +620,11 @@ def run_multires(config_path, num_workers, roi=None):
                         delete_decimated_mesh_files(
                             output_path, lods, mesh_ids, effective_workers,
                         )
-                        os.system(f"rm -rf {output_path}/mesh_lods")
+                        mesh_lods_dir = f"{output_path}/mesh_lods"
+                        if os.path.isdir(mesh_lods_dir) and not os.path.islink(mesh_lods_dir):
+                            dask_util.parallel_delete_tree(
+                                mesh_lods_dir, num_workers=effective_workers, logger=logger,
+                            )
 
             print_with_datetime(
                 f"Complete! Elapsed time: {time.time() - t0}", logger

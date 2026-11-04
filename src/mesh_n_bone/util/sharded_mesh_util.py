@@ -242,13 +242,26 @@ def pack_meshes_to_shards(
     return paths
 
 
-def delete_unsharded_segment_files(multires_dir: str, segment_ids: Iterable[int]) -> None:
-    """Remove `<id>` and `<id>.index` after they've been packed into shards."""
+def delete_unsharded_segment_files(
+    multires_dir: str, segment_ids: Iterable[int], num_workers: int = 1, logger=None,
+) -> None:
+    """Remove `<id>` and `<id>.index` after they've been packed into shards.
 
-    for seg_id in segment_ids:
+    One unlink round trip per file on the shared filesystem, independent
+    per segment, so the removals are spread across threads and progress is
+    logged; a million segments used to be a silent hour here.
+    """
+    from mesh_n_bone.util import dask_util
+
+    def _remove_pair(seg_id):
         for suffix in ("", ".index"):
             p = os.path.join(multires_dir, f"{seg_id}{suffix}")
             try:
                 os.remove(p)
             except FileNotFoundError:
                 pass
+
+    dask_util.parallel_io(
+        list(segment_ids), _remove_pair, num_workers, logger=logger,
+        what="unsharded segment files deleted",
+    )

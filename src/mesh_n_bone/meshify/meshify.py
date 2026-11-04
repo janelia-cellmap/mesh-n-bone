@@ -204,6 +204,76 @@ def _estimate_assembly_peak_bytes(
     return raw_mesh_bytes, int(baseline_bytes + amplification * effective_mesh_bytes)
 
 
+_MANIFEST_SUBDIR = "_manifests"
+_MANIFEST_DTYPE = np.dtype(
+    [("id", "u8"), ("bytes", "u8"), ("vertices", "u8"), ("faces", "u8")]
+)
+
+
+def _write_block_manifest(tmpdirname, block_id, written):
+    """Record what one block wrote (segment id, PLY bytes, vertex and face
+    counts) so the assembly planner can total them from one small file per
+    block instead of statting every per-segment file."""
+    if not written:
+        return
+    mdir = os.path.join(tmpdirname, _MANIFEST_SUBDIR)
+    os.makedirs(mdir, exist_ok=True)
+    rows = np.array(written, dtype=_MANIFEST_DTYPE)
+    final = os.path.join(mdir, f"block_{block_id}.npy")
+    partial = final + ".partial"
+    with open(partial, "wb") as fh:  # a file handle keeps np.save from adding .npy
+        np.save(fh, rows)
+    os.replace(partial, final)
+
+
+def _manifest_totals(dirname):
+    """Per-segment ``[files, bytes, vertices, faces]`` summed over the block
+    manifests under *dirname*, or an empty dict when none were written."""
+    mdir = os.path.join(dirname, _MANIFEST_SUBDIR)
+    totals = {}
+    if not os.path.isdir(mdir):
+        return totals
+    for name in sorted(os.listdir(mdir)):
+        if not name.endswith(".npy") or name.endswith(".partial.npy"):
+            continue
+        rows = np.load(os.path.join(mdir, name))
+        for row in rows:
+            t = totals.setdefault(int(row["id"]), [0, 0, 0, 0])
+            t[0] += 1
+            t[1] += int(row["bytes"])
+            t[2] += int(row["vertices"])
+            t[3] += int(row["faces"])
+    return totals
+
+
+def _promote_meshes_subdir(scale_dir):
+    """Make ``<scale_dir>/meshes/*`` the contents of ``<scale_dir>`` with
+    two directory renames instead of one rename per file.
+
+    Assembly writes its meshes under ``meshes/``; the rest of the pipeline
+    reads them from the scale directory itself. Moving a few hundred
+    thousand files one ``rename`` at a time over NFS took half an hour
+    with nothing in the log. Anything else already in the scale directory
+    (``assembly_metadata``, leftovers) is carried along.
+    """
+    sub = os.path.join(scale_dir, "meshes")
+    if not os.path.isdir(sub) or os.path.islink(sub):
+        return
+    for name in os.listdir(scale_dir):
+        if name == "meshes":
+            continue
+        target = os.path.join(sub, name)
+        if os.path.lexists(target):
+            raise FileExistsError(
+                f"{target} exists in both {scale_dir} and its meshes/ subfolder"
+            )
+        os.rename(os.path.join(scale_dir, name), target)
+    staging = scale_dir.rstrip(os.sep) + ".promoting"
+    os.rename(sub, staging)
+    os.rmdir(scale_dir)
+    os.rename(staging, scale_dir)
+
+
 def _scan_one_assembly_mesh_dir(mesh_dir, mesh_id, amplification):
     """Scan one segment's chunked PLYs and return its estimate, or ``None``."""
     num_files = 0
@@ -248,13 +318,50 @@ def _scan_assembly_mesh_estimates(dirname, amplification, num_workers=1):
     hundreds of thousands of segment directories on large datasets with no
     other feedback before the assembly Dask cluster starts.
     """
-    mesh_ids = [
-        mesh_id for mesh_id in sorted(os.listdir(dirname))
-        if os.path.isdir(os.path.join(dirname, mesh_id))
-    ]
+    # One directory listing; scandir's cached entry type avoids a stat per
+    # segment directory on shared filesystems.
+    with os.scandir(dirname) as it:
+        mesh_ids = sorted(
+            e.name for e in it
+            if e.is_dir(follow_symlinks=False) and not e.name.startswith("_")
+        )
+
+    # The chunked-mesh workers record what they wrote, one small file per
+    # block, so most segments are totalled from those instead of a listing
+    # and a header read per file. Only segments the manifests do not cover
+    # (a block that died between writing its PLYs and its manifest) are
+    # scanned the slow way.
+    totals = _manifest_totals(dirname)
+    from_manifests = []
+    to_scan = []
+    for mesh_id in mesh_ids:
+        try:
+            t = totals.get(int(mesh_id))
+        except ValueError:
+            t = None
+        if t is None:
+            to_scan.append(mesh_id)
+            continue
+        num_files, ply_bytes, vertex_count, face_count = t
+        raw_mesh_bytes, estimated_peak_bytes = _estimate_assembly_peak_bytes(
+            ply_bytes, vertex_count, face_count, amplification,
+        )
+        from_manifests.append(AssemblyMeshEstimate(
+            mesh_id=str(mesh_id), num_files=num_files, ply_bytes=int(ply_bytes),
+            vertex_count=int(vertex_count), face_count=int(face_count),
+            raw_mesh_bytes=int(raw_mesh_bytes),
+            estimated_peak_bytes=int(estimated_peak_bytes),
+        ))
+    if from_manifests:
+        logger.info(
+            "Assembly scan: %d of %d chunked meshes totalled from block manifests",
+            len(from_manifests), len(mesh_ids),
+        )
+    mesh_ids = to_scan
     total = len(mesh_ids)
     if total == 0:
-        return []
+        from_manifests.sort(key=lambda e: e.mesh_id)
+        return from_manifests
 
     done = 0
     report_every = max(1, total // 20)
@@ -295,7 +402,7 @@ def _scan_assembly_mesh_estimates(dirname, amplification, num_workers=1):
             )
             _log_progress()
 
-    estimates = [r for r in results if r is not None]
+    estimates = from_manifests + [r for r in results if r is not None]
     estimates.sort(key=lambda e: e.mesh_id)
     return estimates
 
@@ -778,6 +885,7 @@ def _get_chunked_mesh_worker(block_index, tmpdirname, config):
         if downsample_factor is not None else np.zeros(3)
     )
     mesher.mesh(segmentation_block, close=False)
+    written = []  # (segment id, PLY bytes, vertices, faces) per file this block writes
     for id in mesher.ids():
         original_id = inv_remap[int(id)] if inv_remap is not None else int(id)
         mesh = mesher.get_mesh(id)
@@ -825,15 +933,23 @@ def _get_chunked_mesh_worker(block_index, tmpdirname, config):
             )
 
             os.makedirs(f"{tmpdirname}/{original_id}", exist_ok=True)
+            ply = mesh_simplified.to_ply()
             with open(f"{tmpdirname}/{original_id}/block_{block.id}.ply", "wb") as fp:
-                fp.write(mesh_simplified.to_ply())
+                fp.write(ply)
+            written.append((
+                original_id, len(ply),
+                len(mesh_tri_simplified.vertices), len(mesh_tri_simplified.faces),
+            ))
         else:
             if len(mesh.vertices) == 0:
                 continue
             mesh.vertices += block_offset[::-1] + ds_shift[::-1]
             os.makedirs(f"{tmpdirname}/{original_id}", exist_ok=True)
+            ply = mesh.to_ply()
             with open(f"{tmpdirname}/{original_id}/block_{block.id}.ply", "wb") as fp:
-                fp.write(mesh.to_ply())
+                fp.write(ply)
+            written.append((original_id, len(ply), len(mesh.vertices), len(mesh.faces)))
+    _write_block_manifest(tmpdirname, block.id, written)
 
 
 class Meshify:
@@ -2823,7 +2939,9 @@ class Meshify:
 
         if self.delete_decimated_meshes:
             with Timing_Messager("Cleaning up intermediate mesh files", logger):
-                shutil.rmtree(mesh_lods_dir, ignore_errors=True)
+                dask_util.parallel_delete_tree(
+                    mesh_lods_dir, num_workers=self.num_workers, logger=logger,
+                )
 
         # Pyramid scale cache: keep when explicitly requested for reuse,
         # otherwise tear down so the output dir doesn't accumulate the
@@ -2855,12 +2973,8 @@ class Meshify:
         logger.info("Generating meshes at LOD 0 from segmentation volume")
         self._generate_meshes_at_scale(s0_dir, self.downsample_factor)
 
-        # Move meshes from s0/meshes/ up to s0/
-        s0_mesh_subdir = f"{s0_dir}/meshes"
-        if os.path.isdir(s0_mesh_subdir):
-            for f in os.listdir(s0_mesh_subdir):
-                shutil.move(f"{s0_mesh_subdir}/{f}", f"{s0_dir}/{f}")
-            os.rmdir(s0_mesh_subdir)
+        # Make s0/meshes/* the contents of s0/ (two renames, not one per mesh)
+        _promote_meshes_subdir(s0_dir)
 
         # Collect mesh IDs from s0
         mesh_ids = []
@@ -2980,12 +3094,8 @@ class Meshify:
                     scale_dir, ds_factor, target_reduction_override=tr_lod,
                 )
 
-            # Move meshes from s{lod}/meshes/ up to s{lod}/
-            scale_mesh_subdir = f"{scale_dir}/meshes"
-            if os.path.isdir(scale_mesh_subdir):
-                for f in os.listdir(scale_mesh_subdir):
-                    shutil.move(f"{scale_mesh_subdir}/{f}", f"{scale_dir}/{f}")
-                os.rmdir(scale_mesh_subdir)
+            # Make s{lod}/meshes/* the contents of s{lod}/ (two renames, not one per mesh)
+            _promote_meshes_subdir(scale_dir)
 
     def get_meshes(self):
         """Generate meshes: chunk, assemble, and optionally analyze.
