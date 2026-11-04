@@ -5,16 +5,20 @@ version: "0.9.0"
 requirements:
   - "pixi>=0.40"
 
+# Fileglancer pre-fills every field with its default and does not mark it as
+# one, so each description states the default and what blank means. Fields
+# marked hidden are behind the form's "Show hidden" toggle.
 runnables:
   - id: meshify
     type: job
     name: Meshify segmentation volume
     description: >-
       Run marching cubes on a label volume, assemble across chunks, simplify
-      and smooth, and write Neuroglancer multiresolution Draco meshes. With
-      the output left blank, a label inside an OME-Zarr labels/ folder is
-      meshed to labels/<name>_mesh next to it, and a zarr root that lists
-      labels is meshed label by label.
+      and smooth, and write Neuroglancer multiresolution Draco meshes. The
+      defaults give hemibrain-density meshes; a normal run only needs the
+      label volume. With the output left blank, a label inside an OME-Zarr
+      labels/ folder is meshed to labels/<name>_mesh next to it, and a zarr
+      root that lists labels is meshed label by label.
     command: pixi run python fileglancer/run_meshify.py
 
     parameters:
@@ -34,79 +38,27 @@ runnables:
         type: directory
         exists: false
         description: >-
-          Where to write the meshes. Leave blank to place them next to the
-          label as labels/<name>_mesh (see Output layout).
+          Where to write the meshes. Blank places them next to the label as
+          labels/<name>_mesh; see Output layout.
         required: false
 
       - section: Output layout
+        description: Only used when Output directory is blank.
         collapsed: true
         parameters:
           - flag: --mesh-suffix
             name: Mesh folder suffix
             type: string
             default: "_mesh"
+            placeholder: "_mesh"
             description: >-
-              Suffix of a mesh folder derived from its label's name when the
-              output is blank: labels/<name><suffix>.
+              The mesh folder is the label's name plus this suffix, next to
+              the label: labels/<name><suffix>. Default _mesh.
 
-      - section: Mesh generation
-        collapsed: true
-        parameters:
-          - flag: --downsample-factor
-            name: Downsample factor
-            type: integer
-            min: 1
-            description: Optional integer factor to downsample the volume before meshing.
-          - flag: --downsample-method
-            name: Downsample method
-            type: enum
-            options: [mode, mode_suppress_zero, binary, nearest]
-            default: mode
-
-      - section: Simplification & smoothing
-        collapsed: true
-        parameters:
-          - flag: --target-reduction
-            name: Target face reduction
-            type: number
-            min: 0
-            max: 1
-            default: 0.933
-            description: Fraction of faces to remove during simplification (0 to 1).
-          - flag: --n-smoothing-iter
-            name: Smoothing iterations
-            type: integer
-            min: 0
-            default: 2
-            description: Taubin smoothing iterations.
-          - flag: --simplification
-            name: Simplify meshes
-            type: boolean
-            boolean_style: value
-            default: true
-          - flag: --use-fixed-edge-simplification
-            name: Blockwise simplification (preserve chunk-boundary edges)
-            type: boolean
-            boolean_style: value
-            default: false
-            description: >-
-              Simplify each block independently while preserving edges along
-              chunk boundaries, so seams stay aligned. Faster and uses less
-              memory than global simplification, at the cost of slightly
-              denser meshes near block borders.
-          - flag: --strict
-            name: Strict mode (watertight check + mesh-metrics CSV)
-            type: boolean
-            boolean_style: value
-            default: false
-            description: >-
-              Require every mesh to be watertight, winding-consistent and of
-              positive volume (the run fails otherwise) and write a per-mesh
-              metrics CSV (volume, surface area, curvature, thickness). Off
-              by default: real data is rarely fully watertight, especially
-              with a ROI.
-
-      - section: Multiresolution output
+      - section: Levels of detail
+        description: >-
+          Defaults give four levels of detail, taken from the input's own
+          pyramid when it has one. A normal run needs no change here.
         collapsed: false
         parameters:
           - flag: --multires
@@ -114,89 +66,162 @@ runnables:
             type: boolean
             boolean_style: value
             default: true
+            description: >-
+              Write a Neuroglancer multiresolution mesh source, which is what
+              the Neuroglancer link needs. Off writes one PLY file per segment
+              at full resolution, which Neuroglancer does not read. Default
+              on.
           - flag: --num-lods
             name: Levels of detail
             type: integer
             min: 1
             default: 4
+            description: >-
+              Number of levels including the full-resolution one. Each level
+              is about half the resolution of the one before it, on the finer
+              axes only while the voxels are anisotropic. Default 4.
           - flag: --multires-strategy
             name: LOD strategy
             type: enum
             options: [downsample, decimate]
             default: downsample
             description: >-
-              downsample: mesh each level of detail from a coarser version of
-              the volume (the input's own pyramid levels when it has them).
-              decimate: mesh once and decimate.
+              How the coarser levels are made. downsample (default): re-mesh a
+              coarser volume for each level, the input's own pyramid levels
+              (s1, s2, ...) when it has them, otherwise levels built with the
+              Downsample method. decimate: mesh once at full resolution and
+              decimate that mesh for each level.
           - flag: --decimation-factor
-            name: Face reduction per LOD
+            name: Face count ratio between levels
             type: integer
             min: 2
             default: 6
+            description: >-
+              Each level has about this many times fewer faces than the one
+              before it. Default 6. Not the Target face reduction under
+              Simplification, which is the fraction removed from the
+              full-resolution mesh.
           - flag: --use-existing-scales
             name: Use the input's pyramid levels
             type: boolean
             boolean_style: value
             default: true
             description: >-
-              Mesh the levels of detail from the input's own coarser levels
-              when it has them, and build the missing ones once. Off:
-              downsample inside the workers for every level.
-          - flag: --downsample-cascade
-            name: Build missing levels from the previous level
-            type: boolean
-            boolean_style: value
-            default: false
-          - flag: --delete-intermediate-scales
-            name: Delete the levels built for this run
-            type: boolean
-            boolean_style: value
-            default: true
+              downsample strategy only. Mesh the levels from the input's own
+              coarser levels when it has them, and build just the missing
+              ones. Off: every level downsamples the full-resolution volume
+              inside the workers instead, with the Downsample method. Default
+              on.
+          - flag: --downsample-method
+            name: Downsample method
+            type: enum
+            options: [mode, mode_suppress_zero, binary, nearest]
+            default: mode
+            description: >-
+              How label voxels are merged whenever a coarser volume is made,
+              for missing levels and for the Downsample factor under
+              Resolution. mode (default): majority label. mode_suppress_zero:
+              majority ignoring background, which keeps thin objects visible
+              at coarse levels but inflates them. binary: any non-zero voxel
+              counts. nearest: keep one voxel per block, fastest and roughest.
           - flag: --sharded
             name: Sharded output
             type: boolean
             boolean_style: value
             default: true
-            description: Pack the meshes into shards so thousands load in a few requests.
-          - flag: --keep-decimated-meshes
-            name: Keep per-LOD mesh files
-            type: boolean
-            boolean_style: value
-            default: false
+            description: >-
+              Pack the meshes into shards so thousands load in a few
+              requests. Default on.
 
-      - section: Coordinates & selection
+      - section: Resolution
+        description: The volume is meshed at its own resolution unless a factor is given.
         collapsed: true
         parameters:
-          - flag: --voxel-size-nm
-            name: Voxel size override (nm, z,y,x)
-            type: string
+          - flag: --downsample-factor
+            name: Downsample factor
+            type: integer
+            min: 1
             description: >-
-              Override the voxel size when the volume's metadata is missing
-              or wrong. Comma-separated z,y,x in nanometers.
-            pattern: "^[0-9]+(\\.[0-9]+)?,[0-9]+(\\.[0-9]+)?,[0-9]+(\\.[0-9]+)?$"
+              Shrink the volume by this integer factor on every axis before
+              meshing, so the full-resolution level is coarser and the run is
+              faster. Blank or 1 (the default) meshes at the volume's own
+              resolution. Uses the Downsample method under Levels of detail.
+
+      - section: Simplification & smoothing
+        description: Defaults match the hemibrain meshes.
+        collapsed: true
+        parameters:
+          - flag: --simplification
+            name: Simplify meshes
+            type: boolean
+            boolean_style: value
+            default: true
+            description: >-
+              Reduce the face count of the marching-cubes meshes by the Target
+              face reduction. Off keeps the raw marching-cubes meshes, many
+              times larger. Default on.
+          - flag: --target-reduction
+            name: Target face reduction
+            type: number
+            min: 0
+            max: 1
+            default: 0.933
+            description: >-
+              Fraction of faces removed from the full-resolution mesh, 0 to 1.
+              Default 0.933, which matches the hemibrain meshes at 16 nm.
+              Coarser levels remove more, set by the Face count ratio under
+              Levels of detail.
+          - flag: --n-smoothing-iter
+            name: Smoothing iterations
+            type: integer
+            min: 0
+            default: 2
+            description: Taubin smoothing iterations. Default 2; 0 turns smoothing off.
+
+      - section: Region & segments
+        description: Blank fields mean the whole volume, every segment, and the volume's own voxel size.
+        collapsed: true
+        parameters:
           - flag: --roi
             name: ROI (z0,y0,x0,z1,y1,x1)
             type: string
+            placeholder: "e.g. 0,0,0,2000,4000,4000"
             description: >-
-              Only mesh this region, in the volume's world units, z, y, x,
-              whatever order the volume is stored in.
+              Only mesh this box: near corner then far corner, in the volume's
+              units (nm), always z, y, x whatever order the volume is stored
+              in. Blank meshes the whole volume.
             pattern: "^-?[0-9]+(\\.[0-9]+)?(,-?[0-9]+(\\.[0-9]+)?){5}$"
           - flag: --ids
             name: Segment ids
             type: string
+            placeholder: "e.g. 1,2,3 or ids.csv"
             description: >-
               Only mesh these segments: a comma-separated list of ids, or the
-              path of a CSV file with one id per row.
+              path of a CSV file with one id per row. Blank meshes every
+              segment.
+          - flag: --voxel-size-nm
+            name: Voxel size override (nm, z,y,x)
+            type: string
+            placeholder: "e.g. 45,16,16"
+            description: >-
+              Only when the volume's metadata is missing or wrong.
+              Comma-separated z, y, x in nanometers. Blank reads the voxel
+              size from the volume.
+            pattern: "^[0-9]+(\\.[0-9]+)?,[0-9]+(\\.[0-9]+)?,[0-9]+(\\.[0-9]+)?$"
 
       - section: Segment properties
+        description: Optional per-segment metadata shown in Neuroglancer's segment list.
         collapsed: true
         parameters:
           - flag: --segment-properties-csv
             name: Segment properties CSV
             type: file
-            description: CSV with per-segment metadata (must include an Object ID column).
+            description: >-
+              CSV with per-segment metadata; it must include an Object ID
+              column. Blank writes the segment ids alone.
 
       - section: Compute
+        description: Worker jobs for the meshing. The Resources tab sets the driver job only.
         collapsed: false
         parameters:
           - flag: --num-workers
@@ -205,15 +230,70 @@ runnables:
             min: 1
             default: 48
             description: >-
-              Worker processes across the child LSF jobs. With
-              fileglancer/dask-config.yaml (8 processes per job), 48 workers
-              are 6 child jobs.
+              Worker processes across the child LSF jobs, 8 per job, so the
+              default 48 is 6 child jobs.
           - flag: --lsf-project
             name: LSF project for the worker jobs
             type: string
+            placeholder: "e.g. cellmap"
             description: >-
-              Charge group for the dask worker jobs (the name only, without
-              -P). Leave blank if the cluster does not require one.
+              Charge group for the dask worker jobs, the name only, without
+              -P. Blank if the cluster does not require one.
+
+      - section: Advanced
+        description: Rarely needed; memory and quality trade-offs and checks. More under Show hidden.
+        collapsed: true
+        parameters:
+          - flag: --use-fixed-edge-simplification
+            name: Blockwise simplification
+            type: boolean
+            boolean_style: value
+            default: false
+            description: >-
+              Simplify each block on its own while keeping the edges along
+              chunk boundaries, so seams stay aligned. Faster and lighter on
+              memory than simplifying whole meshes, with slightly denser
+              meshes near block borders. Default off.
+          - flag: --downsample-cascade
+            name: Build missing levels from the previous level
+            type: boolean
+            boolean_style: value
+            default: false
+            description: >-
+              Only when levels of detail have to be built. Build each missing
+              level from the level before it instead of from the
+              full-resolution volume: less memory with many levels, with
+              slightly different label boundaries at coarse levels. Default
+              off.
+          - flag: --delete-intermediate-scales
+            name: Delete the levels built for this run
+            type: boolean
+            boolean_style: value
+            default: true
+            description: >-
+              Only when levels of detail had to be built. Remove them from
+              the output directory once the meshes are written. Off keeps
+              them for inspection or reuse. Default on.
+          - flag: --strict
+            name: Strict mode (watertight check + mesh-metrics CSV)
+            type: boolean
+            boolean_style: value
+            default: false
+            description: >-
+              Require every mesh to be watertight, winding-consistent and of
+              positive volume (the run fails otherwise) and write a per-mesh
+              metrics CSV (volume, surface area, curvature, thickness).
+              Default off: real data is rarely fully watertight, especially
+              with a ROI.
+          - flag: --keep-decimated-meshes
+            name: Keep per-level mesh files
+            type: boolean
+            boolean_style: value
+            default: false
+            hidden: true
+            description: >-
+              Keep the per-level PLY files after the multiresolution output is
+              written, for debugging. Default off.
 
     resources:
       cpus: 2
