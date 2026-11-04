@@ -181,13 +181,23 @@ def _label_folder(path):
 def plan_runs(input_path, output=None, mesh_suffix=DEFAULT_MESH_SUFFIX):
     """The ``(name, input, output)`` runs for the form's input and output.
 
-    An explicit output is one run. Otherwise a label under ``labels/`` is
-    meshed next to itself, and a zarr root listing labels is one run per
-    label. Anything else needs an output directory.
+    A zarr root listing labels is one run per label: into
+    ``<output>/<name><suffix>`` with an explicit output, or next to each
+    label as ``labels/<name><suffix>`` without one. Any other input with
+    an explicit output is one run into it; without one, a label under
+    ``labels/`` is meshed next to itself and anything else is an error.
     """
+    remote = input_path.startswith(_REMOTE_PREFIXES)
+    labels = None if remote else labels_listed_in(input_path)
     if output:
+        if labels:
+            labels_dir = Path(input_path) / "labels"
+            return [
+                (name, str(labels_dir / name), str(Path(output) / f"{name}{mesh_suffix}"))
+                for name in labels
+            ]
         return [(None, input_path, output)]
-    if input_path.startswith(_REMOTE_PREFIXES):
+    if remote:
         raise ValueError(
             "An output directory is needed for a remote input; the meshes "
             "are only placed next to a local label."
@@ -196,7 +206,6 @@ def plan_runs(input_path, output=None, mesh_suffix=DEFAULT_MESH_SUFFIX):
     if found is not None:
         labels_dir, name = found
         return [(name, input_path, str(labels_dir / f"{name}{mesh_suffix}"))]
-    labels = labels_listed_in(input_path)
     if labels:
         labels_dir = Path(input_path) / "labels"
         return [

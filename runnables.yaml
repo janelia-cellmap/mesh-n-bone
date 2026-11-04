@@ -39,11 +39,13 @@ runnables:
         exists: false
         description: >-
           Where to write the meshes. Blank places them next to the label as
-          labels/<name>_mesh; see Output layout.
+          labels/<name>_mesh; see Output layout. For a zarr root with several
+          labels, each label goes to its own <name>_mesh folder inside this
+          directory.
         required: false
 
       - section: Output layout
-        description: Only used when Output directory is blank.
+        description: How a mesh folder is named after its label.
         collapsed: true
         parameters:
           - flag: --mesh-suffix
@@ -52,8 +54,10 @@ runnables:
             default: "_mesh"
             placeholder: "_mesh"
             description: >-
-              The mesh folder is the label's name plus this suffix, next to
-              the label: labels/<name><suffix>. Default _mesh.
+              A mesh folder named after its label is the label's name plus
+              this suffix: labels/<name><suffix> next to the label when
+              Output directory is blank, or <name><suffix> inside the output
+              directory for a zarr root. Default _mesh.
 
       - section: Levels of detail
         description: >-
