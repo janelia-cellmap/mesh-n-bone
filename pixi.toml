@@ -1,4 +1,4 @@
-[project]
+[workspace]
 name = "mesh-n-bone"
 version = "0.9.0"
 description = "Unified tool for mesh generation, multiresolution mesh creation, skeletonization, and analysis."

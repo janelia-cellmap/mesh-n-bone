@@ -3,7 +3,8 @@ description: Generate multiresolution Neuroglancer meshes from segmentation volu
 version: "0.9.0"
 
 requirements:
-  - "pixi>=0.40"
+  # pixi.lock is lockfile version 7, which pixi reads from 0.68.0 on.
+  - "pixi>=0.68"
 
 # Fileglancer pre-fills every field with its default and does not mark it as
 # one, so each description states the default and what blank means. Fields
@@ -16,9 +17,10 @@ runnables:
       Run marching cubes on a label volume, assemble across chunks, simplify
       and smooth, and write Neuroglancer multiresolution Draco meshes. The
       defaults give hemibrain-density meshes; a normal run only needs the
-      label volume. With the output left blank, a label inside an OME-Zarr
-      labels/ folder is meshed to labels/<name>_mesh next to it, and a zarr
-      root that lists labels is meshed label by label.
+      label volume. With the output left blank, the meshes go next to the
+      input in a folder named after it: labels/mitochondria is meshed to
+      labels/mitochondria_mesh. Worker jobs are billed to this job's
+      project.
     command: pixi run python fileglancer/run_meshify.py
 
     parameters:
@@ -26,11 +28,11 @@ runnables:
         name: Label volume
         type: directory
         description: >-
-          An OME-Zarr label group (e.g. .../labels/mitochondria) or array, an
-          N5 or neuroglancer-precomputed volume, or a zarr root whose labels/
-          group lists the labels to mesh. The format is auto-detected. For a
-          multiscale group the finest level is meshed and the coarser levels
-          become the levels of detail. Volumes stored x, y, z are handled.
+          An OME-Zarr label group (e.g. .../labels/mitochondria), an N5 or a
+          neuroglancer-precomputed volume. The format is auto-detected. Point
+          at the group, not a level inside it: the finest level is meshed and
+          the coarser levels become the levels of detail. Volumes stored
+          x, y, z are handled.
         required: true
 
       - flag: --output
@@ -38,14 +40,12 @@ runnables:
         type: directory
         exists: false
         description: >-
-          Where to write the meshes. Blank places them next to the label as
-          labels/<name>_mesh; see Output layout. For a zarr root with several
-          labels, each label goes to its own <name>_mesh folder inside this
-          directory.
+          Where to write the meshes. Blank places them next to the input in a
+          folder named after it plus _mesh; see Output layout.
         required: false
 
       - section: Output layout
-        description: How a mesh folder is named after its label.
+        description: Only used when Output directory is blank.
         collapsed: true
         parameters:
           - flag: --mesh-suffix
@@ -54,10 +54,8 @@ runnables:
             default: "_mesh"
             placeholder: "_mesh"
             description: >-
-              A mesh folder named after its label is the label's name plus
-              this suffix: labels/<name><suffix> next to the label when
-              Output directory is blank, or <name><suffix> inside the output
-              directory for a zarr root. Default _mesh.
+              The mesh folder is the input's name plus this suffix, next to
+              the input: labels/mitochondria<suffix>. Default _mesh.
 
       - section: Levels of detail
         description: >-
@@ -228,7 +226,10 @@ runnables:
               column. Blank writes the segment ids alone.
 
       - section: Compute
-        description: Worker jobs for the meshing. The Resources tab sets the driver job only.
+        description: >-
+          Worker jobs for the meshing. They are billed to this job's LSF
+          project (the -P under Cluster, Extra Arguments, or your default).
+          The Resources tab sets the driver job only.
         collapsed: false
         parameters:
           - flag: --num-workers
@@ -239,17 +240,6 @@ runnables:
             description: >-
               Worker processes across the child LSF jobs, 8 per job, so the
               default 48 is 6 child jobs.
-          - flag: --lsf-project
-            name: LSF project for the worker jobs
-            type: string
-            # Sent as --lsf-project=<value> so a typed "-P..." is not read
-            # as an option by the wrapper's argument parser.
-            value_separator: equals
-            placeholder: "e.g. cellmap"
-            description: >-
-              Charge group for the dask worker jobs, the name only (a typed
-              -P is dropped). Blank if the cluster does not require one;
-              LSF then assigns your default project.
 
       - section: Advanced
         description: Rarely needed; memory and quality trade-offs and checks. More under Show hidden.

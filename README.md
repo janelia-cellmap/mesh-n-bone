@@ -405,7 +405,7 @@ jobqueue:
 
 ### From Fileglancer
 
-mesh-n-bone is also a [Fileglancer](https://github.com/JaneliaSciComp/fileglancer) app: add this repository under **Apps** and submit `meshify` from a form. With the output left blank, a label inside an OME-Zarr `labels/` folder is meshed to `labels/<name>_mesh` next to it, and a zarr root that lists labels is meshed label by label. See [`fileglancer/README.md`](fileglancer/README.md).
+mesh-n-bone is also a [Fileglancer](https://github.com/JaneliaSciComp/fileglancer) app: add this repository under **Apps** and submit `meshify` from a form. With the output left blank, the meshes go next to the input in a folder named after it, so `labels/mitochondria` is meshed to `labels/mitochondria_mesh`. The worker jobs are billed to the Fileglancer job's own LSF project. See [`fileglancer/README.md`](fileglancer/README.md).
 
 ## Testing
 

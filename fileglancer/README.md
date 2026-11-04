@@ -5,7 +5,7 @@ mesh-n-bone is a [Fileglancer](https://github.com/JaneliaSciComp/fileglancer) ap
 ## Files
 
 - [`../runnables.yaml`](../runnables.yaml): the Fileglancer manifest. One runnable, `meshify`, with the input and output fields and sections for the output layout, levels of detail, resolution, simplification and smoothing, region and segments, segment properties, compute, and advanced options.
-- [`run_meshify.py`](run_meshify.py): the wrapper the job runs. Fileglancer passes the form as flags; the wrapper decides which runs to make and where their meshes go, writes a `run-config.yaml` and `dask-config.yaml` per run under `$FG_WORK_DIR/meshify-config/`, and invokes `mesh-n-bone meshify` on each.
+- [`run_meshify.py`](run_meshify.py): the wrapper the job runs. Fileglancer passes the form as flags; the wrapper decides where the meshes go and which LSF project the workers bill to, writes `run-config.yaml` and `dask-config.yaml` under `$FG_WORK_DIR/meshify-config/`, and invokes `mesh-n-bone meshify`.
 - [`dask-config.yaml`](dask-config.yaml): the dask-jobqueue settings of the worker jobs the driver launches, used instead of `lsf-config/dask-config.yaml`.
 
 ## Registering the app
@@ -20,7 +20,7 @@ A branch or tag can be chosen; a release tag (`v0.9.0`) pins the version. Filegl
 
 ## The form
 
-Fileglancer pre-fills every field with its default and does not mark it as one, so each description states the default and what a blank field means. The defaults are mesh-n-bone's own (`Meshify`'s signature; a test pins them) and give hemibrain-density meshes; a normal run only needs the **Label volume**. Only **Compute** starts open, because the LSF project lives there; every tuning section is collapsed, and **Advanced** holds the memory and quality trade-offs. A first run is the **Label volume**, optionally an **Output directory**, and the LSF project. A debugging option (keeping the per-level PLY files) is behind the form's **Show hidden** toggle.
+Fileglancer pre-fills every field with its default and does not mark it as one, so each description states the default and what a blank field means. The defaults are mesh-n-bone's own (`Meshify`'s signature; a test pins them) and give hemibrain-density meshes. A first run is the **Label volume** and, optionally, an **Output directory**; nothing else needs touching. Only **Compute** (the worker count) starts open; every tuning section is collapsed, and **Advanced** holds the memory and quality trade-offs. A debugging option (keeping the per-level PLY files) is behind the form's **Show hidden** toggle.
 
 The level-of-detail fields, since they are the ones people ask about:
 
@@ -31,7 +31,7 @@ The level-of-detail fields, since they are the ones people ask about:
 
 ## Where the meshes go
 
-The **Label volume** field takes a label group of an OME-Zarr, an array, an N5 or precomputed volume, or a zarr root. Leave **Output directory** blank and the wrapper places the meshes by the OME-Zarr layout:
+The **Label volume** field takes a label group of an OME-Zarr, an N5 dataset or a precomputed volume. Leave **Output directory** blank and the meshes go next to the input, in a sibling named after it plus the **Mesh folder suffix**:
 
 ```
 crop-001.zarr/
@@ -39,17 +39,12 @@ crop-001.zarr/
     mitochondria/        <- Label volume
     mitochondria_mesh/   <- written here
     nucleus/
-    nucleus_mesh/
     zarr.json
   raw/
   zarr.json
 ```
 
-- A label group (`.../labels/<name>`) or an array in it is meshed to `.../labels/<name>_mesh`.
-- A zarr root whose `labels/` group lists labels (`attributes.ome.labels` in zarr v3, `labels` in v2) is meshed label by label, each to its own `_mesh` folder, in one submission.
-- The suffix is the **Mesh folder suffix** field.
-- Any other input, including a remote URL, needs an explicit output directory. Fileglancer creates it if it does not exist.
-- With an explicit output directory, a zarr root is still meshed label by label, each to `<output>/<name>_mesh`; any other input is meshed straight into the directory. Use this to try the app on someone else's data without writing into it.
+No convention is read for this: `cells.n5/seg` is meshed to `cells.n5/seg_mesh` the same way. Point at the group rather than a level inside it, or `mito/s0` gets `mito/s0_mesh` inside the group. A remote URL has no "next to", so it needs an explicit output directory. One submission is one label; Fileglancer's relaunch pre-fills the form, so the next label is one field changed. An explicit output directory is used as given, and Fileglancer creates it if it does not exist.
 
 Each mesh folder is a Neuroglancer precomputed multiresolution mesh source with an `info` file and, by default, shards. To view it, add it to the label's segmentation layer as a second source, `precomputed://<url of the _mesh folder>`, where `<url>` is the Fileglancer data link of the folder.
 
@@ -59,12 +54,11 @@ A label group with its own pyramid (`s0`, `s1`, ...) is meshed from its finest l
 
 ## Compute
 
-Fileglancer's job is the driver (the **Resources** defaults: 2 cpus, 30 GB, 8 hours). The driver reads [`dask-config.yaml`](dask-config.yaml) from this directory, puts the form's **LSF project** into it, and launches the worker jobs with dask-jobqueue. The two compute fields are:
+Fileglancer's job is the driver (the **Resources** defaults: 2 cpus, 30 GB, 8 hours). The driver reads [`dask-config.yaml`](dask-config.yaml) from this directory and launches the worker jobs with dask-jobqueue. The one compute field is **Dask workers**, worker processes in total; with 8 processes per child job, 48 workers are 6 child jobs.
 
-- **Dask workers**: worker processes in total. With 8 processes per child job, 48 workers are 6 child jobs.
-- **LSF project**: the charge group of the worker jobs, the name only.
+The worker jobs are billed where the driver is. LSF tells a running job its project through `LSB_PROJECT_NAME`, and the wrapper passes that to dask-jobqueue as the workers' `-P` (the same thing cellmap-flow does). So the project is set once, in Fileglancer's **Cluster** tab under Extra Arguments as `-P <project>`, or not at all when LSF's default for your account is the right one, which is the usual case at Janelia. The job log says which project the workers got and where it came from. Don't add `-n` to Extra Arguments; the CPUs field sets it.
 
-Per child job, `dask-config.yaml` asks for 8 slots, 8 processes, 120 GB and one hour. Change it here for the Fileglancer flow; the command-line flow keeps using `lsf-config/dask-config.yaml`. The driver job's own charge group is set in Fileglancer's **Cluster** tab under extra `bsub` arguments (`-P <project>`); don't add `-n` there, the CPUs field sets it.
+Per child job, `dask-config.yaml` asks for 8 slots, 8 processes, 120 GB and one hour. Change it here for the Fileglancer flow; the command-line flow keeps using `lsf-config/dask-config.yaml`.
 
 ## Trying the wrapper by hand
 
@@ -75,7 +69,7 @@ pixi run python fileglancer/run_meshify.py \
   --num-workers 1 --dry-run
 ```
 
-`--dry-run` prints the runs and their configs without meshing. Without `FG_WORK_DIR`, the configs land in `./meshify-config/`.
+`--dry-run` prints the run and its configs without meshing. Without `FG_WORK_DIR`, the configs land in `./meshify-config/`. Outside an LSF job there is no `LSB_PROJECT_NAME`, so `--lsf-project <name>` gives the workers a project; it also overrides the inherited one inside a job.
 
 ## Adding more runnables
 

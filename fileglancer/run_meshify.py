@@ -3,18 +3,20 @@
 Fileglancer launches apps with flagged CLI arguments. ``mesh-n-bone
 meshify`` reads a config directory holding ``run-config.yaml`` and
 ``dask-config.yaml``. This script bridges the two: it takes the form's
-flags, writes one config directory per run under the job's work
-directory, and invokes ``mesh-n-bone meshify`` on each.
+flags, writes the config directory under the job's work directory, and
+invokes ``mesh-n-bone meshify``.
 
-Where the meshes go when no output is given: a label group inside an
-OME-Zarr ``labels/`` folder (``.../labels/<name>``, or an array in it)
-is meshed to ``.../labels/<name>_mesh`` next to it, and a zarr root
-whose ``labels/`` group lists labels is meshed label by label, each to
-its own ``_mesh`` folder. The suffix is a form field.
+Where the meshes go when no output is given: next to the input, in a
+sibling named after it plus a suffix (``labels/mito`` is meshed to
+``labels/mito_mesh``). The suffix is a form field.
+
+Which LSF project the worker jobs are billed to: the project of the
+Fileglancer job itself, which LSF exposes to the running job as
+``LSB_PROJECT_NAME`` (the ``-P`` from Fileglancer's Cluster tab, or the
+user's default). ``--lsf-project`` overrides it for runs by hand.
 """
 
 import argparse
-import json
 import os
 import shlex
 import subprocess
@@ -66,26 +68,25 @@ def _build_arg_parser():
     parser.add_argument(
         "--input", required=True,
         help=(
-            "A label volume (an OME-Zarr label group or array, an N5 or "
-            "precomputed volume; local or http(s)/s3/gs), or a zarr root "
-            "whose labels/ group lists the labels to mesh."
+            "A label volume: an OME-Zarr label group or array, an N5 or "
+            "precomputed volume; local or http(s)/s3/gs."
         ),
     )
     parser.add_argument(
         "--output", default=None,
-        help=(
-            "Where to write the meshes. Blank: next to the label, as "
-            "labels/<name><suffix>."
-        ),
+        help="Where to write the meshes. Blank: next to the input, as <input><suffix>.",
     )
     parser.add_argument(
         "--mesh-suffix", default=DEFAULT_MESH_SUFFIX,
-        help="Suffix of a mesh folder derived from its label's name.",
+        help="Suffix of the mesh folder named after the input.",
     )
     parser.add_argument("--num-workers", type=int, default=48)
     parser.add_argument(
         "--lsf-project", default=None,
-        help="LSF project (-P) for the dask worker jobs; blank for none.",
+        help=(
+            "LSF project (-P) for the dask worker jobs. Default: the project "
+            "of the job this runs in (LSB_PROJECT_NAME), else none."
+        ),
     )
 
     # Mesh generation
@@ -134,88 +135,32 @@ def _build_arg_parser():
 
     parser.add_argument(
         "--dry-run", action="store_true",
-        help="Print the runs and their configs without running anything.",
+        help="Print the run and its configs without running anything.",
     )
     return parser
 
 
-# --- which runs, and where their meshes go --------------------------------
+# --- where the meshes go -----------------------------------------------------
 
-def _group_attributes(path):
-    """The attributes of a zarr group (v3 ``zarr.json`` or v2 ``.zattrs``),
-    or None when *path* is not a local zarr group."""
-    v3 = Path(path) / "zarr.json"
-    if v3.is_file():
-        with open(v3) as f:
-            doc = json.load(f)
-        return doc.get("attributes", {}) if doc.get("node_type") == "group" else None
-    v2 = Path(path) / ".zattrs"
-    if v2.is_file() and (Path(path) / ".zgroup").is_file():
-        with open(v2) as f:
-            return json.load(f)
-    return None
+def plan_output(input_path, output=None, mesh_suffix=DEFAULT_MESH_SUFFIX):
+    """The output directory for the form's input and output.
 
-
-def labels_listed_in(zarr_root):
-    """The label names an OME-Zarr root lists in its ``labels/`` group
-    (``attributes.ome.labels`` for v3, ``labels`` for v2), or None."""
-    attrs = _group_attributes(Path(zarr_root) / "labels")
-    if attrs is None:
-        return None
-    labels = attrs.get("ome", {}).get("labels") if isinstance(attrs.get("ome"), dict) else None
-    if labels is None:
-        labels = attrs.get("labels")
-    return list(labels) if labels else None
-
-
-def _label_folder(path):
-    """``(labels_dir, name)`` when *path* is a label group under a
-    ``labels/`` folder, or an array inside one; else None."""
-    p = Path(os.path.normpath(path))
-    for candidate in (p, p.parent):
-        if candidate.parent.name == "labels" and candidate.name:
-            return candidate.parent, candidate.name
-    return None
-
-
-def plan_runs(input_path, output=None, mesh_suffix=DEFAULT_MESH_SUFFIX):
-    """The ``(name, input, output)`` runs for the form's input and output.
-
-    A zarr root listing labels is one run per label: into
-    ``<output>/<name><suffix>`` with an explicit output, or next to each
-    label as ``labels/<name><suffix>`` without one. Any other input with
-    an explicit output is one run into it; without one, a label under
-    ``labels/`` is meshed next to itself and anything else is an error.
+    An explicit output is used as given. Otherwise the meshes go next to
+    the input, in a sibling named after it plus *mesh_suffix*:
+    ``.../labels/mito`` is meshed to ``.../labels/mito_mesh``. A remote
+    input has no "next to", so it needs an output.
     """
-    remote = input_path.startswith(_REMOTE_PREFIXES)
-    labels = None if remote else labels_listed_in(input_path)
     if output:
-        if labels:
-            labels_dir = Path(input_path) / "labels"
-            return [
-                (name, str(labels_dir / name), str(Path(output) / f"{name}{mesh_suffix}"))
-                for name in labels
-            ]
-        return [(None, input_path, output)]
-    if remote:
+        return output
+    if input_path.startswith(_REMOTE_PREFIXES):
         raise ValueError(
-            "An output directory is needed for a remote input; the meshes "
-            "are only placed next to a local label."
+            "An output directory is needed for a remote input; without one "
+            "the meshes go next to a local input."
         )
-    found = _label_folder(input_path)
-    if found is not None:
-        labels_dir, name = found
-        return [(name, input_path, str(labels_dir / f"{name}{mesh_suffix}"))]
-    if labels:
-        labels_dir = Path(input_path) / "labels"
-        return [
-            (name, str(labels_dir / name), str(labels_dir / f"{name}{mesh_suffix}"))
-            for name in labels
-        ]
-    raise ValueError(
-        f"{input_path} is neither a label under a labels/ folder nor a zarr "
-        "root listing labels; give an output directory."
-    )
+    source = Path(os.path.normpath(input_path))
+    if not source.name or source.parent == source:
+        raise ValueError(f"Cannot place meshes next to {input_path!r}; give an output directory.")
+    return str(source.with_name(source.name + mesh_suffix))
 
 
 # --- configs -----------------------------------------------------------------
@@ -275,8 +220,8 @@ _DASK_TEMPLATE = Path(__file__).resolve().parent / "dask-config.yaml"
 
 
 def _project_name(value):
-    """The bare LSF project name from the form field. People type
-    ``-P cellmap`` despite the description; dask-jobqueue would then write
+    """The bare LSF project name from a typed value. People type
+    ``-P cellmap`` where a name is asked for; dask-jobqueue would then write
     ``#BSUB -P -P cellmap`` and bsub rejects every worker job with nothing
     on stderr, so the run sits with no workers until its walltime."""
     name = (value or "").strip()
@@ -285,11 +230,25 @@ def _project_name(value):
     return name.strip() or None
 
 
-def _build_dask_config(args):
-    """``fileglancer/dask-config.yaml`` with the form's LSF project, or
-    without a project when the field is blank."""
+def resolve_project(cli_value=None, environ=None):
+    """``(project, source)`` for the worker jobs: an explicit
+    ``--lsf-project`` first, else the project of the job this runs in
+    (``LSB_PROJECT_NAME``, which LSF sets for every running job), else
+    ``(None, ...)`` and bsub applies the user's default."""
+    environ = os.environ if environ is None else environ
+    project = _project_name(cli_value)
+    if project:
+        return project, "--lsf-project"
+    project = _project_name(environ.get("LSB_PROJECT_NAME"))
+    if project:
+        return project, "LSB_PROJECT_NAME, the project of this job"
+    return None, "none given; LSF applies your default"
+
+
+def _build_dask_config(project):
+    """``fileglancer/dask-config.yaml`` with *project* for the worker jobs,
+    or without a project when there is none."""
     config = yaml.safe_load(_DASK_TEMPLATE.read_text())
-    project = _project_name(args.lsf_project)
     if project:
         config["jobqueue"]["lsf"]["project"] = project
     else:
@@ -308,40 +267,29 @@ def main(argv=None):
     args = _build_arg_parser().parse_args(argv)
 
     work_dir = Path(os.environ.get("FG_WORK_DIR", os.getcwd()))
-    runs = plan_runs(args.input, args.output, args.mesh_suffix)
-    dask_config = _build_dask_config(args)
+    output = plan_output(args.input, args.output, args.mesh_suffix)
+    project, source = resolve_project(args.lsf_project)
 
-    print(f"{len(runs)} run(s):", flush=True)
-    for name, input_path, output in runs:
-        print(f"  {name or 'meshify'}: {input_path} -> {output}", flush=True)
+    print(f"meshify: {args.input} -> {output}", flush=True)
+    print(f"worker jobs' LSF project: {project or 'none'} ({source})", flush=True)
 
-    failures = []
-    for name, input_path, output in runs:
-        config_dir = work_dir / "meshify-config" / (name or "meshify")
-        config_dir.mkdir(parents=True, exist_ok=True)
-        run_config = _build_run_config(args, input_path, output)
-        (config_dir / "run-config.yaml").write_text(
-            yaml.safe_dump(run_config, sort_keys=False)
-        )
-        (config_dir / "dask-config.yaml").write_text(
-            yaml.safe_dump(dask_config, sort_keys=False)
-        )
-        cmd = _meshify_command(config_dir, args)
-        print(f"+ {' '.join(shlex.quote(c) for c in cmd)}", flush=True)
-        if args.dry_run:
-            print(yaml.safe_dump(run_config, sort_keys=False), flush=True)
-            continue
-        os.makedirs(output, exist_ok=True)
-        completed = subprocess.run(cmd, check=False)
-        if completed.returncode != 0:
-            print(f"{name or 'meshify'} FAILED with exit code {completed.returncode}",
-                  file=sys.stderr, flush=True)
-            failures.append((name or "meshify", completed.returncode))
-
-    if failures:
-        print(f"{len(failures)} of {len(runs)} run(s) failed: "
-              + ", ".join(n for n, _ in failures), file=sys.stderr, flush=True)
-        sys.exit(failures[0][1] or 1)
+    config_dir = work_dir / "meshify-config"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    run_config = _build_run_config(args, args.input, output)
+    (config_dir / "run-config.yaml").write_text(yaml.safe_dump(run_config, sort_keys=False))
+    (config_dir / "dask-config.yaml").write_text(
+        yaml.safe_dump(_build_dask_config(project), sort_keys=False)
+    )
+    cmd = _meshify_command(config_dir, args)
+    print(f"+ {' '.join(shlex.quote(c) for c in cmd)}", flush=True)
+    if args.dry_run:
+        print(yaml.safe_dump(run_config, sort_keys=False), flush=True)
+        return
+    os.makedirs(output, exist_ok=True)
+    completed = subprocess.run(cmd, check=False)
+    if completed.returncode != 0:
+        print(f"meshify FAILED with exit code {completed.returncode}", file=sys.stderr, flush=True)
+        sys.exit(completed.returncode or 1)
 
 
 if __name__ == "__main__":
