@@ -119,7 +119,7 @@ do_analysis: false               # Compute mesh metrics CSV after meshing (defau
 
 # ── Multiresolution output ──
 do_multires: true                # Also generate neuroglancer multilod_draco output (default: true)
-num_lods: 4                      # Number of levels of detail (default: 4)
+num_lods: 4                      # Up to this many levels of detail (default: 4); a segment gets fewer when its coarser meshes stop shrinking
 multires_strategy: downsample    # LOD strategy: decimate (face-decimate s0 mesh for higher LODs) or
                                  # downsample (re-mesh from progressively downsampled volumes,
                                  # better-looking coarse LODs) (default: downsample)

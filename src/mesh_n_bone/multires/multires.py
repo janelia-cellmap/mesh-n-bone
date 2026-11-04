@@ -139,6 +139,20 @@ def generate_neuroglancer_multires_mesh(
             # Loop completed without break — all LODs are valid
             idx += 1
 
+        # A trailing plateau adds nothing: a coarser level with the same
+        # face count as the one before it draws the same triangles at far
+        # zoom and only stores the mesh again. Equal counts stay in the
+        # middle of the chain, where a cheaper level follows and the
+        # format cannot skip a level.
+        while len(lod_face_counts) > 1 and lod_face_counts[-1][1] == lod_face_counts[-2][1]:
+            dropped_lod, dropped_faces = lod_face_counts.pop()
+            idx -= 1
+            lod_truncation_reason = (
+                f"Segment {id} using {idx}/{requested_lod_count} requested "
+                f"LODs; dropping trailing LOD {dropped_lod} because it has "
+                f"{dropped_faces} faces, the same as LOD {lod_face_counts[-1][0]}."
+            )
+
         lods = lods[:idx]
         if lod_truncation_reason is not None:
             logger.info(lod_truncation_reason)
