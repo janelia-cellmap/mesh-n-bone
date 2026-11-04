@@ -10,8 +10,9 @@ jobqueue:
     log-directory: job-logs
     name: mesh-n-bone
 
-    # project is overwritten at runtime by run_meshify.py from the form's
-    # "LSF project" field. The placeholder here is just a marker.
+    # project is overwritten at runtime by run_meshify.py with the
+    # Fileglancer job's own project (LSB_PROJECT_NAME) or --lsf-project,
+    # and dropped when there is neither. The placeholder is just a marker.
     project: your_project_name
 
 distributed:

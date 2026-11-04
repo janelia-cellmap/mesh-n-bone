@@ -155,8 +155,8 @@ class TestFormReadsOnItsOwn:
             assert "Blank" in p["description"], f"{p['flag']} does not say what blank means"
 
     def test_only_the_compute_section_starts_open(self, items):
-        """A first run is the two path fields plus the LSF project; every
-        tuning section starts collapsed."""
+        """A first run is the two path fields; every tuning section starts
+        collapsed."""
         expanded = [item["section"] for item in items if "section" in item and not item.get("collapsed")]
         assert expanded == ["Compute"]
 
@@ -175,39 +175,36 @@ class TestFormReadsOnItsOwn:
 
 
 class TestWhereTheMeshesGo:
+    """Blank output: a sibling of the input named after it plus the suffix.
+    No convention is read; it works the same for a label group, an N5
+    dataset or a precomputed folder."""
+
     @pytest.mark.parametrize("version", [3, 2])
     def test_label_group_is_meshed_next_to_itself(self, tmp_path, wrapper, version):
         root = _zarr_root_with_labels(tmp_path / "crop.zarr", ["mito", "nuc"], version)
-        runs = wrapper.plan_runs(str(root / "labels" / "mito"))
-        assert runs == [("mito", str(root / "labels" / "mito"), str(root / "labels" / "mito_mesh"))]
+        assert wrapper.plan_output(str(root / "labels" / "mito")) == str(root / "labels" / "mito_mesh")
 
-    def test_array_inside_a_label_group(self, tmp_path, wrapper):
+    def test_the_suffix_is_a_parameter(self, tmp_path, wrapper):
         root = _zarr_root_with_labels(tmp_path / "crop.zarr", ["mito"])
-        path = str(root / "labels" / "mito" / "s0")
-        runs = wrapper.plan_runs(path, mesh_suffix="_meshes")
-        assert runs == [("mito", path, str(root / "labels" / "mito_meshes"))]
+        out = wrapper.plan_output(str(root / "labels" / "mito") + "/", mesh_suffix="_meshes")
+        assert out == str(root / "labels" / "mito_meshes")
 
-    @pytest.mark.parametrize("version", [3, 2])
-    def test_zarr_root_is_meshed_label_by_label(self, tmp_path, wrapper, version):
-        root = _zarr_root_with_labels(tmp_path / "crop.zarr", ["mito", "nuc"], version)
-        runs = wrapper.plan_runs(str(root))
-        assert runs == [
-            ("mito", str(root / "labels" / "mito"), str(root / "labels" / "mito_mesh")),
-            ("nuc", str(root / "labels" / "nuc"), str(root / "labels" / "nuc_mesh")),
-        ]
+    def test_any_input_gets_a_sibling(self, wrapper):
+        assert wrapper.plan_output("/data/cells.n5/seg") == "/data/cells.n5/seg_mesh"
+        assert wrapper.plan_output("/data/seg.zarr/s0") == "/data/seg.zarr/s0_mesh"
 
     def test_explicit_output_wins(self, tmp_path, wrapper):
         root = _zarr_root_with_labels(tmp_path / "crop.zarr", ["mito"])
-        runs = wrapper.plan_runs(str(root / "labels" / "mito"), output="/somewhere/else")
-        assert runs == [(None, str(root / "labels" / "mito"), "/somewhere/else")]
+        assert wrapper.plan_output(str(root / "labels" / "mito"), output="/somewhere/else") == "/somewhere/else"
+        assert wrapper.plan_output("https://example.org/seg.zarr/labels/mito", output="/out") == "/out"
 
-    def test_other_inputs_need_an_output(self, tmp_path, wrapper):
-        plain = tmp_path / "seg.zarr" / "s0"
-        plain.mkdir(parents=True)
-        with pytest.raises(ValueError, match="give an output directory"):
-            wrapper.plan_runs(str(plain))
+    def test_remote_input_needs_an_output(self, wrapper):
         with pytest.raises(ValueError, match="remote input"):
-            wrapper.plan_runs("https://example.org/seg.zarr/labels/mito")
+            wrapper.plan_output("https://example.org/seg.zarr/labels/mito")
+
+    def test_a_root_path_cannot_have_a_sibling(self, wrapper):
+        with pytest.raises(ValueError, match="give an output directory"):
+            wrapper.plan_output("/")
 
 
 class TestConfigs:
@@ -250,47 +247,48 @@ class TestConfigs:
             "mesh-n-bone", "meshify", "/cfg", "-n", "7", "--ids", "1,2,3",
         ]
 
-    def test_lsf_project_is_set_or_dropped(self, wrapper):
-        parser = wrapper._build_arg_parser()
-        with_project = wrapper._build_dask_config(
-            parser.parse_args(["--input", "/in", "--lsf-project", "cellmap"]),
-        )
-        assert with_project["jobqueue"]["lsf"]["project"] == "cellmap"
-        without = wrapper._build_dask_config(parser.parse_args(["--input", "/in"]))
-        assert "project" not in without["jobqueue"]["lsf"]
+class TestWorkerProject:
+    """The worker jobs are billed where the Fileglancer job is. LSF exposes
+    a running job's project as LSB_PROJECT_NAME (the Cluster tab's -P, or
+    the user's default), the same thing cellmap-flow reads; --lsf-project
+    overrides it for runs by hand. There is no form field for it."""
+
+    def test_the_form_has_no_project_field(self, manifest):
+        assert "--lsf-project" not in {p["flag"] for p in _parameters(manifest["runnables"][0]["parameters"])}
+
+    def test_inherits_the_job_project(self, wrapper):
+        assert wrapper.resolve_project(None, {"LSB_PROJECT_NAME": "miaai"})[0] == "miaai"
+
+    def test_explicit_project_wins(self, wrapper):
+        project, source = wrapper.resolve_project("cellmap", {"LSB_PROJECT_NAME": "miaai"})
+        assert (project, source) == ("cellmap", "--lsf-project")
+
+    def test_no_project_outside_lsf(self, wrapper):
+        assert wrapper.resolve_project(None, {})[0] is None
+        assert "project" not in wrapper._build_dask_config(None)["jobqueue"]["lsf"]
 
     @pytest.mark.parametrize("typed", ["cellmap", "-P cellmap", " -Pcellmap ", "-P=cellmap", "-P  cellmap"])
-    def test_a_typed_dash_p_is_stripped_from_the_project(self, wrapper, typed):
-        """bsub rejects '#BSUB -P -P cellmap' silently; the field is the
-        name only, but a pasted '-P cellmap' must still work. Fileglancer
-        sends this field as --lsf-project=<value>, which is also what lets
-        argparse accept a value that starts with a dash."""
-        parser = wrapper._build_arg_parser()
-        config = wrapper._build_dask_config(parser.parse_args(["--input", "/in", f"--lsf-project={typed}"]))
-        assert config["jobqueue"]["lsf"]["project"] == "cellmap"
-
-    def test_the_project_field_is_sent_with_equals(self, manifest):
-        project = next(
-            p for p in _parameters(manifest["runnables"][0]["parameters"]) if p["flag"] == "--lsf-project"
-        )
-        assert project.get("value_separator") == "equals"
+    def test_a_typed_dash_p_is_stripped(self, wrapper, typed):
+        """bsub rejects '#BSUB -P -P cellmap' silently, so a pasted
+        '-P cellmap' is reduced to the name wherever it comes from."""
+        assert wrapper.resolve_project(typed, {})[0] == "cellmap"
+        assert wrapper.resolve_project(None, {"LSB_PROJECT_NAME": typed})[0] == "cellmap"
+        assert wrapper._build_dask_config("cellmap")["jobqueue"]["lsf"]["project"] == "cellmap"
 
     @pytest.mark.parametrize("typed", ["", "  ", "-P", "-P "])
-    def test_an_empty_project_is_dropped(self, wrapper, typed):
-        parser = wrapper._build_arg_parser()
-        config = wrapper._build_dask_config(parser.parse_args(["--input", "/in", f"--lsf-project={typed}"]))
-        assert "project" not in config["jobqueue"]["lsf"]
+    def test_an_empty_project_is_none(self, wrapper, typed):
+        assert wrapper.resolve_project(typed, {"LSB_PROJECT_NAME": typed})[0] is None
 
-    def test_dry_run_plans_every_label(self, tmp_path, wrapper, monkeypatch, capsys):
-        root = _zarr_root_with_labels(tmp_path / "crop.zarr", ["mito", "nuc"])
+    def test_dry_run_writes_the_configs_with_the_job_project(self, tmp_path, wrapper, monkeypatch, capsys):
+        root = _zarr_root_with_labels(tmp_path / "crop.zarr", ["mito"])
         monkeypatch.setenv("FG_WORK_DIR", str(tmp_path / "work"))
-        wrapper.main(["--input", str(root), "--dry-run", "--lsf-project", "miaai"])
+        monkeypatch.setenv("LSB_PROJECT_NAME", "miaai")
+        wrapper.main(["--input", str(root / "labels" / "mito"), "--dry-run"])
         out = capsys.readouterr().out
-        assert "2 run(s)" in out
-        for name in ("mito", "nuc"):
-            cfg = yaml.safe_load((tmp_path / "work" / "meshify-config" / name / "run-config.yaml").read_text())
-            assert cfg["input_path"] == str(root / "labels" / name)
-            assert cfg["output_directory"] == str(root / "labels" / f"{name}_mesh")
-            dask = yaml.safe_load((tmp_path / "work" / "meshify-config" / name / "dask-config.yaml").read_text())
-            assert dask["jobqueue"]["lsf"]["project"] == "miaai"
+        assert "LSF project: miaai (LSB_PROJECT_NAME" in out
+        cfg = yaml.safe_load((tmp_path / "work" / "meshify-config" / "run-config.yaml").read_text())
+        assert cfg["input_path"] == str(root / "labels" / "mito")
+        assert cfg["output_directory"] == str(root / "labels" / "mito_mesh")
+        dask = yaml.safe_load((tmp_path / "work" / "meshify-config" / "dask-config.yaml").read_text())
+        assert dask["jobqueue"]["lsf"]["project"] == "miaai"
         assert not (root / "labels" / "mito_mesh").exists()
