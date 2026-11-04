@@ -259,6 +259,28 @@ class TestConfigs:
         without = wrapper._build_dask_config(parser.parse_args(["--input", "/in"]))
         assert "project" not in without["jobqueue"]["lsf"]
 
+    @pytest.mark.parametrize("typed", ["cellmap", "-P cellmap", " -Pcellmap ", "-P=cellmap", "-P  cellmap"])
+    def test_a_typed_dash_p_is_stripped_from_the_project(self, wrapper, typed):
+        """bsub rejects '#BSUB -P -P cellmap' silently; the field is the
+        name only, but a pasted '-P cellmap' must still work. Fileglancer
+        sends this field as --lsf-project=<value>, which is also what lets
+        argparse accept a value that starts with a dash."""
+        parser = wrapper._build_arg_parser()
+        config = wrapper._build_dask_config(parser.parse_args(["--input", "/in", f"--lsf-project={typed}"]))
+        assert config["jobqueue"]["lsf"]["project"] == "cellmap"
+
+    def test_the_project_field_is_sent_with_equals(self, manifest):
+        project = next(
+            p for p in _parameters(manifest["runnables"][0]["parameters"]) if p["flag"] == "--lsf-project"
+        )
+        assert project.get("value_separator") == "equals"
+
+    @pytest.mark.parametrize("typed", ["", "  ", "-P", "-P "])
+    def test_an_empty_project_is_dropped(self, wrapper, typed):
+        parser = wrapper._build_arg_parser()
+        config = wrapper._build_dask_config(parser.parse_args(["--input", "/in", f"--lsf-project={typed}"]))
+        assert "project" not in config["jobqueue"]["lsf"]
+
     def test_dry_run_plans_every_label(self, tmp_path, wrapper, monkeypatch, capsys):
         root = _zarr_root_with_labels(tmp_path / "crop.zarr", ["mito", "nuc"])
         monkeypatch.setenv("FG_WORK_DIR", str(tmp_path / "work"))

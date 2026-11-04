@@ -265,12 +265,24 @@ def _build_run_config(args, input_path, output):
 _DASK_TEMPLATE = Path(__file__).resolve().parent / "dask-config.yaml"
 
 
+def _project_name(value):
+    """The bare LSF project name from the form field. People type
+    ``-P cellmap`` despite the description; dask-jobqueue would then write
+    ``#BSUB -P -P cellmap`` and bsub rejects every worker job with nothing
+    on stderr, so the run sits with no workers until its walltime."""
+    name = (value or "").strip()
+    if name.startswith("-P"):
+        name = name[2:].lstrip(" =")
+    return name.strip() or None
+
+
 def _build_dask_config(args):
     """``fileglancer/dask-config.yaml`` with the form's LSF project, or
     without a project when the field is blank."""
     config = yaml.safe_load(_DASK_TEMPLATE.read_text())
-    if args.lsf_project:
-        config["jobqueue"]["lsf"]["project"] = args.lsf_project
+    project = _project_name(args.lsf_project)
+    if project:
+        config["jobqueue"]["lsf"]["project"] = project
     else:
         config["jobqueue"]["lsf"].pop("project", None)
     return config

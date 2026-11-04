@@ -238,10 +238,14 @@ runnables:
           - flag: --lsf-project
             name: LSF project for the worker jobs
             type: string
+            # Sent as --lsf-project=<value> so a typed "-P..." is not read
+            # as an option by the wrapper's argument parser.
+            value_separator: equals
             placeholder: "e.g. cellmap"
             description: >-
-              Charge group for the dask worker jobs, the name only, without
-              -P. Blank if the cluster does not require one.
+              Charge group for the dask worker jobs, the name only (a typed
+              -P is dropped). Blank if the cluster does not require one;
+              LSF then assigns your default project.
 
       - section: Advanced
         description: Rarely needed; memory and quality trade-offs and checks. More under Show hidden.
