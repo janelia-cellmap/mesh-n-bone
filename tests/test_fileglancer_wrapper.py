@@ -115,6 +115,62 @@ class TestManifestMatchesWrapper:
         assert output["required"] is False
 
 
+class TestFormReadsOnItsOwn:
+    """Fileglancer pre-fills defaults without marking them, repeats a field's
+    name as the placeholder of an empty box, and shows a bare checkbox for a
+    boolean without a description. The manifest has to carry the meaning."""
+
+    @pytest.fixture(scope="class")
+    def items(self, manifest):
+        return manifest["runnables"][0]["parameters"]
+
+    def test_every_field_and_section_is_described(self, items):
+        for item in items:
+            if "section" in item:
+                assert item.get("description"), f"section {item['section']!r} has no description"
+        for p in _parameters(items):
+            assert p.get("description"), f"{p['flag']} has no description"
+
+    def test_descriptions_state_the_default(self, items):
+        for p in _parameters(items):
+            if "default" not in p:
+                continue
+            text = p["description"]
+            if p["type"] == "boolean":
+                expected = "Default on" if p["default"] else "Default off"
+            else:
+                expected = str(p["default"])
+            assert expected in text, f"{p['flag']}: {expected!r} not stated in {text!r}"
+
+    def test_empty_text_fields_show_an_example(self, items):
+        for p in _parameters(items):
+            if p["type"] == "string":
+                assert p.get("placeholder"), f"{p['flag']} has no placeholder"
+
+    def test_blank_means_something_for_optional_fields(self, items):
+        for p in _parameters(items):
+            if p["type"] in ("file", "directory", "boolean", "enum") or "default" in p:
+                continue
+            assert "Blank" in p["description"], f"{p['flag']} does not say what blank means"
+
+    def test_only_the_lod_and_compute_sections_start_open(self, items):
+        expanded = [item["section"] for item in items if "section" in item and not item.get("collapsed")]
+        assert expanded == ["Levels of detail", "Compute"]
+
+    def test_only_the_debug_option_is_hidden(self, items):
+        hidden = [p["flag"] for p in _parameters(items) if p.get("hidden")]
+        assert hidden == ["--keep-decimated-meshes"]
+
+    def test_cross_references_name_real_fields_and_sections(self, items):
+        names = {p["name"] for p in _parameters(items)}
+        sections = {item["section"] for item in items if "section" in item}
+        for phrase in ("Downsample method", "Downsample factor", "Target face reduction",
+                       "Face count ratio", "Output directory"):
+            assert any(n.startswith(phrase) for n in names), phrase
+        for phrase in ("Output layout", "Levels of detail", "Resolution", "Simplification"):
+            assert any(s.startswith(phrase) for s in sections), phrase
+
+
 class TestWhereTheMeshesGo:
     @pytest.mark.parametrize("version", [3, 2])
     def test_label_group_is_meshed_next_to_itself(self, tmp_path, wrapper, version):

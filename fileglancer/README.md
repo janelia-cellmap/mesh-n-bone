@@ -4,7 +4,7 @@ mesh-n-bone is a [Fileglancer](https://github.com/JaneliaSciComp/fileglancer) ap
 
 ## Files
 
-- [`../runnables.yaml`](../runnables.yaml): the Fileglancer manifest. One runnable, `meshify`, with form fields for the input and output, mesh generation, simplification, multiresolution output, ROI and segment selection, segment properties and compute.
+- [`../runnables.yaml`](../runnables.yaml): the Fileglancer manifest. One runnable, `meshify`, with the input and output fields and sections for the output layout, levels of detail, resolution, simplification and smoothing, region and segments, segment properties, compute, and advanced options.
 - [`run_meshify.py`](run_meshify.py): the wrapper the job runs. Fileglancer passes the form as flags; the wrapper decides which runs to make and where their meshes go, writes a `run-config.yaml` and `dask-config.yaml` per run under `$FG_WORK_DIR/meshify-config/`, and invokes `mesh-n-bone meshify` on each.
 - [`dask-config.yaml`](dask-config.yaml): the dask-jobqueue settings of the worker jobs the driver launches, used instead of `lsf-config/dask-config.yaml`.
 
@@ -17,6 +17,17 @@ https://github.com/janelia-cellmap/mesh-n-bone
 ```
 
 A branch or tag can be chosen; a release tag (`v0.9.0`) pins the version. Fileglancer clones the repo at that revision and, on the first launch, `pixi run` builds the environment from `pixi.lock` (a few minutes, once per revision). The job needs `pixi` on the cluster node and access to conda-forge and PyPI for that first build.
+
+## The form
+
+Fileglancer pre-fills every field with its default and does not mark it as one, so each description states the default and what a blank field means. The defaults are mesh-n-bone's own (`Meshify`'s signature; a test pins them) and give hemibrain-density meshes; a normal run only needs the **Label volume**. Two sections start open, **Levels of detail** and **Compute**; the rest are collapsed, and **Advanced** holds the memory and quality trade-offs. A debugging option (keeping the per-level PLY files) is behind the form's **Show hidden** toggle.
+
+The level-of-detail fields, since they are the ones people ask about:
+
+- **Levels of detail** counts the full-resolution level, so 4 means s0 to s3.
+- **LOD strategy** `downsample` re-meshes a coarser volume for each level, the input's own pyramid levels when it has them; `decimate` meshes once and decimates.
+- **Face count ratio between levels** (6) is how many times fewer faces each level has than the one before. **Target face reduction** (0.933), under Simplification, is the fraction removed from the full-resolution mesh. They are different numbers for different things.
+- **Downsample method** is how label voxels are merged whenever a coarser volume has to be made: for pyramid levels the input lacks, and for the **Downsample factor** under Resolution, which shrinks the volume before meshing at all.
 
 ## Where the meshes go
 
@@ -43,7 +54,7 @@ Each mesh folder is a Neuroglancer precomputed multiresolution mesh source with 
 
 ## Multiscale inputs
 
-A label group with its own pyramid (`s0`, `s1`, ...) is meshed from its finest level, and the coarser levels are the levels of detail, whatever factors they were built with, including anisotropic ones. Levels that are missing are built once under the output directory and deleted afterwards unless **Delete the levels built for this run** is off. Volumes stored x, y, z (as TensorSwitch writes them) are read z, y, x; a ROI is always given z, y, x in world units.
+A label group with its own pyramid (`s0`, `s1`, ...) is meshed from its finest level, and the coarser levels are the levels of detail, whatever factors they were built with, including anisotropic ones. Levels that are missing are built once under the output directory and deleted afterwards unless **Delete the levels built for this run** (under Advanced) is off. Volumes stored x, y, z (as TensorSwitch writes them) are read z, y, x; a ROI is always given z, y, x in world units.
 
 ## Compute
 
