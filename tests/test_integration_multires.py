@@ -559,32 +559,53 @@ class TestLodTruncation:
             for r in caplog.records
         )
 
-    def test_lod_retained_on_equal_faces(self, tmp_output_dir):
-        """Equal face counts across LODs are retained (pyfqmr floor plateau)."""
-        output_path = os.path.join(tmp_output_dir, "equal_faces_test")
+    @staticmethod
+    def _write_lod_chain(output_path, subdivisions):
+        """One icosphere per LOD; subdivisions 1, 2, 3 give 80, 320, 1280 faces."""
         mesh_lods = os.path.join(output_path, "mesh_lods")
-
-        mesh = trimesh.creation.icosphere(subdivisions=3, radius=50.0)
-        mesh.vertices += 100
-        for lod in (0, 1):
+        for lod, subdiv in enumerate(subdivisions):
+            mesh = trimesh.creation.icosphere(subdivisions=subdiv, radius=50.0)
+            mesh.vertices += 100
             lod_dir = os.path.join(mesh_lods, f"s{lod}")
             os.makedirs(lod_dir)
             mesh.export(os.path.join(lod_dir, "1.ply"))
+        return list(range(len(subdivisions)))
+
+    @staticmethod
+    def _num_lods_in_index(output_path):
+        with open(os.path.join(output_path, "multires", "1.index"), "rb") as f:
+            return struct.unpack("<I", f.read()[24:28])[0]
+
+    def test_lod_retained_on_equal_faces_when_a_smaller_one_follows(self, tmp_output_dir):
+        """A plateau in the middle stays: the format cannot skip a level,
+        and dropping the plateau would also drop the cheaper level behind it."""
+        output_path = os.path.join(tmp_output_dir, "middle_plateau")
+        lods = self._write_lod_chain(output_path, [3, 2, 2, 1])  # 1280, 320, 320, 80
 
         generate_neuroglancer_multires_mesh(
-            id=1,
-            num_subtask_workers=1,
-            output_path=output_path,
-            lods=[0, 1],
-            original_ext=".ply",
-            lod_0_box_size=None,
+            id=1, num_subtask_workers=1, output_path=output_path,
+            lods=lods, original_ext=".ply", lod_0_box_size=None,
         )
 
-        index_file = os.path.join(output_path, "multires", "1.index")
-        with open(index_file, "rb") as f:
-            data = f.read()
-        num_lods = struct.unpack("<I", data[24:28])[0]
-        assert num_lods == 2
+        assert self._num_lods_in_index(output_path) == 4
+
+    def test_trailing_equal_faces_are_trimmed(self, tmp_output_dir, caplog):
+        """A plateau at the end is dead weight: the same triangles at far
+        zoom, stored again. Only the first level of the plateau is kept."""
+        output_path = os.path.join(tmp_output_dir, "trailing_plateau")
+        lods = self._write_lod_chain(output_path, [3, 2, 1, 1, 1])  # 1280, 320, 80, 80, 80
+
+        with caplog.at_level(logging.INFO, logger="mesh_n_bone.multires.multires"):
+            generate_neuroglancer_multires_mesh(
+                id=1, num_subtask_workers=1, output_path=output_path,
+                lods=lods, original_ext=".ply", lod_0_box_size=None,
+            )
+
+        assert self._num_lods_in_index(output_path) == 3
+        assert any(
+            "dropping trailing LOD 3 because it has 80 faces, the same as LOD 2" in r.message
+            for r in caplog.records
+        )
 
     def test_lod_truncation_on_missing_candidate_mesh(self, tmp_output_dir, caplog):
         """If a requested higher LOD mesh is missing, log why it was dropped."""

@@ -77,9 +77,12 @@ runnables:
             min: 1
             default: 4
             description: >-
-              Number of levels including the full-resolution one. Each level
-              is about half the resolution of the one before it, on the finer
-              axes only while the voxels are anisotropic. Default 4.
+              Up to this many levels, counting the full-resolution one. The
+              input's own pyramid levels are used first and any beyond them
+              are built; each is about half the resolution of the one before
+              it, on the finer axes only while the voxels are anisotropic. A
+              segment gets fewer levels when a coarser mesh stops getting
+              smaller or falls under 50 faces. Default 4.
           - flag: --multires-strategy
             name: LOD strategy
             type: enum

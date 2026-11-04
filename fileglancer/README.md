@@ -24,7 +24,7 @@ Fileglancer pre-fills every field with its default and does not mark it as one, 
 
 The level-of-detail fields, since they are the ones people ask about:
 
-- **Levels of detail** counts the full-resolution level, so 4 means s0 to s3.
+- **Levels of detail** is a ceiling that counts the full-resolution level, so 4 means s0 to s3 at most. The input's pyramid levels are used first and any beyond them are built. A segment ships with fewer levels when a coarser mesh stops getting smaller or falls under 50 faces.
 - **LOD strategy** `downsample` re-meshes a coarser volume for each level, the input's own pyramid levels when it has them; `decimate` meshes once and decimates.
 - **Face count ratio between levels** (6) is how many times fewer faces each level has than the one before. **Target face reduction** (0.933), under Simplification, is the fraction removed from the full-resolution mesh. They are different numbers for different things.
 - **Downsample method** is how label voxels are merged whenever a coarser volume has to be made: for pyramid levels the input lacks, and for the **Downsample factor** under Resolution, which shrinks the volume before meshing at all.
@@ -54,7 +54,7 @@ Each mesh folder is a Neuroglancer precomputed multiresolution mesh source with 
 
 ## Multiscale inputs
 
-A label group with its own pyramid (`s0`, `s1`, ...) is meshed from its finest level, and the coarser levels are the levels of detail, whatever factors they were built with, including anisotropic ones. Levels that are missing are built once under the output directory and deleted afterwards unless **Delete the levels built for this run** (under Advanced) is off. Volumes stored x, y, z (as TensorSwitch writes them) are read z, y, x; a ROI is always given z, y, x in world units.
+A label group with its own pyramid (`s0`, `s1`, ...) is meshed from its finest level, and its coarser levels are used as the levels of detail, up to the **Levels of detail** count, whatever factors they were built with, including anisotropic ones. Levels that are missing are built once under the output directory and deleted afterwards unless **Delete the levels built for this run** (under Advanced) is off. Volumes stored x, y, z (as TensorSwitch writes them) are read z, y, x; a ROI is always given z, y, x in world units.
 
 ## Compute
 
