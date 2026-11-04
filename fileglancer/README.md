@@ -49,6 +49,7 @@ crop-001.zarr/
 - A zarr root whose `labels/` group lists labels (`attributes.ome.labels` in zarr v3, `labels` in v2) is meshed label by label, each to its own `_mesh` folder, in one submission.
 - The suffix is the **Mesh folder suffix** field.
 - Any other input, including a remote URL, needs an explicit output directory. Fileglancer creates it if it does not exist.
+- With an explicit output directory, a zarr root is still meshed label by label, each to `<output>/<name>_mesh`; any other input is meshed straight into the directory. Use this to try the app on someone else's data without writing into it.
 
 Each mesh folder is a Neuroglancer precomputed multiresolution mesh source with an `info` file and, by default, shards. To view it, add it to the label's segmentation layer as a second source, `precomputed://<url of the _mesh folder>`, where `<url>` is the Fileglancer data link of the folder.
 
