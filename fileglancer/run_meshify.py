@@ -117,6 +117,11 @@ def _build_arg_parser():
     parser.add_argument("--delete-intermediate-scales", type=_bool, default=None)
     parser.add_argument("--sharded", type=_bool, default=None)
     parser.add_argument("--keep-decimated-meshes", type=_bool, default=None)
+    parser.add_argument(
+        "--center-octree", type=_bool, default=None,
+        help="Centre each mesh in its octree (click-to-focus lands on it) "
+             "or align the octree to the mesh corner (no seams in small meshes).",
+    )
 
     # Coordinates & selection
     parser.add_argument("--voxel-size-nm", type=_parse_triplet, default=None)
@@ -244,6 +249,8 @@ def _build_run_config(args, input_path, output):
         config["sharded"] = args.sharded
     if args.keep_decimated_meshes is not None:
         config["delete_decimated_meshes"] = not args.keep_decimated_meshes
+    if args.center_octree is not None:
+        config["center_octree"] = args.center_octree
 
     if args.voxel_size_nm is not None:
         config["voxel_size_nm"] = args.voxel_size_nm

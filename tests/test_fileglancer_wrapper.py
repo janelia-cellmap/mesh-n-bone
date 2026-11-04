@@ -104,6 +104,7 @@ class TestManifestMatchesWrapper:
         assert form["--downsample-cascade"] is defaults["downsample_cascade"]
         assert form["--delete-intermediate-scales"] is defaults["delete_intermediate_scales"]
         assert form["--sharded"] is defaults["sharded"]
+        assert form["--center-octree"] is defaults["center_octree"]
 
     def test_output_may_not_exist_yet(self, manifest):
         output = next(
@@ -213,6 +214,7 @@ class TestConfigs:
             "--input", "/in", "--output", "/out",
             "--multires", "false", "--sharded", "False", "--simplification", "true",
             "--strict", "true", "--keep-decimated-meshes", "true",
+            "--center-octree", "false",
             "--use-existing-scales", "false", "--num-lods", "5",
             "--target-reduction", "0.9", "--downsample-method", "nearest",
             "--voxel-size-nm", "45,16,16", "--roi", "0,0,0,100,200,300",
@@ -226,6 +228,7 @@ class TestConfigs:
             "check_mesh_validity": True, "do_analysis": True,
             "do_multires": False, "num_lods": 5, "use_existing_scales": False,
             "sharded": False, "delete_decimated_meshes": False,
+            "center_octree": False,
             "voxel_size_nm": [45.0, 16.0, 16.0],
             "roi": {"begin": [0.0, 0.0, 0.0], "end": [100.0, 200.0, 300.0]},
             "segment_properties_csv": "/props.csv",

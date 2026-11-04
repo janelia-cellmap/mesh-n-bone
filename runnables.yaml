@@ -288,6 +288,19 @@ runnables:
               metrics CSV (volume, surface area, curvature, thickness).
               Default off: real data is rarely fully watertight, especially
               with a ROI.
+          - flag: --center-octree
+            name: Centre each mesh in its octree
+            type: boolean
+            boolean_style: value
+            default: true
+            description: >-
+              On: the mesh sits in the middle of its top-level chunk, so
+              Neuroglancer's double-click-to-focus lands on it, but a mesh
+              small enough for one full-resolution chunk is cut into eight
+              fragments, which can show seams at high zoom. Off: the octree
+              is aligned to the mesh's corner, small meshes stay in one
+              fragment with no seams, and click-to-focus lands near the
+              corner. Default on.
           - flag: --keep-decimated-meshes
             name: Keep per-level mesh files
             type: boolean
