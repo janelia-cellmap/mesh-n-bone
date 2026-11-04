@@ -154,9 +154,11 @@ class TestFormReadsOnItsOwn:
                 continue
             assert "Blank" in p["description"], f"{p['flag']} does not say what blank means"
 
-    def test_only_the_lod_and_compute_sections_start_open(self, items):
+    def test_only_the_compute_section_starts_open(self, items):
+        """A first run is the two path fields plus the LSF project; every
+        tuning section starts collapsed."""
         expanded = [item["section"] for item in items if "section" in item and not item.get("collapsed")]
-        assert expanded == ["Levels of detail", "Compute"]
+        assert expanded == ["Compute"]
 
     def test_only_the_debug_option_is_hidden(self, items):
         hidden = [p["flag"] for p in _parameters(items) if p.get("hidden")]

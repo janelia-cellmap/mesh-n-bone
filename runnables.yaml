@@ -59,7 +59,7 @@ runnables:
         description: >-
           Defaults give four levels of detail, taken from the input's own
           pyramid when it has one. A normal run needs no change here.
-        collapsed: false
+        collapsed: true
         parameters:
           - flag: --multires
             name: Multiresolution Neuroglancer output

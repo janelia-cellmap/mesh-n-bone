@@ -20,7 +20,7 @@ A branch or tag can be chosen; a release tag (`v0.9.0`) pins the version. Filegl
 
 ## The form
 
-Fileglancer pre-fills every field with its default and does not mark it as one, so each description states the default and what a blank field means. The defaults are mesh-n-bone's own (`Meshify`'s signature; a test pins them) and give hemibrain-density meshes; a normal run only needs the **Label volume**. Two sections start open, **Levels of detail** and **Compute**; the rest are collapsed, and **Advanced** holds the memory and quality trade-offs. A debugging option (keeping the per-level PLY files) is behind the form's **Show hidden** toggle.
+Fileglancer pre-fills every field with its default and does not mark it as one, so each description states the default and what a blank field means. The defaults are mesh-n-bone's own (`Meshify`'s signature; a test pins them) and give hemibrain-density meshes; a normal run only needs the **Label volume**. Only **Compute** starts open, because the LSF project lives there; every tuning section is collapsed, and **Advanced** holds the memory and quality trade-offs. A first run is the **Label volume**, optionally an **Output directory**, and the LSF project. A debugging option (keeping the per-level PLY files) is behind the form's **Show hidden** toggle.
 
 The level-of-detail fields, since they are the ones people ask about:
 
