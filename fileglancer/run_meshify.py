@@ -11,9 +11,10 @@ sibling named after it plus a suffix (``labels/mito`` is meshed to
 ``labels/mito_mesh``). The suffix is a form field.
 
 Which LSF project the worker jobs are billed to: the project of the
-Fileglancer job itself, which LSF exposes to the running job as
-``LSB_PROJECT_NAME`` (the ``-P`` from Fileglancer's Cluster tab, or the
-user's default). ``--lsf-project`` overrides it for runs by hand.
+Fileglancer job itself (the ``-P`` from Fileglancer's Cluster tab, or
+the user's default), read from ``LSB_PROJECT_NAME`` when LSF sets it
+and otherwise asked of ``bjobs`` for this job's id. ``--lsf-project``
+overrides it for runs by hand.
 """
 
 import argparse
@@ -85,7 +86,8 @@ def _build_arg_parser():
         "--lsf-project", default=None,
         help=(
             "LSF project (-P) for the dask worker jobs. Default: the project "
-            "of the job this runs in (LSB_PROJECT_NAME), else none."
+            "of the job this runs in (LSB_PROJECT_NAME, else bjobs on "
+            "LSB_JOBID), else none."
         ),
     )
 
@@ -230,11 +232,31 @@ def _project_name(value):
     return name.strip() or None
 
 
-def resolve_project(cli_value=None, environ=None):
+def _project_of_job(job_id, run=subprocess.run):
+    """What LSF reports as the project of *job_id* (``bjobs -o proj_name``),
+    or None when bjobs is unavailable, fails, or reports LSF's own
+    placeholder ``default``. The wide column keeps long names from being
+    truncated with a ``*``."""
+    try:
+        done = run(
+            ["bjobs", "-noheader", "-o", "proj_name:64", str(job_id)],
+            capture_output=True, text=True, timeout=60, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    lines = [line.strip() for line in (done.stdout or "").splitlines() if line.strip()]
+    name = _project_name(lines[0]) if lines else None
+    if done.returncode != 0 or name in (None, "default", "-"):
+        return None
+    return name
+
+
+def resolve_project(cli_value=None, environ=None, job_project=_project_of_job):
     """``(project, source)`` for the worker jobs: an explicit
-    ``--lsf-project`` first, else the project of the job this runs in
-    (``LSB_PROJECT_NAME``, which LSF sets for every running job), else
-    ``(None, ...)`` and bsub applies the user's default."""
+    ``--lsf-project`` first; else the project of the job this runs in,
+    from ``LSB_PROJECT_NAME`` when LSF sets it, else from ``bjobs`` on
+    ``LSB_JOBID``; else ``(None, ...)`` and bsub applies the user's
+    default."""
     environ = os.environ if environ is None else environ
     project = _project_name(cli_value)
     if project:
@@ -242,6 +264,17 @@ def resolve_project(cli_value=None, environ=None):
     project = _project_name(environ.get("LSB_PROJECT_NAME"))
     if project:
         return project, "LSB_PROJECT_NAME, the project of this job"
+    job_id = environ.get("LSB_JOBID")
+    if job_id:
+        project = job_project(job_id)
+        if project:
+            return project, f"bjobs, the project of this job ({job_id})"
+        return None, (
+            f"none found for this job ({job_id}): LSB_PROJECT_NAME is unset and "
+            "bjobs reports no project. LSF applies your default; an account that "
+            "must pass -P will see every worker job rejected, so give -P under "
+            "Cluster, Extra Arguments"
+        )
     return None, "none given; LSF applies your default"
 
 
@@ -271,6 +304,13 @@ def main(argv=None):
     project, source = resolve_project(args.lsf_project)
 
     print(f"meshify: {args.input} -> {output}", flush=True)
+    if os.environ.get("LSB_JOBID"):
+        # One line that settles, from the log alone, what LSF told this job.
+        print(
+            f"LSF job {os.environ['LSB_JOBID']} in queue {os.environ.get('LSB_QUEUE', '?')}; "
+            f"LSB_PROJECT_NAME={os.environ.get('LSB_PROJECT_NAME') or '<unset>'}",
+            flush=True,
+        )
     print(f"worker jobs' LSF project: {project or 'none'} ({source})", flush=True)
 
     config_dir = work_dir / "meshify-config"

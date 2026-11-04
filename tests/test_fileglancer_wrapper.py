@@ -5,6 +5,7 @@ import importlib.util
 import inspect
 import json
 import os
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -266,6 +267,49 @@ class TestWorkerProject:
     def test_no_project_outside_lsf(self, wrapper):
         assert wrapper.resolve_project(None, {})[0] is None
         assert "project" not in wrapper._build_dask_config(None)["jobqueue"]["lsf"]
+
+    def test_asks_bjobs_when_the_variable_is_missing(self, wrapper):
+        """Janelia's nodes did not set LSB_PROJECT_NAME for a Fileglancer
+        job, so the job's own id is the second source."""
+        asked = []
+
+        def job_project(job_id):
+            asked.append(job_id)
+            return "cellmap"
+
+        project, source = wrapper.resolve_project(None, {"LSB_JOBID": "155196857"}, job_project=job_project)
+        assert (project, asked) == ("cellmap", ["155196857"])
+        assert "bjobs" in source and "155196857" in source
+
+    def test_says_loudly_when_the_job_has_no_project(self, wrapper):
+        project, source = wrapper.resolve_project(None, {"LSB_JOBID": "1"}, job_project=lambda job_id: None)
+        assert project is None
+        assert "rejected" in source and "Extra Arguments" in source
+
+    @pytest.mark.parametrize("stdout, code, expected", [
+        ("cellmap   \n", 0, "cellmap"),
+        ("  scicompsoft\n", 0, "scicompsoft"),
+        ("default\n", 0, None),
+        ("-\n", 0, None),
+        ("", 0, None),
+        ("cellmap\n", 1, None),
+    ])
+    def test_bjobs_output_is_read_as_a_project(self, wrapper, stdout, code, expected):
+        def run(argv, **kwargs):
+            assert argv[:4] == ["bjobs", "-noheader", "-o", "proj_name:64"]
+            return subprocess.CompletedProcess(argv, code, stdout=stdout, stderr="")
+
+        assert wrapper._project_of_job("7", run=run) == expected
+
+    def test_bjobs_missing_or_hanging_means_no_project(self, wrapper):
+        def missing(argv, **kwargs):
+            raise FileNotFoundError("bjobs")
+
+        def hanging(argv, **kwargs):
+            raise subprocess.TimeoutExpired(argv, 60)
+
+        assert wrapper._project_of_job("7", run=missing) is None
+        assert wrapper._project_of_job("7", run=hanging) is None
 
     @pytest.mark.parametrize("typed", ["cellmap", "-P cellmap", " -Pcellmap ", "-P=cellmap", "-P  cellmap"])
     def test_a_typed_dash_p_is_stripped(self, wrapper, typed):
