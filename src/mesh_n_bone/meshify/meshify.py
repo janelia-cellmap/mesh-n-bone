@@ -1570,7 +1570,12 @@ class Meshify:
             self.has_custom_roi = False
         self.num_workers = num_workers
 
-        if read_write_block_shape_pixels:
+        # A default block shape is sized again for each coarser level read
+        # from an existing scale (_generate_meshes_at_scale); a given one is kept.
+        self._block_shape_given = (
+            read_write_block_shape_pixels is not None and len(read_write_block_shape_pixels) > 0
+        )
+        if self._block_shape_given:
             self.read_write_block_shape_pixels = np.array(read_write_block_shape_pixels)
         else:
             self.read_write_block_shape_pixels = (
@@ -2518,6 +2523,7 @@ class Meshify:
         orig_base_voxel = self.base_voxel_size.copy()
         orig_true_offset = self.true_offset.copy()
         orig_roi = self.roi
+        orig_block_shape = self.read_write_block_shape_pixels
 
         try:
             # Override to write PLYs (not neuroglancer format) to the scale dir
@@ -2541,6 +2547,12 @@ class Meshify:
                     self.roi = _snap_roi_to_voxels(new_arr, *self._roi_world)
                 else:
                     self.roi = new_arr.box
+                # The default block shape was sized for the finest level. The
+                # same shape over a coarser level makes far fewer blocks (75
+                # at LOD 2 of a crop whose LOD 0 had 1,734), so a few workers
+                # do all of it: size it again for this level.
+                if not getattr(self, "_block_shape_given", True):
+                    self.read_write_block_shape_pixels = self._default_block_shape_pixels()
             elif downsample_factor is not None:
                 # Per axis; the configured scalar downsample_factor, if
                 # any, is already folded into a LOD's factor.
@@ -2579,6 +2591,7 @@ class Meshify:
             self.base_voxel_size = orig_base_voxel
             self.true_offset = orig_true_offset
             self.roi = orig_roi
+            self.read_write_block_shape_pixels = orig_block_shape
 
     def _discover_existing_scales(self):
         """Return ``{(fz, fy, fx): dataset_path}`` for OME-NGFF multiscale
