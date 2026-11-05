@@ -310,3 +310,18 @@ class TestDeleteUnsharded:
     def test_missing_files_do_not_raise(self, tmp_output_dir):
         # Should be a no-op when nothing is present.
         sharded_mesh_util.delete_unsharded_segment_files(tmp_output_dir, [42])
+
+
+def test_shard_bytes_do_not_depend_on_the_order_of_the_ids(tmp_output_dir):
+    """A directory listing's order varies between filesystems; the shard
+    must not."""
+    seg_ids = list(range(1, 41))
+    spec = sharded_mesh_util.make_sharding_spec(0, 3, 0)  # several minishards
+    shards = []
+    for k, order in enumerate((seg_ids, seg_ids[::-1], seg_ids[13:] + seg_ids[:13])):
+        d = os.path.join(tmp_output_dir, f"order{k}")
+        _stage_fake_meshes(d, seg_ids)
+        path = sharded_mesh_util.pack_one_shard("0", order, d, d, spec.to_dict())
+        with open(path, "rb") as f:
+            shards.append(f.read())
+    assert shards[0] == shards[1] == shards[2]

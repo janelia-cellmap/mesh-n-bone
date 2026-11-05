@@ -168,7 +168,11 @@ def pack_one_shard(
     from_packs = _read_packed_chunks(packed) if packed else {}
     data: Dict[int, bytes] = {}
     data_offset: Dict[int, int] = {}
-    for seg_id in segment_ids:
+    # In id order: synthesize_shard_file lays the minishards out in the
+    # order it meets them, so an unsorted list (a directory listing, whose
+    # order depends on the filesystem) would give different, if equally
+    # valid, shard bytes for the same meshes.
+    for seg_id in sorted(int(i) for i in segment_ids):
         chunk = from_packs.get(int(seg_id))
         if chunk is None and not (packed and int(seg_id) in packed):
             chunk = _read_segment_chunk(multires_dir, seg_id)
