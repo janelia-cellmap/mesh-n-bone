@@ -135,3 +135,18 @@ class TestInteriorTest:
 
     def test_no_vertices_is_not_interior(self):
         assert not meshify_module._segment_is_interior(np.empty((0, 3)), (16,) * 3, (1.0,) * 3)
+
+
+def test_an_earlier_runs_packs_are_not_read(tmp_path):
+    """A run into a directory an earlier, killed run left behind meshes
+    from scratch: the old packs, manifests and assembly markers go."""
+    path = _blob_volume(tmp_path)
+    clean = _mesh_all(path, str(tmp_path / "clean"))
+
+    out = tmp_path / "reused"
+    stale = out / "tmp_chunked"
+    meshify_module._write_block_pack(str(stale), 99, [(77777, b"not a ply", 3, 1, 0)])
+    (stale / meshify_module._ASSEMBLED_SUBDIR).mkdir()
+    for k in range(8):
+        (stale / meshify_module._ASSEMBLED_SUBDIR / f"wave_1_batch_{k}").write_text("")
+    assert _mesh_all(path, str(out)) == clean

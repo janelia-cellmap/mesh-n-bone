@@ -181,6 +181,7 @@ def _estimate_assembly_peak_bytes(
 
 _MANIFEST_SUBDIR = "_manifests"
 _PACK_SUBDIR = "_packs"
+_ASSEMBLED_SUBDIR = "_assembled"
 # One row per mesh piece a block wrote: the segment id, where its PLY sits
 # in the block's pack file (offset, bytes), its vertex and face counts, and
 # whether the block worker finished the segment itself (see
@@ -1693,6 +1694,10 @@ class Meshify:
         worker_config["blocks"] = blocks
         # Block workers write the segments they finish straight into meshes/.
         os.makedirs(f"{self.output_directory}/meshes", exist_ok=True)
+        # Packs, manifests and assembly markers left by an earlier run into
+        # this directory would be read as this run's.
+        for stale in (_PACK_SUBDIR, _MANIFEST_SUBDIR, _ASSEMBLED_SUBDIR):
+            shutil.rmtree(os.path.join(dirname, stale), ignore_errors=True)
 
         effective_workers = dask_util.effective_num_workers(
             self.num_workers, num_blocks, logger, "generate chunked meshes",
@@ -2223,7 +2228,7 @@ class Meshify:
         saved_array = self.segmentation_array
         self.segmentation_array = None
 
-        done_dir = os.path.join(dirname, "_assembled")
+        done_dir = os.path.join(dirname, _ASSEMBLED_SUBDIR)
         os.makedirs(done_dir, exist_ok=True)
         try:
             for i, wave in enumerate(waves, start=1):
