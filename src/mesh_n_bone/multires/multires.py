@@ -1,6 +1,7 @@
 from contextlib import ExitStack
 import numpy as np
 import os
+import shutil
 import time
 import dask
 from dask.distributed import worker_client
@@ -73,9 +74,15 @@ def generate_neuroglancer_multires_mesh(
             client = stack.enter_context(worker_client())
 
         os.makedirs(f"{output_path}/multires", exist_ok=True)
-        os.system(
-            f"rm -rf {output_path}/multires/{id} {output_path}/multires/{id}.index"
-        )
+        # Clear a previous attempt's files. Directly, not via a shell: a
+        # process spawn per segment costs hours over millions of segments.
+        for stale in (f"{output_path}/multires/{id}", f"{output_path}/multires/{id}.index"):
+            try:
+                os.remove(stale)
+            except FileNotFoundError:
+                pass
+            except IsADirectoryError:
+                shutil.rmtree(stale)
 
         vertex_min = None
         vertex_max = None

@@ -29,7 +29,6 @@ from cloudvolume.datasource.precomputed.sharding import (
     ShardingSpecification,
     synthesize_shard_file,
 )
-from dask.distributed import wait
 
 
 def _murmur3_x86_128_unsigned(value: int) -> np.uint64:
@@ -225,21 +224,11 @@ def pack_meshes_to_shards(
         lambda item: pack_one_shard(item[0], item[1], multires_dir, output_dir, spec_dict)
     )
 
-    if num_workers == 1:
-        # Synchronous scheduler — no distributed Client exists (see
-        # `dask_util.start_dask`), so use `.compute()` rather than the
-        # `persist()`+`wait()` Client-based path.
-        return list(bag.compute())
+    from mesh_n_bone.util import dask_util
 
-    futures = bag.persist()
-    [completed, _] = wait(futures)
-    failed = [f for f in completed if f.exception() is not None]
-    paths = [f.result() for f in completed if f.exception() is None]
-    for c in completed:
-        c.cancel()
-    if failed:
-        raise RuntimeError(f"Failed to pack {len(failed)} shards: {failed}")
-    return paths
+    # Plain .compute() without a distributed client (one worker; see
+    # `dask_util.start_dask`), progress lines and lost-worker checks with one.
+    return list(dask_util.compute_watched(bag, "shard packing"))
 
 
 def delete_unsharded_segment_files(

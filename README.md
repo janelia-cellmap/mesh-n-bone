@@ -382,6 +382,8 @@ jobqueue:
 
 Update `project` to your LSF project/queue allocation and adjust `ncpus`, `memory`, and `walltime` for your cluster.
 
+`walltime` is per worker job. One hour gets Janelia's short queue, which has no per-user slot limit, but then every task must finish within the hour, because dask-jobqueue does not replace a worker job that ends. A volume with millions of labels can have blocks that take longer, so for those runs give the workers the same walltime as the driver. If every worker exits while work remains, the run stops within ten minutes and logs how the worker jobs ended. A walltime kill is reported as such instead of being retried as out-of-memory.
+
 #### SLURM / SGE
 
 The same pattern applies — submit the driver via your scheduler and set the cluster type in `dask-config.yaml`:

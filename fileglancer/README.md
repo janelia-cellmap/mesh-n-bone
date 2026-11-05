@@ -58,7 +58,9 @@ Fileglancer's job is the driver (the **Resources** defaults: 2 cpus, 30 GB, 8 ho
 
 The worker jobs are billed where the driver is. The wrapper reads the driver's project from `LSB_PROJECT_NAME` when LSF sets it (what cellmap-flow reads) and otherwise asks `bjobs` for its own job id, then passes that to dask-jobqueue as the workers' `-P`. So the project is set once, in Fileglancer's **Cluster** tab under Extra Arguments as `-P <project>`, or not at all when LSF's default for your account is the right one, which is the usual case at Janelia. The job log prints what LSF told the job and which project the workers got; when the driver has no project and your account must pass `-P`, the log says so, and the fix is the Extra Arguments field. Don't add `-n` there; the CPUs field sets it.
 
-Per child job, `dask-config.yaml` asks for 8 slots, 8 processes, 120 GB and one hour. Change it here for the Fileglancer flow; the command-line flow keeps using `lsf-config/dask-config.yaml`.
+Per child job, `dask-config.yaml` asks for 8 slots, 8 processes and 120 GB. Change it here for the Fileglancer flow; the command-line flow keeps using `lsf-config/dask-config.yaml`.
+
+The worker jobs get the driver's walltime: the wrapper reads the `-W` from the job script Fileglancer writes and gives it to the workers, and the log prints it. A one-hour limit would put the workers in the short queue, but dask-jobqueue never replaces a worker job that ends, so a block that takes longer than the workers' limit used to leave the driver waiting, idle, until its own limit. Workers that lose the driver exit within a minute, so a killed or finished driver takes its workers with it. If every worker does exit while work remains, the run now fails within ten minutes and says how the worker jobs ended.
 
 ## Trying the wrapper by hand
 

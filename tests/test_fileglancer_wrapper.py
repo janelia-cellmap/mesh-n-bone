@@ -336,3 +336,59 @@ class TestWorkerProject:
         dask = yaml.safe_load((tmp_path / "work" / "meshify-config" / "dask-config.yaml").read_text())
         assert dask["jobqueue"]["lsf"]["project"] == "miaai"
         assert not (root / "labels" / "mito_mesh").exists()
+
+
+class TestWorkerWalltime:
+    """The worker jobs get the Fileglancer job's own walltime, so a block
+    can take as long as the driver waits for it, and they end with it."""
+
+    @staticmethod
+    def _job_script(work_dir, runlimit_line):
+        work_dir.mkdir(parents=True, exist_ok=True)
+        (work_dir / "fg-mesh-n-bone-meshify.1.sh").write_text(
+            "#!/bin/bash\n"
+            "#BSUB -J fg-mesh-n-bone-meshify\n"
+            "#BSUB -n 2\n"
+            f"{runlimit_line}\n"
+            '#BSUB -cwd "/somewhere"\n'
+            "export FG_WORK_DIR=/somewhere\n"
+        )
+
+    @pytest.mark.parametrize("line, expected", [
+        ("#BSUB -W 08:00", "08:00"),
+        ('#BSUB -W "4:00"', "4:00"),
+        ("#BSUB  -W 30", "30"),
+    ])
+    def test_reads_the_job_scripts_runlimit(self, tmp_path, wrapper, line, expected):
+        self._job_script(tmp_path, line)
+        assert wrapper.driver_walltime(tmp_path) == expected
+
+    def test_no_script_or_no_runlimit_means_none(self, tmp_path, wrapper):
+        assert wrapper.driver_walltime(tmp_path) is None
+        self._job_script(tmp_path, "#BSUB -M 30720")
+        assert wrapper.driver_walltime(tmp_path) is None
+
+    def test_template_matches_the_apps_walltime_and_ends_with_the_driver(self, wrapper, manifest):
+        lsf = wrapper._build_dask_config(None)["jobqueue"]["lsf"]
+        app = manifest["runnables"][0]
+        assert lsf["walltime"] == app["resources"]["walltime"]
+        assert lsf["death-timeout"] == 60
+
+    def test_dry_run_gives_the_workers_the_jobs_walltime(self, tmp_path, wrapper, monkeypatch, capsys):
+        root = _zarr_root_with_labels(tmp_path / "crop.zarr", ["mito"])
+        work = tmp_path / "work"
+        # A walltime YAML would read as a number unless it is written as a string.
+        self._job_script(work, "#BSUB -W 4:00")
+        monkeypatch.setenv("FG_WORK_DIR", str(work))
+        monkeypatch.setenv("LSB_PROJECT_NAME", "miaai")
+        wrapper.main(["--input", str(root / "labels" / "mito"), "--dry-run"])
+        assert "worker jobs' walltime: 4:00 (this job's -W)" in capsys.readouterr().out
+        dask = yaml.safe_load((work / "meshify-config" / "dask-config.yaml").read_text())
+        assert dask["jobqueue"]["lsf"]["walltime"] == "4:00"
+
+    def test_dry_run_without_a_script_keeps_the_default(self, tmp_path, wrapper, monkeypatch, capsys):
+        root = _zarr_root_with_labels(tmp_path / "crop.zarr", ["mito"])
+        monkeypatch.setenv("FG_WORK_DIR", str(tmp_path / "work"))
+        monkeypatch.setenv("LSB_PROJECT_NAME", "miaai")
+        wrapper.main(["--input", str(root / "labels" / "mito"), "--dry-run"])
+        assert "worker jobs' walltime: 08:00 (the dask-config default" in capsys.readouterr().out
