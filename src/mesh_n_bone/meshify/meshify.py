@@ -4,6 +4,7 @@ from dataclasses import asdict, dataclass
 import copy
 import numpy as np
 import os
+import time
 import logging
 from zmesh import Mesher
 from zmesh import Mesh as Zmesh
@@ -107,6 +108,10 @@ def _chunk_stage_1_reduction(config):
     )
     return stage_1_reduction
 
+
+# The default block shape keeps at least this many blocks per worker, so
+# every worker has work and no single block sets the run's length.
+MIN_BLOCKS_PER_WORKER = 3
 
 # Thread-local tensorstore handle cache so each worker opens once
 _thread_local_ts = {}
@@ -224,6 +229,31 @@ def _write_block_manifest(tmpdirname, block_id, written):
     with open(partial, "wb") as fh:  # a file handle keeps np.save from adding .npy
         np.save(fh, rows)
     os.replace(partial, final)
+
+
+def _blocks_finished_since(dirname, since):
+    """Ids of the blocks whose manifest under *dirname* was written at or
+    after *since* (a ``time.time()``): the blocks of this run that
+    finished, since a worker writes its block's manifest last. Older
+    manifests, from an earlier run into the same directory, don't count."""
+    mdir = os.path.join(dirname, _MANIFEST_SUBDIR)
+    finished = set()
+    if not os.path.isdir(mdir):
+        return finished
+    with os.scandir(mdir) as it:
+        for entry in it:
+            name = entry.name
+            if not (name.startswith("block_") and name.endswith(".npy")):
+                continue
+            if name.endswith(".partial.npy"):
+                continue
+            try:
+                if entry.stat().st_mtime < since - 5:
+                    continue
+                finished.add(int(name[len("block_"):-len(".npy")]))
+            except (OSError, ValueError):
+                continue
+    return finished
 
 
 def _manifest_totals(dirname):
@@ -1361,6 +1391,13 @@ class Meshify:
         1 GB so a single slow block doesn't tail the whole run. Falls
         back to 128 MB if no dask-config can be parsed.
 
+        Blocks then shrink, a chunk multiple at a time, until there are at
+        least ``MIN_BLOCKS_PER_WORKER`` per worker. Otherwise a volume
+        fits in fewer blocks than workers, the extra workers sit idle,
+        and the run takes as long as its densest block: 96 workers on 72
+        blocks of a synapse prediction with millions of labels ran past
+        the worker walltime.
+
         Parameters
         ----------
         target_mb : int, float, or None
@@ -1387,7 +1424,24 @@ class Meshify:
             max_by_roi = int(np.min(roi_pixels / chunk))
             max_mult = min(max_mult, max_by_roi)
         multiplier = max(1, max_mult)
-        return chunk * multiplier
+        num_workers = int(getattr(self, "num_workers", 1) or 1)
+        roi = getattr(self, "roi", None)
+        if num_workers > 1 and roi is not None:
+            roi_pixels = np.array(roi.shape)
+            wanted = MIN_BLOCKS_PER_WORKER * num_workers
+            while multiplier > 1 and np.prod(
+                np.ceil(roi_pixels / (chunk * multiplier))
+            ) < wanted:
+                multiplier -= 1
+        block = chunk * multiplier
+        if roi is not None:
+            logger.info(
+                "Meshing blocks of %s voxels: %d blocks for %d workers "
+                "(memory budget %.0f MB per block, at least %d blocks per worker).",
+                block.tolist(), int(np.prod(np.ceil(np.array(roi.shape) / block))),
+                num_workers, target_mb, MIN_BLOCKS_PER_WORKER,
+            )
+        return block
 
     def _get_downsample_function(self):
         """Return the appropriate downsample function based on config."""
@@ -1530,21 +1584,40 @@ class Meshify:
         effective_workers = dask_util.effective_num_workers(
             self.num_workers, num_blocks, logger, "generate chunked meshes",
         )
+        phase_started = time.time()
+        attempts = []
 
         def _run(workers, config):
+            block_ids = range(num_blocks)
+            if attempts:
+                # A retry after a worker crash: blocks that finished in an
+                # earlier attempt of this phase wrote their manifest last,
+                # atomically, so they are complete; mesh only the rest.
+                finished = _blocks_finished_since(dirname, phase_started)
+                block_ids = [i for i in range(num_blocks) if i not in finished]
+                logger.info(
+                    "Retrying chunked meshes: %d of %d blocks finished in the "
+                    "earlier attempt; meshing the other %d.",
+                    num_blocks - len(block_ids), num_blocks, len(block_ids),
+                )
+            attempts.append(workers)
+            if not block_ids:
+                return
             # Use the rounded estimator here rather than workers * 10 directly:
             # dask.bag.range puts all remainder elements in the final partition.
-            npartitions = dask_util.guesstimate_npartitions(num_blocks, workers)
-            bag = db.range(num_blocks, npartitions=npartitions).map(
-                _get_chunked_mesh_worker, dirname, worker_config
-            )
+            npartitions = dask_util.guesstimate_npartitions(len(block_ids), workers)
+            if len(block_ids) == num_blocks:
+                ids = db.range(num_blocks, npartitions=npartitions)
+            else:
+                ids = db.from_sequence(block_ids, npartitions=npartitions)
+            bag = ids.map(_get_chunked_mesh_worker, dirname, worker_config)
             with dask_util.start_dask(
                 workers, "generate chunked meshes", logger, config=config,
             ):
                 with Timing_Messager(
-                    f"Generating chunked meshes ({num_blocks} blocks)", logger,
+                    f"Generating chunked meshes ({len(block_ids)} blocks)", logger,
                 ):
-                    bag.compute()
+                    dask_util.compute_watched(bag, "chunked meshes", logger)
 
         dask_util.run_with_oom_retry(
             _run, effective_workers, "generate chunked meshes", logger,
@@ -2104,7 +2177,7 @@ class Meshify:
                         with Timing_Messager(
                             f"Assembling meshes ({phase_name})", logger,
                         ):
-                            bag.compute()
+                            dask_util.compute_watched(bag, phase_name, logger)
 
                 dask_util.run_with_oom_retry(
                     _run, wave.workers, phase_name, logger,
@@ -2659,7 +2732,7 @@ class Meshify:
                         with Timing_Messager(
                             f"Building {label} ({len(sc_grid)} super-chunks)", logger,
                         ):
-                            bag.compute()
+                            dask_util.compute_watched(bag, label, logger)
 
             try:
                 dask_util.run_with_oom_retry(

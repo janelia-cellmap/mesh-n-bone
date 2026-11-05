@@ -1,6 +1,11 @@
+import asyncio
+from collections import Counter
 from contextlib import contextmanager, nullcontext
 import copy
+import math
 import os
+import re
+import time
 import dask
 from dask.distributed import Client, wait
 import getpass
@@ -150,6 +155,7 @@ def start_dask(num_workers, msg, logger, config=None):
 
     cluster_type = next(iter(config["jobqueue"]))
     dask.config.update(dask.config.config, config)
+    _remember_jobqueue(cluster_type, config["jobqueue"].get(cluster_type))
 
     set_local_directory(cluster_type)
     if cluster_type == "local":
@@ -200,6 +206,228 @@ def start_dask(num_workers, msg, logger, config=None):
         yield client
     finally:
         _close_dask_client(client, msg, logger)
+        _ACTIVE_JOBQUEUE.clear()
+
+
+class WorkersLostError(RuntimeError):
+    """A phase cannot finish because its workers are gone: every one
+    exited and none came back, or the worker jobs reached their walltime.
+    Retrying with fewer, larger workers would not help, so the OOM retry
+    lets this through."""
+
+
+# The jobqueue settings of the cluster start_dask is running, for the
+# messages compute_watched writes when workers disappear.
+_ACTIVE_JOBQUEUE = {}
+
+
+def _remember_jobqueue(cluster_type, settings):
+    settings = settings or {}
+    log_directory = settings.get("log-directory")
+    _ACTIVE_JOBQUEUE.clear()
+    _ACTIVE_JOBQUEUE.update(
+        type=cluster_type,
+        walltime=settings.get("walltime"),
+        # Relative to the directory the cluster starts in, as jobqueue reads it.
+        log_directory=os.path.abspath(log_directory) if log_directory else None,
+    )
+
+
+_LSF_TERM_REASON = re.compile(r"\b(TERM_[A-Z_]+)\b")
+_LSF_EXIT_CODE = re.compile(r"Exited with exit code (\d+)")
+_LSF_REASON_MEANING = {
+    "TERM_RUNLIMIT": "reached the worker walltime",
+    "TERM_MEMLIMIT": "went over the LSF memory limit",
+    "TERM_OWNER": "killed by you or by the pipeline closing its cluster",
+}
+
+
+def lsf_exit_reasons(log_directory, since):
+    """How the worker jobs whose LSF summaries were written to
+    *log_directory* at or after *since* (a ``time.time()``) ended.
+
+    LSF appends a summary to a job's ``-o`` file when the job ends, so a
+    ``.out`` file there means that worker job is over. Returns a
+    ``Counter`` of ``TERM_*`` reasons, ``"completed"``, or
+    ``"exit code N"``; empty when there is no such directory (SLURM, SGE
+    and local clusters).
+    """
+    counts = Counter()
+    if not log_directory or not os.path.isdir(log_directory):
+        return counts
+    with os.scandir(log_directory) as it:
+        entries = [e for e in it if e.name.endswith(".out")]
+    for entry in entries:
+        try:
+            # A few seconds of slack for the file server's clock.
+            if entry.stat().st_mtime < since - 5:
+                continue
+            with open(entry.path, errors="replace") as fh:
+                text = fh.read()
+        except OSError:
+            continue
+        match = _LSF_TERM_REASON.search(text)
+        if match:
+            counts[match.group(1)] += 1
+        elif "Successfully completed" in text:
+            counts["completed"] += 1
+        else:
+            match = _LSF_EXIT_CODE.search(text)
+            counts[f"exit code {match.group(1)}" if match else "unknown"] += 1
+    return counts
+
+
+def describe_exit_reasons(counts):
+    """``"9 TERM_RUNLIMIT (reached the worker walltime), ..."``."""
+    parts = []
+    for reason, n in counts.most_common():
+        meaning = _LSF_REASON_MEANING.get(reason)
+        parts.append(f"{n} {reason} ({meaning})" if meaning else f"{n} {reason}")
+    return ", ".join(parts)
+
+
+def _active_client():
+    """The distributed client start_dask opened, or ``None`` when work
+    runs in-process (synchronous scheduler, no cluster)."""
+    if dask.config.get("scheduler", None) == "synchronous":
+        return None
+    try:
+        from distributed import default_client
+        return default_client()
+    except (ImportError, ValueError):
+        return None
+
+
+def _format_elapsed(seconds):
+    minutes, secs = divmod(int(seconds), 60)
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h{minutes:02d}m" if hours else f"{minutes}m{secs:02d}s"
+
+
+def _workers_lost_message(what, done, total, since, grace_seconds):
+    jobqueue = dict(_ACTIVE_JOBQUEUE)
+    message = (
+        f"All dask workers for {what} have exited and none came back within "
+        f"{_format_elapsed(grace_seconds)}, with {done} of {total} tasks done. "
+        "dask-jobqueue does not replace worker jobs that end, so this run "
+        "cannot finish."
+    )
+    reasons = lsf_exit_reasons(jobqueue.get("log_directory"), since)
+    if reasons:
+        message += f" The worker jobs ended: {describe_exit_reasons(reasons)}."
+    elif jobqueue.get("log_directory"):
+        message += (
+            f" No LSF job summaries were found in {jobqueue['log_directory']}; "
+            "check the worker job logs there."
+        )
+    if reasons.get("TERM_RUNLIMIT"):
+        message += (
+            f" Their walltime is {jobqueue.get('walltime')} "
+            f"(jobqueue.{jobqueue.get('type')}.walltime in dask-config.yaml); "
+            "raise it, or use smaller blocks so each task finishes in time."
+        )
+    return message
+
+
+def compute_watched(
+    collection,
+    what,
+    logger=None,
+    *,
+    poll_seconds=15.0,
+    heartbeat_seconds=600.0,
+    report_fraction=0.05,
+    lost_grace_seconds=600.0,
+):
+    """Compute *collection* like ``.compute()``, saying how far it got.
+
+    On the cluster start_dask opened, logs ``done/total`` tasks every
+    *report_fraction* of them and at least every *heartbeat_seconds*
+    (so "is it stuck" is answerable from the log), and raises
+    :class:`WorkersLostError` when every worker that had connected has
+    been gone for *lost_grace_seconds*: dask-jobqueue never replaces a
+    worker job that ends, so without this the driver waits, idle, until
+    its own walltime. Waiting for the first workers to start is only
+    logged; a busy queue is not an error. A task's exception, including
+    ``KilledWorker``, is raised as ``.compute()`` would raise it.
+
+    Without a distributed client (one worker, synchronous scheduler) this
+    is plain ``.compute()``.
+
+    Returns what ``.compute()`` returns: for a bag, the list of its items.
+    """
+    log = logger if logger is not None else logging.getLogger(__name__)
+    client = _active_client()
+    if client is None:
+        return collection.compute()
+
+    parts = collection.to_delayed()
+    single = not isinstance(parts, (list, tuple))
+    if single:
+        parts = [parts]
+    futures = client.compute(list(parts))
+    total = len(futures)
+    if total == 0:
+        return []
+
+    started = time.monotonic()
+    wall_started = time.time()
+    step = max(1, math.ceil(total * report_fraction))
+    next_report = step
+    last_log = started
+    seen_workers = False
+    lost_since = None
+    finished = False
+    try:
+        while True:
+            try:
+                wait(futures, timeout=poll_seconds)
+            except (TimeoutError, asyncio.TimeoutError):
+                pass
+            for future in futures:
+                if future.status in ("error", "cancelled"):
+                    future.result()  # raises the task's own exception
+            done = sum(1 for f in futures if f.status == "finished")
+            if done == total:
+                break
+            now = time.monotonic()
+            try:
+                n_workers = len(client.nthreads())
+            except Exception:  # a slow scheduler reply is not a lost cluster
+                n_workers = None
+            if n_workers:
+                seen_workers = True
+                lost_since = None
+            elif n_workers == 0 and seen_workers:
+                if lost_since is None:
+                    lost_since = now
+                    log.warning(
+                        "%s: every worker has exited (%d of %d tasks done); "
+                        "failing in %s unless one comes back.",
+                        what, done, total, _format_elapsed(lost_grace_seconds),
+                    )
+                elif now - lost_since >= lost_grace_seconds:
+                    raise WorkersLostError(_workers_lost_message(
+                        what, done, total, wall_started, lost_grace_seconds,
+                    ))
+            if done >= next_report or now - last_log >= heartbeat_seconds:
+                log.info(
+                    "%s: %d/%d tasks done (%d%%), %s workers connected, %s elapsed",
+                    what, done, total, 100 * done // total,
+                    "?" if n_workers is None else n_workers,
+                    _format_elapsed(now - started),
+                )
+                last_log = now
+                while next_report <= done:
+                    next_report += step
+        results = client.gather(futures)
+        finished = True
+    finally:
+        if not finished:
+            client.cancel(futures)
+    if single:
+        return results[0]
+    return [item for part in results for item in part]
 
 
 def setup_execution_directory(config_path, logger):
@@ -326,10 +554,30 @@ def run_with_oom_retry(
 
     workers = num_workers
     for attempt in range(max_retries + 1):
+        attempt_started = time.time()
         try:
             return work_fn(workers, config)
         except KilledWorker as e:
-            processes = int(config["jobqueue"][cluster_type].get("processes", 1) or 1)
+            settings = config["jobqueue"][cluster_type]
+            # Workers killed at their walltime also surface as KilledWorker.
+            # Halving the workers would only make the next attempt slower,
+            # so say what happened and stop.
+            reasons = _await_lsf_exit_reasons(
+                settings.get("log-directory"), attempt_started,
+            )
+            if reasons.get("TERM_RUNLIMIT") and not reasons.get("TERM_MEMLIMIT"):
+                message = (
+                    f"Phase '{phase_name}': the worker jobs reached their "
+                    f"walltime ({settings.get('walltime')}) before the phase "
+                    f"finished; they ended: {describe_exit_reasons(reasons)}. "
+                    "This is not out-of-memory, so retrying with fewer, larger "
+                    "workers would not help. Raise "
+                    f"jobqueue.{cluster_type}.walltime in dask-config.yaml, or "
+                    "use smaller blocks so each task finishes in time."
+                )
+                logger.error(message)
+                raise WorkersLostError(message) from e
+            processes = int(settings.get("processes", 1) or 1)
             if attempt >= max_retries:
                 logger.error(
                     "Phase '%s' hit worker OOM and exhausted %d retries "
@@ -363,6 +611,29 @@ def run_with_oom_retry(
             )
             set_jobqueue_processes(config, cluster_type, new_processes)
             workers = new_workers
+
+
+# How long a KilledWorker waits for LSF to write the worker jobs' summaries
+# before treating it as out-of-memory. LSF writes them within seconds of a
+# job ending; a runlimit kill ends every worker job at nearly the same time.
+_EXIT_SUMMARY_WAIT_SECONDS = 90.0
+
+
+def _await_lsf_exit_reasons(log_directory, since, timeout=None, poll_seconds=5.0):
+    """:func:`lsf_exit_reasons`, waiting up to *timeout* seconds for a
+    ``TERM_RUNLIMIT`` or ``TERM_MEMLIMIT`` summary to appear. Returns
+    at once, empty, without a log directory."""
+    if not log_directory or not os.path.isdir(log_directory):
+        return Counter()
+    timeout = _EXIT_SUMMARY_WAIT_SECONDS if timeout is None else timeout
+    deadline = time.monotonic() + timeout
+    while True:
+        reasons = lsf_exit_reasons(log_directory, since)
+        if reasons.get("TERM_RUNLIMIT") or reasons.get("TERM_MEMLIMIT"):
+            return reasons
+        if time.monotonic() >= deadline:
+            return reasons
+        time.sleep(poll_seconds)
 
 
 def effective_num_workers(requested, num_tasks, logger=None, phase_name=None):
@@ -522,7 +793,10 @@ def guesstimate_npartitions(elements, num_workers, scaling=10):
     return actual_partitions
 
 
-def compute_bag(fn, memmap_file_path, variable_args_list, fixed_args_list, num_workers):
+def compute_bag(
+    fn, memmap_file_path, variable_args_list, fixed_args_list, num_workers,
+    what=None,
+):
     """Execute a function over a list of argument tuples using a Dask bag.
 
     The *variable_args_list* is saved to disk as a NumPy ``.npy`` file and
@@ -544,11 +818,14 @@ def compute_bag(fn, memmap_file_path, variable_args_list, fixed_args_list, num_w
         Additional arguments appended to every call.
     num_workers : int
         Number of Dask workers.  ``1`` triggers synchronous execution.
+    what : str or None
+        Label for the progress lines; defaults to *fn*'s name.
 
     Raises
     ------
-    RuntimeError
-        If any partition raises an exception on a distributed cluster.
+    Exception
+        The first failing task's exception, as :func:`compute_watched`
+        raises it (``KilledWorker`` included, so the OOM retry sees it).
     """
     np.save(memmap_file_path, variable_args_list)
 
@@ -563,22 +840,10 @@ def compute_bag(fn, memmap_file_path, variable_args_list, fixed_args_list, num_w
         npartitions=guesstimate_npartitions(variable_args_list, num_workers),
     )
 
+    bag = bag.map_partitions(partition_worker, memmap_file_path, *fixed_args_list)
     try:
-        bag = bag.map_partitions(partition_worker, memmap_file_path, *fixed_args_list)
-        if num_workers == 1:
-            bag.compute()
-        else:
-            futures = bag.persist()
-
-            [completed, _] = wait(futures)
-            failed = [f for f in completed if f.exception() is not None]
-
-            for completed_future in completed:
-                completed_future.cancel()
-
-            if failed:
-                raise RuntimeError(f"Failed to compute {len(failed)} blocks: {failed}")
+        compute_watched(bag, what or getattr(fn, "__name__", "tasks"), logger)
     except Exception as e:
-        print("Compute raised an exception:", e)
+        logger.error("Compute raised an exception: %s", e)
         raise
     os.remove(memmap_file_path)

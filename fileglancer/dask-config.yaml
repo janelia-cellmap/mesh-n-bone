@@ -5,7 +5,14 @@ jobqueue:
     cores: 8
     memory: 120GB
     mem: 120000000000
-    walltime: 01:00
+    # Overwritten at runtime by run_meshify.py with this Fileglancer job's
+    # own -W, so a worker can run as long as the driver that waits for it.
+    # (1:00 would get the short queue, but a dense block can take longer,
+    # and a worker killed at its walltime is never replaced.)
+    walltime: "08:00"
+    # Workers that lose the driver exit after this many seconds, so they
+    # end with it instead of running on to their own walltime.
+    death-timeout: 60
     use-stdin: true
     log-directory: job-logs
     name: mesh-n-bone

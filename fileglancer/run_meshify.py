@@ -15,10 +15,16 @@ Fileglancer job itself (the ``-P`` from Fileglancer's Cluster tab, or
 the user's default), read from ``LSB_PROJECT_NAME`` when LSF sets it
 and otherwise asked of ``bjobs`` for this job's id. ``--lsf-project``
 overrides it for runs by hand.
+
+How long the worker jobs may run: as long as this job, the ``-W`` in
+the job script Fileglancer wrote, so no block outlives the driver's
+patience and no worker is killed while the driver still waits for it.
+Workers that lose the driver exit within a minute (``death-timeout``).
 """
 
 import argparse
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -278,14 +284,38 @@ def resolve_project(cli_value=None, environ=None, job_project=_project_of_job):
     return None, "none given; LSF applies your default"
 
 
-def _build_dask_config(project):
+_BSUB_RUNLIMIT = re.compile(r"^#BSUB\s+-W\s+(\S+)", re.MULTILINE)
+
+
+def driver_walltime(work_dir):
+    """The ``-W`` run limit of the Fileglancer job script in *work_dir*
+    (``"08:00"``), or ``None`` when no script there sets one.
+
+    Fileglancer writes the job's ``#BSUB`` lines, including the walltime
+    the form or the app's resources gave it, into a script in the job's
+    work directory."""
+    for script in sorted(Path(work_dir).glob("*.sh")):
+        try:
+            text = script.read_text(errors="replace")
+        except OSError:
+            continue
+        match = _BSUB_RUNLIMIT.search(text)
+        if match:
+            return match.group(1).strip("\"'")
+    return None
+
+
+def _build_dask_config(project, walltime=None):
     """``fileglancer/dask-config.yaml`` with *project* for the worker jobs,
-    or without a project when there is none."""
+    or without a project when there is none, and with *walltime* for
+    them when given."""
     config = yaml.safe_load(_DASK_TEMPLATE.read_text())
     if project:
         config["jobqueue"]["lsf"]["project"] = project
     else:
         config["jobqueue"]["lsf"].pop("project", None)
+    if walltime:
+        config["jobqueue"]["lsf"]["walltime"] = str(walltime)
     return config
 
 
@@ -312,13 +342,23 @@ def main(argv=None):
             flush=True,
         )
     print(f"worker jobs' LSF project: {project or 'none'} ({source})", flush=True)
+    walltime = driver_walltime(work_dir)
+    if walltime:
+        print(f"worker jobs' walltime: {walltime} (this job's -W)", flush=True)
+    else:
+        default = _build_dask_config(project)["jobqueue"]["lsf"]["walltime"]
+        print(
+            f"worker jobs' walltime: {default} (the dask-config default; "
+            "no -W found in this job's script)",
+            flush=True,
+        )
 
     config_dir = work_dir / "meshify-config"
     config_dir.mkdir(parents=True, exist_ok=True)
     run_config = _build_run_config(args, args.input, output)
     (config_dir / "run-config.yaml").write_text(yaml.safe_dump(run_config, sort_keys=False))
     (config_dir / "dask-config.yaml").write_text(
-        yaml.safe_dump(_build_dask_config(project), sort_keys=False)
+        yaml.safe_dump(_build_dask_config(project, walltime), sort_keys=False)
     )
     cmd = _meshify_command(config_dir, args)
     print(f"+ {' '.join(shlex.quote(c) for c in cmd)}", flush=True)
