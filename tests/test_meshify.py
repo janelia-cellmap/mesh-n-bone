@@ -146,52 +146,40 @@ class TestAssemblyMemoryPlanning:
         with open(path, "wb") as f:
             f.write(header + body)
 
-    def test_scans_ply_headers_for_mesh_estimates(self, tmp_output_dir):
-        from mesh_n_bone.meshify.meshify import _scan_assembly_mesh_estimates
-
-        mesh_dir = os.path.join(tmp_output_dir, "tmp_chunked", "42")
-        os.makedirs(mesh_dir)
-        self._write_binary_ply(os.path.join(mesh_dir, "block_0.ply"), 10, 20)
-        self._write_binary_ply(os.path.join(mesh_dir, "block_1.ply"), 2, 4)
-
-        estimates = _scan_assembly_mesh_estimates(
-            os.path.join(tmp_output_dir, "tmp_chunked"),
-            amplification=16,
+    def test_plans_mesh_estimates_from_block_manifests(self, tmp_output_dir):
+        from mesh_n_bone.meshify.meshify import (
+            _plan_assembly_from_manifests, _read_block_manifests, _write_block_pack,
         )
-        assert len(estimates) == 1
-        estimate = estimates[0]
+
+        tmp_chunked = os.path.join(tmp_output_dir, "tmp_chunked")
+        _write_block_pack(tmp_chunked, 0, [(42, b"a" * 300, 10, 20, 0)])
+        _write_block_pack(tmp_chunked, 1, [(42, b"b" * 100, 2, 4, 0)])
+
+        plan = _plan_assembly_from_manifests(_read_block_manifests(tmp_chunked), amplification=16)
+        assert len(plan.estimates) == 1
+        estimate = plan.estimates[0]
         assert estimate.mesh_id == "42"
         assert estimate.num_files == 2
+        assert estimate.ply_bytes == 400
         assert estimate.vertex_count == 12
         assert estimate.face_count == 24
         assert estimate.raw_mesh_bytes == 12 * 3 * 8 + 24 * 3 * 4
         assert estimate.estimated_peak_bytes > estimate.raw_mesh_bytes
 
-    @pytest.mark.parametrize(
-        "num_workers",
-        [
-            1,   # sequential path: max_workers > 1 is false
-            2,   # threaded path: total (10) > max_workers
-            32,  # more workers requested than mesh dirs exist: falls back to
-                 # sequential since total (10) > max_workers is false
-        ],
-    )
-    def test_scan_result_is_independent_of_num_workers(
-        self, tmp_output_dir, num_workers,
-    ):
-        from mesh_n_bone.meshify.meshify import _scan_assembly_mesh_estimates
+    @pytest.mark.parametrize("num_workers", [1, 2, 32])
+    def test_manifest_reading_is_independent_of_num_workers(self, tmp_output_dir, num_workers):
+        from mesh_n_bone.meshify.meshify import (
+            _plan_assembly_from_manifests, _read_block_manifests, _write_block_pack,
+        )
 
         tmp_chunked = os.path.join(tmp_output_dir, "tmp_chunked")
-        mesh_ids = [str(i) for i in range(10)]
-        for mesh_id in mesh_ids:
-            mesh_dir = os.path.join(tmp_chunked, mesh_id)
-            os.makedirs(mesh_dir)
-            self._write_binary_ply(os.path.join(mesh_dir, "block_0.ply"), 1, 1)
-
-        estimates = _scan_assembly_mesh_estimates(
-            tmp_chunked, amplification=16, num_workers=num_workers,
-        )
-        assert [e.mesh_id for e in estimates] == sorted(mesh_ids)
+        for block in range(30):
+            _write_block_pack(tmp_chunked, block, [(block % 10, b"p", 1, 1, 0)])
+        rows = _read_block_manifests(tmp_chunked, num_workers=num_workers)
+        assert len(rows) == 30
+        plan = _plan_assembly_from_manifests(rows, amplification=16)
+        assert [e.mesh_id for e in plan.estimates] == [str(i) for i in range(10)]
+        assert all(e.num_files == 3 for e in plan.estimates)
 
     def test_balanced_batches_leave_giant_mesh_alone(self):
         from mesh_n_bone.meshify.meshify import (
@@ -367,9 +355,9 @@ class TestStagedReductions:
         from cloudvolume.mesh import Mesh as CloudVolumeMesh
         from mesh_n_bone.meshify.meshify import Meshify, staged_reductions
 
-        block_dir = os.path.join(tmp_output_dir, "blocks", "1")
+        from mesh_n_bone.meshify.meshify import _write_block_pack
+
         output_dir = os.path.join(tmp_output_dir, "out")
-        os.makedirs(block_dir)
         os.makedirs(os.path.join(output_dir, "meshes"))
 
         vertices = np.array(
@@ -391,8 +379,8 @@ class TestStagedReductions:
             dtype=np.uint32,
         )
         mesh = CloudVolumeMesh(vertices, faces, normals=None)
-        with open(os.path.join(block_dir, "block_0.ply"), "wb") as f:
-            f.write(mesh.to_ply())
+        ply = mesh.to_ply()
+        _write_block_pack(os.path.join(tmp_output_dir, "blocks"), 0, [(1, ply, 4, 4, 0)])
 
         reductions = []
 
@@ -431,7 +419,7 @@ class TestStagedReductions:
         meshify.do_legacy_neuroglancer = False
         meshify.do_singleres_multires_neuroglancer = False
 
-        meshify._assemble_mesh("1")
+        meshify._assemble_mesh("1", ((0, 0, len(ply)),))
 
         _, expected_stage_2 = staged_reductions(0.933, 0.25, 0.75)
         assert reductions == [expected_stage_2]
