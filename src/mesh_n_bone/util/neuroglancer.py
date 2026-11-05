@@ -198,7 +198,7 @@ def _build_properties_from_csv(ids, csv_path, columns=None, id_column="Object ID
 
 
 def write_segment_properties_file(
-    path, csv_path=None, csv_columns=None, csv_id_column="Object ID",
+    path, csv_path=None, csv_columns=None, csv_id_column="Object ID", ids=None,
 ):
     """Create segment properties dir/file so that all meshes are selectable
     based on id in neuroglancer.
@@ -217,6 +217,9 @@ def write_segment_properties_file(
     csv_id_column : str
         Name of the CSV column containing segment IDs.  Defaults to
         ``"Object ID"``.
+    ids : iterable of int or None
+        The segments with meshes. ``None`` lists them from the ``.index``
+        files in *path*.
     """
 
     def list_index_ids(path):
@@ -231,7 +234,7 @@ def write_segment_properties_file(
     if not os.path.exists(segment_properties_directory):
         os.makedirs(segment_properties_directory)
 
-    ids = list_index_ids(path)
+    ids = list_index_ids(path) if ids is None else [str(int(i)) for i in ids]
     ids.sort(key=int)
 
     if csv_path is not None:

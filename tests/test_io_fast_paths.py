@@ -130,48 +130,47 @@ class TestPromoteMeshesSubdir:
             mf._promote_meshes_subdir(str(s0))
 
 
-def _ply(n_vertices, n_faces):
-    header = (
-        "ply\nformat binary_little_endian 1.0\n"
-        f"element vertex {n_vertices}\nproperty float x\nproperty float y\nproperty float z\n"
-        f"element face {n_faces}\nproperty list uchar int vertex_indices\nend_header\n"
-    ).encode()
-    return header + b"\0" * (12 * n_vertices + 13 * n_faces)
-
-
-class TestBlockManifests:
-    def test_round_trip_and_totals_across_blocks(self, tmp_path):
-        mf._write_block_manifest(str(tmp_path), 0, [(7, 100, 10, 20), (8, 50, 5, 6)])
-        mf._write_block_manifest(str(tmp_path), 1, [(7, 300, 30, 60)])
-        mf._write_block_manifest(str(tmp_path), 2, [])  # a block that wrote nothing
+class TestBlockPacks:
+    def test_round_trip_through_pack_and_manifest(self, tmp_path):
+        pieces = [(7, b"seven-from-block-0", 10, 20, 0), (8, b"eight", 5, 6, 1)]
+        mf._write_block_pack(str(tmp_path), 0, pieces)
+        mf._write_block_pack(str(tmp_path), 1, [(7, b"seven-from-block-1", 30, 60, 0)])
+        mf._write_block_pack(str(tmp_path), 2, [])  # a block that wrote nothing
         assert sorted(os.listdir(tmp_path / mf._MANIFEST_SUBDIR)) == ["block_0.npy", "block_1.npy"]
-        totals = mf._manifest_totals(str(tmp_path))
-        assert totals == {7: [2, 400, 40, 80], 8: [1, 50, 5, 6]}
+        assert sorted(os.listdir(tmp_path / mf._PACK_SUBDIR)) == ["block_0.pack", "block_1.pack"]
+        rows = mf._read_block_manifests(str(tmp_path))
+        assert len(rows) == 3
+        for row in rows:
+            data = mf._read_pack_piece(str(tmp_path), row["block"], row["offset"], row["bytes"])
+            expected = {(0, 7): b"seven-from-block-0", (0, 8): b"eight", (1, 7): b"seven-from-block-1"}
+            assert data == expected[(int(row["block"]), int(row["id"]))]
 
-    def test_scan_uses_manifests_and_falls_back_for_uncovered_segments(self, tmp_path, caplog):
-        amplification = 32
-        # Segment 7: two blocks, both recorded in manifests.
-        (tmp_path / "7").mkdir()
-        (tmp_path / "7" / "block_0.ply").write_bytes(_ply(10, 20))
-        (tmp_path / "7" / "block_1.ply").write_bytes(_ply(30, 60))
-        mf._write_block_manifest(str(tmp_path), 0, [(7, len(_ply(10, 20)), 10, 20)])
-        mf._write_block_manifest(str(tmp_path), 1, [(7, len(_ply(30, 60)), 30, 60)])
-        # Segment 9: its block died before writing a manifest; files only.
-        (tmp_path / "9").mkdir()
-        (tmp_path / "9" / "block_2.ply").write_bytes(_ply(4, 2))
-        with caplog.at_level(logging.INFO, logger="mesh_n_bone.meshify.meshify"):
-            estimates = mf._scan_assembly_mesh_estimates(str(tmp_path), amplification, num_workers=1)
-        by_id = {e.mesh_id: e for e in estimates}
-        assert set(by_id) == {"7", "9"}
-        assert (by_id["7"].num_files, by_id["7"].vertex_count, by_id["7"].face_count) == (2, 40, 80)
-        assert (by_id["9"].num_files, by_id["9"].vertex_count, by_id["9"].face_count) == (1, 4, 2)
-        # Both routes produce the same estimate for the same counts.
-        slow = mf._scan_one_assembly_mesh_dir(str(tmp_path / "7"), "7", amplification)
-        assert slow.estimated_peak_bytes == by_id["7"].estimated_peak_bytes
-        assert any("1 of 2 chunked meshes totalled from block manifests" in r.message for r in caplog.records)
+    def test_a_short_pack_is_an_error(self, tmp_path):
+        mf._write_block_pack(str(tmp_path), 0, [(7, b"abc", 1, 1, 0)])
+        with pytest.raises(IOError, match="shorter than its manifest"):
+            mf._read_pack_piece(str(tmp_path), 0, 0, 10)
 
-    def test_scan_without_manifests_is_unchanged(self, tmp_path):
-        (tmp_path / "3").mkdir()
-        (tmp_path / "3" / "block_0.ply").write_bytes(_ply(10, 20))
-        estimates = mf._scan_assembly_mesh_estimates(str(tmp_path), 24, num_workers=1)
-        assert [(e.mesh_id, e.vertex_count, e.face_count) for e in estimates] == [("3", 10, 20)]
+    def test_plan_separates_finished_segments_from_the_rest(self, tmp_path):
+        # 1: one piece, finished in its block            -> nothing to do
+        # 2: one piece, not finished (touched a face)    -> assembled
+        # 3: finished in block 0 and met again in block 1 -> redone, assembled
+        # 4: pieces in blocks 2 and 0                     -> assembled, pieces by block
+        mf._write_block_pack(str(tmp_path), 0, [
+            (1, b"1", 1, 1, 1), (3, b"33", 2, 2, 1), (4, b"444", 3, 3, 0),
+        ])
+        mf._write_block_pack(str(tmp_path), 1, [(2, b"2", 1, 1, 0), (3, b"3", 1, 1, 0)])
+        mf._write_block_pack(str(tmp_path), 2, [(4, b"4", 1, 1, 0)])
+        plan = mf._plan_assembly_from_manifests(mf._read_block_manifests(str(tmp_path)), 32)
+        assert plan.finished_in_blocks == 1
+        assert plan.redone == [3]
+        assert [e.mesh_id for e in plan.estimates] == ["2", "3", "4"]
+        assert plan.pieces[4] == ((0, 3, 3), (2, 0, 1))
+        assert 1 not in plan.pieces
+        by_id = {e.mesh_id: e for e in plan.estimates}
+        assert (by_id["3"].num_files, by_id["3"].ply_bytes, by_id["3"].face_count) == (2, 3, 3)
+
+    def test_no_manifests_means_an_empty_plan(self, tmp_path):
+        plan = mf._plan_assembly_from_manifests(mf._read_block_manifests(str(tmp_path)), 32)
+        assert (plan.estimates, plan.pieces, plan.finished_in_blocks, plan.redone) == ([], {}, 0, [])
+
+

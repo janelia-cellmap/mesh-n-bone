@@ -447,3 +447,49 @@ class TestMultiresClearsOldFilesWithoutAShell:
         )
         with open(os.path.join(multires, "1.index"), "rb") as f:
             assert f.read() != b"stale"
+
+
+class TestEveryLevelGetsItsOwnBlockFloor:
+    """A coarser level read from an existing scale has its default block
+    shape sized for itself, not reused from the finest level."""
+
+    @staticmethod
+    def _level(shape):
+        return SimpleNamespace(
+            chunk_shape=(128, 128, 128), dtype=np.dtype("uint32"), path=f"level{shape}",
+            voxel_size=np.ones(3), translation=np.zeros(3), box=SimpleNamespace(shape=shape),
+        )
+
+    def _meshify(self, monkeypatch, tmp_path, given):
+        s0, s2 = self._level((1466, 4125, 4125)), self._level((733, 1032, 1032))
+        monkeypatch.setattr(meshify_module, "_estimate_block_target_mb_from_dask_config", lambda *a, **k: 2500.0)
+        monkeypatch.setattr(meshify_module, "open_dataset", lambda path: s2)
+        m = object.__new__(Meshify)
+        m.segmentation_array, m.roi, m.num_workers = s0, s0.box, 192
+        m._block_shape_given = given
+        m.read_write_block_shape_pixels = (
+            np.array([768] * 3) if given else m._default_block_shape_pixels()
+        )
+        for name, value in dict(
+            output_directory=str(tmp_path), downsample_factor=None, true_voxel_size=np.ones(3),
+            do_legacy_neuroglancer=False, do_singleres_multires_neuroglancer=False,
+            target_reduction=0.9, _dataset_path="s0", input_path="s0", base_voxel_size=np.ones(3),
+            true_offset=np.zeros(3), has_custom_roi=False, keep_chunked_meshes=False,
+        ).items():
+            setattr(m, name, value)
+        seen = []
+        m.get_chunked_meshes = lambda dirname: seen.append(m.read_write_block_shape_pixels.tolist())
+        m.assemble_meshes = lambda dirname: None
+        return m, seen
+
+    def test_a_default_shape_is_sized_again(self, monkeypatch, tmp_path):
+        m, seen = self._meshify(monkeypatch, tmp_path, given=False)
+        assert m.read_write_block_shape_pixels.tolist() == [256] * 3  # 1,734 blocks at LOD 0
+        m._generate_meshes_at_scale(str(tmp_path / "s2"), input_dataset_path="s2")
+        assert seen == [[128] * 3]  # 486 blocks at LOD 2, not 75
+        assert m.read_write_block_shape_pixels.tolist() == [256] * 3
+
+    def test_a_given_shape_is_kept(self, monkeypatch, tmp_path):
+        m, seen = self._meshify(monkeypatch, tmp_path, given=True)
+        m._generate_meshes_at_scale(str(tmp_path / "s2"), input_dataset_path="s2")
+        assert seen == [[768] * 3]
