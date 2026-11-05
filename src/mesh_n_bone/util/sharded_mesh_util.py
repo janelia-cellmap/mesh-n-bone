@@ -120,27 +120,58 @@ def _read_segment_chunk(
     return fragment_bytes + manifest_bytes, len(manifest_bytes)
 
 
+def _read_packed_chunks(packed: Dict[int, Tuple[str, int, int, int]]) -> Dict[int, Tuple[bytes, int]]:
+    """``{seg_id: (chunk_binary, manifest_size)}`` for segments whose
+    multires chunk sits in a pack file, given ``{seg_id: (pack path,
+    offset, bytes, manifest_size)}``. Reads each pack's pieces in offset
+    order through one open file."""
+    by_pack: Dict[str, List[Tuple[int, int, int, int]]] = defaultdict(list)
+    for seg_id, (path, offset, nbytes, manifest_size) in packed.items():
+        by_pack[path].append((int(offset), int(nbytes), int(manifest_size), int(seg_id)))
+    chunks: Dict[int, Tuple[bytes, int]] = {}
+    for path, pieces in by_pack.items():
+        with open(path, "rb") as fh:
+            for offset, nbytes, manifest_size, seg_id in sorted(pieces):
+                fh.seek(offset)
+                binary = fh.read(nbytes)
+                if len(binary) != nbytes:
+                    raise IOError(
+                        f"{path} is shorter than its manifest says "
+                        f"({len(binary)} of {nbytes} bytes at {offset})"
+                    )
+                chunks[seg_id] = (binary, manifest_size)
+    return chunks
+
+
 def pack_one_shard(
     shard_name: str,
     segment_ids: List[int],
     multires_dir: str,
     output_dir: str,
     spec_dict: Dict,
+    packed: Dict[int, Tuple[str, int, int, int]] | None = None,
 ) -> str:
     """Assemble a single `<shard_name>.shard` file from its segments.
 
     Designed to run on a dask worker. Re-creates the ShardingSpecification
     from a JSON-able dict so it ships cleanly across processes.
+
+    A segment in *packed* (``{seg_id: (pack path, offset, bytes,
+    manifest_size)}``) has its chunk read from a pack file; any other is
+    read from its ``<id>`` and ``<id>.index`` files in *multires_dir*.
     """
 
     spec = ShardingSpecification.from_dict(spec_dict)
     if spec.hash == "murmurhash3_x86_128":
         spec.hashfn = _murmur3_x86_128_unsigned
 
+    from_packs = _read_packed_chunks(packed) if packed else {}
     data: Dict[int, bytes] = {}
     data_offset: Dict[int, int] = {}
     for seg_id in segment_ids:
-        chunk = _read_segment_chunk(multires_dir, seg_id)
+        chunk = from_packs.get(int(seg_id))
+        if chunk is None and not (packed and int(seg_id) in packed):
+            chunk = _read_segment_chunk(multires_dir, seg_id)
         if chunk is None:
             continue
         binary, manifest_size = chunk
@@ -206,8 +237,13 @@ def pack_meshes_to_shards(
     spec: ShardingSpecification,
     num_workers: int,
     output_dir: str | None = None,
+    packed: Dict[int, Tuple[str, int, int, int]] | None = None,
 ) -> List[str]:
-    """Group segments by shard, dispatch one dask task per shard, return written paths."""
+    """Group segments by shard, dispatch one dask task per shard, return written paths.
+
+    *packed* maps the segments whose multires chunk sits in a pack file to
+    ``(pack path, offset, bytes, manifest_size)``; see :func:`pack_one_shard`.
+    """
 
     output_dir = output_dir or multires_dir
     os.makedirs(output_dir, exist_ok=True)
@@ -219,9 +255,19 @@ def pack_meshes_to_shards(
     if not shard_items:
         return []
 
+    if packed:
+        shard_items = [
+            (name, ids, {i: packed[i] for i in ids if i in packed})
+            for name, ids in shard_items
+        ]
+    else:
+        shard_items = [(name, ids, None) for name, ids in shard_items]
+
     bag = db.from_sequence(shard_items, npartitions=min(len(shard_items), max(1, num_workers)))
     bag = bag.map(
-        lambda item: pack_one_shard(item[0], item[1], multires_dir, output_dir, spec_dict)
+        lambda item: pack_one_shard(
+            item[0], item[1], multires_dir, output_dir, spec_dict, packed=item[2],
+        )
     )
 
     from mesh_n_bone.util import dask_util
