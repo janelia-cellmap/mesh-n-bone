@@ -261,8 +261,111 @@ def _read_pack_piece(dirname, block_id, offset, nbytes):
 
 
 _MANIFEST_ROWS_DTYPE = np.dtype(_MANIFEST_DTYPE.descr + [("block", "u8")])
+# Meshes a meshing pass finished, when they go to the multires step in
+# pack files (Meshify._uses_mesh_packs): <scale dir>/_finished/<name>.pack
+# with a manifest of (segment id, offset, bytes) under _finished/_manifests.
+_FINISHED_SUBDIR = "_finished"
+_FINISHED_DTYPE = np.dtype([("id", "u8"), ("offset", "u8"), ("bytes", "u8")])
+_FINISHED_INDEX_DTYPE = np.dtype(
+    [("id", "u8"), ("pack", "u4"), ("offset", "u8"), ("bytes", "u8")]
+)
+# Hand meshes to the multires step in packs when nothing else reads the
+# per-segment PLYs (see Meshify._uses_mesh_packs). A switch for tests.
+USE_MESH_PACKS = True
+# Segments whose LOD-0 PLY is at most this big get their multires chunks
+# built in batches on a worker's own disk; bigger ones keep the
+# per-segment route, which can split one segment over several workers.
+SMALL_SEGMENT_MAX_BYTES = 1 << 20
+# Small segments per multires batch task.
+SMALL_MULTIRES_BATCH = 2000
+
+
+def _write_finished_pack(output_directory, name, entries):
+    """Write finished meshes, ``(segment id, PLY bytes)``, as one pack
+    with its manifest, pack first, both renamed into place."""
+    if not entries:
+        return
+    fdir = os.path.join(output_directory, _FINISHED_SUBDIR)
+    mdir = os.path.join(fdir, _MANIFEST_SUBDIR)
+    os.makedirs(mdir, exist_ok=True)
+    pack = os.path.join(fdir, f"{name}.pack")
+    rows = []
+    offset = 0
+    with open(pack + ".partial", "wb") as fh:
+        for segment_id, ply in entries:
+            fh.write(ply)
+            rows.append((int(segment_id), offset, len(ply)))
+            offset += len(ply)
+    os.replace(pack + ".partial", pack)
+    manifest = os.path.join(mdir, f"{name}.npy")
+    with open(manifest + ".partial", "wb") as fh:
+        np.save(fh, np.array(rows, dtype=_FINISHED_DTYPE))
+    os.replace(manifest + ".partial", manifest)
+
+
+def _read_finished_index(scale_dir, num_workers=1):
+    """``(pack paths, index)`` for the meshes one meshing pass finished:
+    the index has one row per segment, sorted by id, naming its pack (by
+    position in the paths), offset and size.
+
+    A segment a block finished early but that assembly redid with its
+    other pieces is listed by assembly (``superseded.npy``); the block's
+    copy is dropped.
+    """
+    fdir = os.path.join(scale_dir, _FINISHED_SUBDIR)
+    mdir = os.path.join(fdir, _MANIFEST_SUBDIR)
+    if not os.path.isdir(mdir):
+        return [], np.empty(0, dtype=_FINISHED_INDEX_DTYPE)
+    names = sorted(
+        name[:-len(".npy")] for name in os.listdir(mdir)
+        if name.endswith(".npy") and not name.endswith(".partial.npy")
+    )
+    superseded_path = os.path.join(fdir, "superseded.npy")
+    superseded = (
+        np.load(superseded_path) if os.path.exists(superseded_path)
+        else np.empty(0, dtype=np.uint64)
+    )
+
+    def _load(item):
+        k, name = item
+        rows = np.load(os.path.join(mdir, f"{name}.npy"))
+        if name.startswith("block_") and len(superseded):
+            rows = rows[~np.isin(rows["id"], superseded)]
+        part = np.empty(len(rows), dtype=_FINISHED_INDEX_DTYPE)
+        part["id"], part["offset"], part["bytes"] = rows["id"], rows["offset"], rows["bytes"]
+        part["pack"] = k
+        return part
+
+    parts = dask_util.parallel_io(
+        list(enumerate(names)), _load, num_workers,
+        logger=logger if len(names) >= _PROGRESS_MIN_ITEMS else None,
+        what="finished-mesh manifests read",
+    )
+    index = np.concatenate(parts) if parts else np.empty(0, dtype=_FINISHED_INDEX_DTYPE)
+    index = index[np.argsort(index["id"], kind="stable")]
+    if len(index) > 1 and np.any(index["id"][1:] == index["id"][:-1]):
+        twice = index["id"][1:][index["id"][1:] == index["id"][:-1]]
+        raise RuntimeError(
+            f"{scale_dir}: {len(twice)} segments were finished twice, e.g. {twice[:5].tolist()}"
+        )
+    return [os.path.join(fdir, f"{name}.pack") for name in names], index
+
+
 # File operations on fewer items than this finish too fast to need progress lines.
 _PROGRESS_MIN_ITEMS = 1000
+
+
+def _read_pack_piece_at(path, offset, nbytes):
+    """*nbytes* bytes at *offset* of the pack file *path*."""
+    with open(path, "rb") as fh:
+        fh.seek(offset)
+        data = fh.read(nbytes)
+    if len(data) != nbytes:
+        raise IOError(
+            f"{path} is shorter than its manifest says "
+            f"({len(data)} of {nbytes} bytes at {offset})"
+        )
+    return data
 
 
 def _read_block_manifests(dirname, num_workers=1):
@@ -382,7 +485,9 @@ def _segment_is_interior(vertices, core_voxels_xyz, voxel_size_xyz):
 
 def _finish_segment_mesh(mesh, mesh_id, settings):
     """The last step of assembly for one segment's whole mesh: repair,
-    simplify and smooth it, and write it under ``meshes/``.
+    simplify and smooth it, and write it under ``meshes/``. When the
+    meshes go to the multires step in packs (``settings["to_pack"]``),
+    returns the PLY bytes instead of writing them.
 
     Assembly runs it after joining a segment's pieces; a block worker runs
     it on a segment that lies wholly inside its block, with the same
@@ -433,6 +538,11 @@ def _finish_segment_mesh(mesh, mesh_id, settings):
             raise Exception(f"Mesh {mesh_id} contains no faces")
     except Exception as e:
         raise Exception(f"{mesh_id} failed, with error: {e}")
+
+    if settings.get("to_pack"):
+        # The multires step reads it from a pack (_write_finished_pack):
+        # the same bytes the PLY file would hold.
+        return mesh.export(file_type="ply")
 
     from mesh_n_bone.util.neuroglancer import (
         write_ngmesh,
@@ -1003,6 +1113,7 @@ def _get_chunked_mesh_worker(block_index, tmpdirname, config):
     local_finish_max_faces = int(config.get("local_finish_max_faces") or 0) if finish else 0
 
     pieces = []  # (segment id, PLY bytes, vertices, faces, finished) for the block's pack
+    finished_plys = []  # (segment id, PLY bytes) when the finished meshes go to packs
     for id in mesher.ids():
         original_id = inv_remap[int(id)] if inv_remap is not None else int(id)
         mesh = mesher.get_mesh(id)
@@ -1060,8 +1171,86 @@ def _get_chunked_mesh_worker(block_index, tmpdirname, config):
         pieces.append((original_id, ply, counts[0], counts[1], int(finish_here)))
         if finish_here:
             # From the PLY bytes, as assembly would read the piece back.
-            _finish_segment_mesh(Zmesh.from_ply(ply), original_id, finish)
+            finished = _finish_segment_mesh(Zmesh.from_ply(ply), original_id, finish)
+            if finished is not None:
+                finished_plys.append((original_id, finished))
+    if finished_plys:
+        _write_finished_pack(finish["output_directory"], f"block_{block.id}", finished_plys)
+    # The block manifest comes last: it marks the block complete.
     _write_block_pack(tmpdirname, block.id, pieces)
+
+
+_SOURCE_DTYPE = np.dtype([
+    ("id", "u8"), ("lod", "u1"), ("path", "u4"), ("offset", "u8"), ("bytes", "u8"),
+])
+
+
+def _small_segment_batches(small_rows, indexes, lods, batch_size):
+    """Batches of small segments for the multires step, each
+    ``(name, sources, paths)``: one row per segment level, ``(segment id,
+    lod, path, offset, bytes)`` with ``path`` indexing the batch's own
+    list of pack paths.
+
+    Segments are batched by the LOD-0 pack they are in, so a batch's
+    coarser levels also come from a few packs (the same region of the
+    volume), and its reads stay sequential.
+    """
+    small_ids = small_rows["id"]  # sorted: the LOD-0 index is
+    all_paths = []
+    per_level = []
+    for lod in lods:
+        paths, index = indexes[lod]
+        base = len(all_paths)
+        all_paths.extend(paths)
+        if len(index) == 0:
+            continue
+        at = np.minimum(np.searchsorted(index["id"], small_ids), len(index) - 1)
+        found = index["id"][at] == small_ids
+        rows = np.empty(int(found.sum()), dtype=_SOURCE_DTYPE)
+        rows["id"] = small_ids[found]
+        rows["lod"] = lod
+        rows["path"] = index["pack"][at[found]].astype(np.uint32) + base
+        rows["offset"] = index["offset"][at[found]]
+        rows["bytes"] = index["bytes"][at[found]]
+        per_level.append(rows)
+    sources = np.concatenate(per_level)
+    sources = sources[np.lexsort((sources["lod"], sources["id"]))]
+
+    # Number the batches: by LOD-0 pack, then batch_size at a time.
+    order = np.argsort(small_rows["pack"], kind="stable")
+    packs = small_rows["pack"][order]
+    group = np.concatenate([[0], np.cumsum(packs[1:] != packs[:-1])])
+    group_start = np.concatenate([[0], np.flatnonzero(packs[1:] != packs[:-1]) + 1])
+    within = (np.arange(len(order)) - group_start[group]) // batch_size
+    new_batch = np.concatenate([[True], (group[1:] != group[:-1]) | (within[1:] != within[:-1])])
+    batch_of = np.empty(len(order), dtype=np.int64)
+    batch_of[order] = np.cumsum(new_batch) - 1
+
+    row_batch = batch_of[np.searchsorted(small_ids, sources["id"])]
+    by_batch = np.argsort(row_batch, kind="stable")
+    sources, row_batch = sources[by_batch], row_batch[by_batch]
+    batches = []
+    for k, rows in enumerate(np.split(sources, np.flatnonzero(np.diff(row_batch)) + 1)):
+        used, local = np.unique(rows["path"], return_inverse=True)
+        rows = rows.copy()
+        rows["path"] = local
+        batches.append((f"batch_{k}", rows, [all_paths[int(i)] for i in used]))
+    return batches
+
+
+def _small_multires_task(name, sources, paths, chunk_dir, lods, kwargs):
+    """One batch of :func:`_small_segment_batches`, run through
+    ``generate_small_multires_batch``."""
+    from mesh_n_bone.multires.multires import generate_small_multires_batch
+
+    entries = []
+    ids, starts = np.unique(sources["id"], return_index=True)
+    for segment_id, rows in zip(ids, np.split(sources, starts[1:])):
+        entries.append((int(segment_id), [
+            (int(r["lod"]), paths[int(r["path"])], int(r["offset"]), int(r["bytes"]))
+            for r in rows
+        ]))
+    return generate_small_multires_batch(entries, chunk_dir, name, lods, ".ply", **kwargs)
 
 
 class Meshify:
@@ -1620,6 +1809,7 @@ class Meshify:
             "smooth_before_simplify": self.smooth_before_simplify,
             "do_legacy_neuroglancer": self.do_legacy_neuroglancer,
             "do_singleres_multires_neuroglancer": self.do_singleres_multires_neuroglancer,
+            "to_pack": bool(getattr(self, "_mesh_packs", False)),
         }
 
     def _block_shape_voxels(self):
@@ -1698,6 +1888,7 @@ class Meshify:
         # this directory would be read as this run's.
         for stale in (_PACK_SUBDIR, _MANIFEST_SUBDIR, _ASSEMBLED_SUBDIR):
             shutil.rmtree(os.path.join(dirname, stale), ignore_errors=True)
+        shutil.rmtree(os.path.join(self.output_directory, _FINISHED_SUBDIR), ignore_errors=True)
 
         effective_workers = dask_util.effective_num_workers(
             self.num_workers, num_blocks, logger, "generate chunked meshes",
@@ -2120,16 +2311,23 @@ class Meshify:
             )
             return
 
-        _finish_segment_mesh(mesh, mesh_id, self._finish_settings())
+        return _finish_segment_mesh(mesh, mesh_id, self._finish_settings())
 
     def _assemble_mesh_batch(self, done_marker, items):
         """Assemble a memory-balanced batch of ``(segment id, pieces)``
         sequentially, then write *done_marker*; a batch whose marker
-        exists was finished by an earlier attempt and is skipped."""
+        exists was finished by an earlier attempt and is skipped. When
+        the meshes go to packs, the batch's meshes become one pack."""
         if os.path.exists(done_marker):
             return
+        finished = []
         for mesh_id, pieces in items:
-            self._assemble_mesh(mesh_id, pieces)
+            ply = self._assemble_mesh(mesh_id, pieces)
+            if ply is not None:
+                finished.append((mesh_id, ply))
+        _write_finished_pack(
+            self.output_directory, f"assembly_{os.path.basename(done_marker)}", finished,
+        )
         with open(done_marker, "w"):
             pass
 
@@ -2171,7 +2369,13 @@ class Meshify:
             f" ({len(plan.redone)} of them also finished early in a block, "
             "redone with their other pieces)" if plan.redone else "",
         )
-        if plan.redone:
+        if plan.redone and getattr(self, "_mesh_packs", False):
+            # Their block's finished copy covers one part; assembly's
+            # replaces it in the index (_read_finished_index).
+            fdir = os.path.join(self.output_directory, _FINISHED_SUBDIR)
+            os.makedirs(fdir, exist_ok=True)
+            np.save(os.path.join(fdir, "superseded.npy"), np.array(plan.redone, dtype=np.uint64))
+        elif plan.redone:
             # Their early outputs cover one part; assembly writes the whole.
             stale = [
                 path for segment_id in plan.redone
@@ -2953,6 +3157,13 @@ class Meshify:
         os.makedirs(mesh_lods_dir, exist_ok=True)
 
         lods = list(range(self.num_lods))
+        # Read once here: the meshing passes and the multires step must agree.
+        self._mesh_packs = self._uses_mesh_packs()
+        if self._mesh_packs:
+            logger.info(
+                "Meshing passes hand their meshes to the multires step in "
+                "pack files, not one PLY per segment per level."
+            )
 
         if self.multires_strategy == "decimate":
             self._generate_multires_decimate(mesh_lods_dir, lods)
@@ -2963,6 +3174,94 @@ class Meshify:
                 f"Unknown multires_strategy '{self.multires_strategy}'. "
                 f"Choose from: 'decimate', 'downsample'"
             )
+
+        if self._mesh_packs:
+            if not self._multires_from_packs(mesh_lods_dir, lods):
+                return
+        elif not self._multires_from_files(mesh_lods_dir, lods):
+            return
+
+        # Run mesh metrics on the LOD-0 per-segment PLYs BEFORE they get
+        # cleaned up. AnalyzeMeshes reads PLYs from a directory; the LOD-0
+        # outputs live at mesh_lods/s0/ at this point in the multires flow.
+        # (Previously, do_analysis was unreachable when do_multires=true
+        # because get_meshes early-returns after get_multiscale_meshes —
+        # this restores it as a no-multires-required option.)
+        if self.do_analysis:
+            from mesh_n_bone.analyze.analyze import AnalyzeMeshes
+
+            lod0_dir = f"{mesh_lods_dir}/s0"
+            with Timing_Messager(
+                f"Analyzing meshes at {lod0_dir}", logger,
+            ):
+                AnalyzeMeshes(
+                    lod0_dir,
+                    f"{self.output_directory}/metrics",
+                    num_workers=self.num_workers,
+                ).analyze()
+
+        if self.delete_decimated_meshes:
+            with Timing_Messager("Cleaning up intermediate mesh files", logger):
+                dask_util.parallel_delete_tree(
+                    mesh_lods_dir, num_workers=self.num_workers, logger=logger,
+                )
+
+        # Pyramid scale cache: keep when explicitly requested for reuse,
+        # otherwise tear down so the output dir doesn't accumulate the
+        # downsampled-segmentation zarrs.
+        #
+        # CRITICAL: s0 inside the pyramid is a symlink to the user's
+        # original input array. shutil.rmtree on its own does the right
+        # thing (unlinks the symlink, doesn't follow it into the target),
+        # but we explicitly unlink every symlink first BEFORE the
+        # recursive tree walk runs — defensive coding around a
+        # destructive operation. Worst case if shutil.rmtree ever
+        # regressed: it would walk into the user's input and delete
+        # their data.
+        pyramid_path = os.path.join(self.output_directory, "_intermediate_scales.zarr")
+        if os.path.isdir(pyramid_path) and self.delete_intermediate_scales:
+            with Timing_Messager("Cleaning up intermediate scale zarr", logger):
+                _safely_remove_pyramid(
+                    pyramid_path, num_workers=max(1, int(self.num_workers)),
+                )
+
+        logger.info("Multires pipeline complete")
+
+    def _uses_mesh_packs(self):
+        """Whether the meshing passes hand their meshes to the multires
+        step in pack files instead of one PLY per segment per level.
+
+        Only when nothing else reads those PLYs or the per-segment
+        multires files: sharded output, the downsample strategy (the
+        decimate strategy reads and writes level files per segment), no
+        analysis of the LOD-0 meshes, and neither the level meshes nor
+        the unsharded files kept.
+        """
+        return bool(
+            USE_MESH_PACKS
+            and self.do_multires
+            and self.sharded
+            and self.multires_strategy == "downsample"
+            and self.delete_decimated_meshes
+            and self.delete_unsharded_files
+            and not self.do_analysis
+        )
+
+    def _multires_kwargs(self):
+        return dict(
+            lod_0_box_size=self.lod_0_box_size,
+            vertex_quantization_bits=16,
+            target_faces_per_lod0_chunk=self.target_faces_per_lod0_chunk,
+            voxel_size_nm=float(self.base_voxel_size[0]),
+            center_octree=self.center_octree,
+        )
+
+    def _multires_from_files(self, mesh_lods_dir, lods):
+        """The multires step from one PLY per segment per level: a
+        multires file pair per segment, then shards (when sharded) from
+        those. Returns ``False`` when there is nothing to do."""
+        from mesh_n_bone.multires.multires import generate_all_neuroglancer_multires_meshes
+        from mesh_n_bone.util import neuroglancer
 
         # Collect mesh IDs and file sizes from s0
         s0_dir = f"{mesh_lods_dir}/s0"
@@ -2986,7 +3285,7 @@ class Meshify:
 
         if not mesh_ids:
             logger.warning("No meshes found at s0, skipping multires generation")
-            return
+            return False
 
         logger.info(f"Generating neuroglancer multires for {len(mesh_ids)} meshes with {self.num_lods} LODs")
 
@@ -3077,51 +3376,194 @@ class Meshify:
                     lod_scale_multiplier=float(self.base_voxel_size[0]),
                 )
 
-        # Run mesh metrics on the LOD-0 per-segment PLYs BEFORE they get
-        # cleaned up. AnalyzeMeshes reads PLYs from a directory; the LOD-0
-        # outputs live at mesh_lods/s0/ at this point in the multires flow.
-        # (Previously, do_analysis was unreachable when do_multires=true
-        # because get_meshes early-returns after get_multiscale_meshes —
-        # this restores it as a no-multires-required option.)
-        if self.do_analysis:
-            from mesh_n_bone.analyze.analyze import AnalyzeMeshes
+        return True
 
-            lod0_dir = f"{mesh_lods_dir}/s0"
-            with Timing_Messager(
-                f"Analyzing meshes at {lod0_dir}", logger,
-            ):
-                AnalyzeMeshes(
-                    lod0_dir,
-                    f"{self.output_directory}/metrics",
-                    num_workers=self.num_workers,
-                ).analyze()
+    def _multires_from_packs(self, mesh_lods_dir, lods):
+        """The multires step from the meshing passes' packs (sharded output).
 
-        if self.delete_decimated_meshes:
-            with Timing_Messager("Cleaning up intermediate mesh files", logger):
-                dask_util.parallel_delete_tree(
-                    mesh_lods_dir, num_workers=self.num_workers, logger=logger,
+        Small segments, whose LOD-0 PLY is at most ``SMALL_SEGMENT_MAX_BYTES``,
+        are batched by the LOD-0 pack they are in, so a batch reads a few
+        packs; each batch builds its segments' multires chunks on a
+        worker's own disk and writes them into one pack
+        (``generate_small_multires_batch``). Large segments are written out
+        as level PLYs and take the per-segment route, which can split one
+        segment over several workers. The shard packer then joins both.
+        The functions that build a segment's chunk are the same either
+        way, so the shards are the same. Returns ``False`` when there is
+        nothing to do.
+        """
+        from mesh_n_bone.multires.multires import (
+            SMALL_CHUNKS_SUBDIR,
+            generate_all_neuroglancer_multires_meshes,
+            read_small_chunk_index,
+        )
+        from mesh_n_bone.util import neuroglancer, sharded_mesh_util
+
+        with Timing_Messager("Reading the meshing passes' pack indexes", logger):
+            indexes = {
+                lod: _read_finished_index(f"{mesh_lods_dir}/s{lod}", self.num_workers)
+                for lod in lods
+            }
+        s0_paths, s0 = indexes[0]
+        if len(s0) == 0:
+            logger.warning("No meshes found at s0, skipping multires generation")
+            return False
+        mesh_ids = [int(i) for i in s0["id"]]
+        large = s0["bytes"] > SMALL_SEGMENT_MAX_BYTES
+        large_ids = [int(i) for i in s0["id"][large]]
+        logger.info(
+            f"Generating neuroglancer multires for {len(mesh_ids)} meshes with "
+            f"{self.num_lods} LODs: {len(mesh_ids) - len(large_ids)} small ones "
+            f"in batches from packs, {len(large_ids)} large ones one by one"
+        )
+
+        def _sources(segment_ids):
+            """Per segment, ``[(lod, pack path, offset, bytes), ...]`` for
+            the levels it has."""
+            sources = {int(i): [] for i in segment_ids}
+            wanted = np.asarray(sorted(sources), dtype=np.uint64)
+            for lod in lods:
+                paths, index = indexes[lod]
+                if len(index) == 0:
+                    continue
+                at = np.searchsorted(index["id"], wanted)
+                at = np.minimum(at, len(index) - 1)
+                found = index["id"][at] == wanted
+                for segment_id, row in zip(wanted[found], index[at[found]]):
+                    sources[int(segment_id)].append(
+                        (lod, paths[int(row["pack"])], int(row["offset"]), int(row["bytes"]))
+                    )
+            return sources
+
+        multires_path = f"{self.output_directory}/multires"
+        os.makedirs(multires_path, exist_ok=True)
+        kwargs = self._multires_kwargs()
+
+        if large_ids:
+            # The per-segment route reads <lod dir>/<id>.ply; write those
+            # for the large segments only.
+            copies = [
+                (f"{mesh_lods_dir}/s{lod}/{segment_id}.ply", path, offset, nbytes)
+                for segment_id, levels in _sources(large_ids).items()
+                for lod, path, offset, nbytes in levels
+            ]
+
+            def _copy(item):
+                target, path, offset, nbytes = item
+                data = _read_pack_piece_at(path, offset, nbytes)
+                with open(target, "wb") as fh:
+                    fh.write(data)
+
+            dask_util.parallel_io(
+                copies, _copy, self.num_workers,
+                logger=logger if len(copies) >= _PROGRESS_MIN_ITEMS else None,
+                what="large-segment level meshes written",
+            )
+            large_sizes = s0["bytes"][large].astype(float)
+            workers = dask_util.effective_num_workers(
+                self.num_workers, len(large_ids), logger, "multires creation (large segments)",
+            )
+
+            def _run_large(workers, config):
+                with dask_util.start_dask(
+                    workers, "multires creation (large segments)", logger, config=config,
+                ):
+                    with Timing_Messager("Generating multires meshes (large segments)", logger):
+                        generate_all_neuroglancer_multires_meshes(
+                            self.output_directory, workers, large_ids, lods, ".ply",
+                            large_sizes, kwargs["lod_0_box_size"],
+                            target_faces_per_lod0_chunk=kwargs["target_faces_per_lod0_chunk"],
+                            voxel_size_nm=kwargs["voxel_size_nm"],
+                            center_octree=kwargs["center_octree"],
+                        )
+
+            dask_util.run_with_oom_retry(
+                _run_large, workers, "multires creation (large segments)", logger,
+                max_retries=self.memory_retry_max, retry_on_oom=self.retry_on_oom,
+            )
+
+        chunk_dir = os.path.join(multires_path, SMALL_CHUNKS_SUBDIR)
+        # An earlier run's batches would be taken as done (their manifests
+        # mark that); retries within this run keep theirs.
+        shutil.rmtree(chunk_dir, ignore_errors=True)
+        small_rows = s0[~large]
+        if len(small_rows):
+            batches = _small_segment_batches(small_rows, indexes, lods, SMALL_MULTIRES_BATCH)
+            workers = dask_util.effective_num_workers(
+                self.num_workers, len(batches), logger, "multires creation (small segments)",
+            )
+
+            def _run_small(workers, config):
+                bag = db.from_sequence(batches, npartitions=len(batches)).map(
+                    lambda batch: _small_multires_task(*batch, chunk_dir, lods, kwargs)
                 )
+                with dask_util.start_dask(
+                    workers, "multires creation (small segments)", logger, config=config,
+                ):
+                    with Timing_Messager(
+                        f"Generating multires meshes ({len(small_rows)} small segments "
+                        f"in {len(batches)} batches)", logger,
+                    ):
+                        dask_util.compute_watched(bag, "small-segment multires batches", logger)
 
-        # Pyramid scale cache: keep when explicitly requested for reuse,
-        # otherwise tear down so the output dir doesn't accumulate the
-        # downsampled-segmentation zarrs.
-        #
-        # CRITICAL: s0 inside the pyramid is a symlink to the user's
-        # original input array. shutil.rmtree on its own does the right
-        # thing (unlinks the symlink, doesn't follow it into the target),
-        # but we explicitly unlink every symlink first BEFORE the
-        # recursive tree walk runs — defensive coding around a
-        # destructive operation. Worst case if shutil.rmtree ever
-        # regressed: it would walk into the user's input and delete
-        # their data.
-        pyramid_path = os.path.join(self.output_directory, "_intermediate_scales.zarr")
-        if os.path.isdir(pyramid_path) and self.delete_intermediate_scales:
-            with Timing_Messager("Cleaning up intermediate scale zarr", logger):
-                _safely_remove_pyramid(
-                    pyramid_path, num_workers=max(1, int(self.num_workers)),
+            dask_util.run_with_oom_retry(
+                _run_small, workers, "multires creation (small segments)", logger,
+                max_retries=self.memory_retry_max, retry_on_oom=self.retry_on_oom,
+            )
+
+        packed = read_small_chunk_index(chunk_dir)
+        with_meshes = sorted(
+            set(packed)
+            | {i for i in large_ids if os.path.exists(f"{multires_path}/{i}.index")}
+        )
+        with Timing_Messager("Writing segment properties file", logger):
+            neuroglancer.write_segment_properties_file(
+                multires_path,
+                csv_path=self.segment_properties_csv,
+                csv_columns=self.segment_properties_columns,
+                csv_id_column=self.segment_properties_id_column,
+                ids=with_meshes,
+            )
+
+        params = sharded_mesh_util.choose_shard_params(len(mesh_ids))
+        for key, override in (
+            ("preshift_bits", self.preshift_bits),
+            ("minishard_bits", self.minishard_bits),
+            ("shard_bits", self.shard_bits),
+        ):
+            if override is not None:
+                params[key] = int(override)
+        spec = sharded_mesh_util.make_sharding_spec(**params)
+        workers = dask_util.effective_num_workers(
+            self.num_workers, len(mesh_ids), logger, "shard packing",
+        )
+
+        def _pack(workers, config):
+            with dask_util.start_dask(workers, "shard packing", logger, config=config):
+                with Timing_Messager(
+                    f"Packing meshes into sharded format ({params})", logger
+                ):
+                    sharded_mesh_util.pack_meshes_to_shards(
+                        multires_path, mesh_ids, spec, workers, packed=packed,
+                    )
+
+        dask_util.run_with_oom_retry(
+            _pack, workers, "shard packing", logger,
+            max_retries=self.memory_retry_max, retry_on_oom=self.retry_on_oom,
+        )
+
+        with Timing_Messager("Writing sharded info file", logger):
+            sharded_mesh_util.write_sharded_info_file(
+                multires_path, spec, vertex_quantization_bits=16,
+                lod_scale_multiplier=float(self.base_voxel_size[0]),
+            )
+        with Timing_Messager("Deleting unsharded per-segment files", logger):
+            if large_ids:
+                sharded_mesh_util.delete_unsharded_segment_files(
+                    multires_path, large_ids, num_workers=self.num_workers, logger=logger,
                 )
-
-        logger.info("Multires pipeline complete")
+            shutil.rmtree(chunk_dir, ignore_errors=True)
+        return True
 
     def _generate_multires_decimate(self, mesh_lods_dir, lods):
         """Strategy: mesh at s0, then decimate for higher LODs."""

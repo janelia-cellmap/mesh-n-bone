@@ -361,6 +361,140 @@ def _mesh_intersects_roi(mesh_path, roi_begin, roi_end):
     return np.all(mesh_min <= roi_end) and np.all(mesh_max >= roi_begin)
 
 
+# Pack files of small segments' multires chunks, written by
+# generate_small_multires_batch and read by the shard packer.
+SMALL_CHUNKS_SUBDIR = "_small_chunks"
+_CHUNK_MANIFEST_DTYPE = np.dtype([
+    ("id", "u8"), ("offset", "u8"), ("bytes", "u8"), ("manifest_size", "u8"),
+])
+
+
+def _local_scratch():
+    """A directory on this machine's own disk: the dask worker's local
+    directory on a cluster node, else the system temporary directory."""
+    try:
+        from distributed import get_worker
+        return get_worker().local_directory
+    except (ImportError, ValueError):
+        import tempfile
+        return tempfile.gettempdir()
+
+
+def generate_small_multires_batch(
+    entries, chunk_dir, name, lods, original_ext=".ply", lod_0_box_size=None,
+    vertex_quantization_bits=16,
+    target_faces_per_lod0_chunk=DEFAULT_TARGET_FACES_PER_LOD0_CHUNK,
+    voxel_size_nm=1.0,
+    min_useful_faces=MIN_USEFUL_FACES_PER_LOD,
+    center_octree=True,
+):
+    """Multires chunks for a batch of small segments, into one pack file.
+
+    *entries* is a list of ``(segment id, [(lod, pack path, offset,
+    bytes), ...])``: where each of the segment's level meshes sits in the
+    packs the meshing passes wrote. The meshes are copied to a scratch
+    directory on this machine's own disk, laid out as
+    :func:`generate_neuroglancer_multires_mesh` reads them, and that same
+    function writes each segment's ``<id>`` and ``<id>.index`` there. The
+    results go into ``<chunk_dir>/<name>.pack``, one shard-ready chunk per
+    segment (fragment data then manifest, as the shard packer joins
+    them), with a manifest of offsets written last.
+
+    So a segment costs no file operation on the shared filesystem beyond
+    its share of a few sequential reads and one write. A batch whose
+    manifest exists was finished by an earlier attempt and is skipped.
+
+    Returns the ids of the segments that got a chunk.
+    """
+    import tempfile
+    from mesh_n_bone.util.sharded_mesh_util import _read_segment_chunk
+
+    manifest_dir = os.path.join(chunk_dir, "_manifests")
+    manifest_path = os.path.join(manifest_dir, f"{name}.npy")
+    if os.path.exists(manifest_path):
+        return [int(i) for i in np.load(manifest_path)["id"]]
+
+    with tempfile.TemporaryDirectory(prefix="multires-", dir=_local_scratch()) as tmp:
+        reads = sorted(
+            (path, int(offset), int(nbytes), int(lod), int(segment_id))
+            for segment_id, sources in entries
+            for lod, path, offset, nbytes in sources
+        )
+        made = set()
+        handle_path, handle = None, None
+        try:
+            for path, offset, nbytes, lod, segment_id in reads:
+                if path != handle_path:
+                    if handle is not None:
+                        handle.close()
+                    handle_path, handle = path, open(path, "rb")
+                handle.seek(offset)
+                data = handle.read(nbytes)
+                if len(data) != nbytes:
+                    raise IOError(
+                        f"{path} is shorter than its manifest says "
+                        f"({len(data)} of {nbytes} bytes at {offset})"
+                    )
+                lod_dir = f"{tmp}/mesh_lods/s{lod}"
+                if lod_dir not in made:
+                    os.makedirs(lod_dir, exist_ok=True)
+                    made.add(lod_dir)
+                ext = original_ext if lod == 0 else ".ply"
+                with open(f"{lod_dir}/{segment_id}{ext}", "wb") as fh:
+                    fh.write(data)
+        finally:
+            if handle is not None:
+                handle.close()
+
+        for segment_id, _ in entries:
+            generate_neuroglancer_multires_mesh(
+                int(segment_id), 1, tmp, lods, original_ext, lod_0_box_size,
+                vertex_quantization_bits=vertex_quantization_bits,
+                target_faces_per_lod0_chunk=target_faces_per_lod0_chunk,
+                voxel_size_nm=voxel_size_nm,
+                min_useful_faces=min_useful_faces,
+                center_octree=center_octree,
+            )
+
+        os.makedirs(manifest_dir, exist_ok=True)
+        pack_path = os.path.join(chunk_dir, f"{name}.pack")
+        rows = []
+        offset = 0
+        with open(pack_path + ".partial", "wb") as fh:
+            for segment_id, _ in entries:
+                chunk = _read_segment_chunk(f"{tmp}/multires", int(segment_id))
+                if chunk is None:
+                    continue
+                binary, manifest_size = chunk
+                fh.write(binary)
+                rows.append((int(segment_id), offset, len(binary), manifest_size))
+                offset += len(binary)
+        os.replace(pack_path + ".partial", pack_path)
+        with open(manifest_path + ".partial", "wb") as fh:
+            np.save(fh, np.array(rows, dtype=_CHUNK_MANIFEST_DTYPE))
+        os.replace(manifest_path + ".partial", manifest_path)
+    return [row[0] for row in rows]
+
+
+def read_small_chunk_index(chunk_dir):
+    """``{segment id: (pack path, offset, bytes, manifest_size)}`` for
+    every chunk :func:`generate_small_multires_batch` wrote under
+    *chunk_dir*."""
+    manifest_dir = os.path.join(chunk_dir, "_manifests")
+    index = {}
+    if not os.path.isdir(manifest_dir):
+        return index
+    for name in sorted(os.listdir(manifest_dir)):
+        if not name.endswith(".npy") or name.endswith(".partial.npy"):
+            continue
+        pack_path = os.path.join(chunk_dir, name[:-len(".npy")] + ".pack")
+        for row in np.load(os.path.join(manifest_dir, name)):
+            index[int(row["id"])] = (
+                pack_path, int(row["offset"]), int(row["bytes"]), int(row["manifest_size"]),
+            )
+    return index
+
+
 def generate_all_neuroglancer_multires_meshes(
     output_path, num_workers, ids, lods, original_ext, file_sizes,
     lod_0_box_size=None, vertex_quantization_bits=16,

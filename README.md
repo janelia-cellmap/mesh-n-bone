@@ -199,6 +199,12 @@ sharded: true                    # Pack all meshes into a few <n>.shard files
 # minishard_bits: 6              # from the segment count via choose_shard_params.
 # preshift_bits: 0
 delete_unsharded_files: true     # Remove per-segment files after packing (default: true)
+# With sharded output, the downsample strategy and both delete_* options
+# true (and do_analysis false), no per-segment file is written on the way
+# to the shards: the meshing passes hand their meshes on in a few pack
+# files, and small segments are built into shard chunks on each worker's
+# own disk. The shards are the same either way. Setting either delete_*
+# option to false keeps the per-segment files instead.
 
 # ── Coordinate system ──
 # Voxel size and placement are read automatically from the dataset metadata
